@@ -29,8 +29,6 @@ jobs:
 
       - name: Build
         run: npm run build
-        env:
-          BASE_PATH: /senstry
 
       - uses: actions/configure-pages@v4
 
