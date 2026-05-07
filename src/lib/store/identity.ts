@@ -6,8 +6,11 @@ export const identity: Writable<Identity | null> = writable(null);
 
 export interface PairedDevice {
 	pubkey: string;
-	label: string;
+	nickname: string;
 	addedAt: number;
+	relays: string[];
+	capabilities: ('monitor' | 'viewer')[];
+	lastSeenAt: number | null;
 }
 
 export const pairedDevices: Writable<PairedDevice[]> = writable([]);
@@ -29,8 +32,22 @@ export async function addPairedDevice(device: PairedDevice): Promise<void> {
 	});
 }
 
+export async function updatePairedDevice(pubkey: string, patch: Partial<PairedDevice>): Promise<void> {
+	const db = await openDB();
+	const existing = await db.get('pairedDevices', pubkey) as PairedDevice | undefined;
+	if (!existing) return;
+	const updated = { ...existing, ...patch };
+	await db.put('pairedDevices', updated);
+	pairedDevices.update((d) => d.map((x) => (x.pubkey === pubkey ? updated : x)));
+}
+
 export async function removePairedDevice(pubkey: string): Promise<void> {
 	const db = await openDB();
 	await db.delete('pairedDevices', pubkey);
 	pairedDevices.update((d) => d.filter((x) => x.pubkey !== pubkey));
+}
+
+// Returns nickname for a pubkey, falling back to shortened pubkey.
+export function getNickname(pubkey: string, devices: PairedDevice[]): string {
+	return devices.find((d) => d.pubkey === pubkey)?.nickname ?? pubkey.slice(0, 8);
 }

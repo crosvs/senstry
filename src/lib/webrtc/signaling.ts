@@ -1,25 +1,27 @@
 import { subscribe, publish } from '$lib/nostr/client';
 import { giftWrap, giftUnwrap } from '$lib/nostr/crypto';
 import { finalizeEvent } from 'nostr-tools/pure';
-import { KIND_SIGNAL_OFFER, KIND_SIGNAL_ANSWER, KIND_SIGNAL_ICE } from '$lib/nostr/events';
+import { KIND_SIGNAL } from '$lib/nostr/events';
 import { dbg } from '$lib/store/debug';
 import type { NostrEvent } from 'nostr-tools';
 
 export interface SignalMessage {
-	type: string;
-	sdp?: string;
-	candidate?: string;
-	sdpMid?: string | null;
-	sdpMLineIndex?: number | null;
+	type: 'offer-request' | 'offer' | 'answer' | 'hangup' | 'ping' | 'pong';
 	sessionId: string;
+	sdp?: string;
 }
 
-type SignalHandler = (msg: SignalMessage, fromPubkey: string) => void;
+export type SignalHandler = (msg: SignalMessage, fromPubkey: string) => void | Promise<void>;
 
 // NIP-59 gift-wrap outer events have randomised created_at for privacy,
-// so `since` relay filters don't work. Instead we check the inner rumor's
-// honest timestamp and discard anything older than SIGNAL_TTL_S seconds.
+// so `since` relay filters don't work. We check the inner rumor's honest
+// timestamp and discard anything older than SIGNAL_TTL_S seconds.
 const SIGNAL_TTL_S = 60;
+
+// Deduplicate events by outer event ID — relays may replay the same event
+// on reconnect. Cleared every TTL interval to bound memory growth.
+const seenEventIds = new Set<string>();
+setInterval(() => seenEventIds.clear(), SIGNAL_TTL_S * 1000);
 
 export function listenForSignals(
 	privkey: Uint8Array,
@@ -29,15 +31,17 @@ export function listenForSignals(
 	return subscribe(
 		{ kinds: [1059], '#p': [pubkey] },
 		(event: NostrEvent) => {
+			if (seenEventIds.has(event.id)) return;
+			seenEventIds.add(event.id);
 			try {
 				const inner = giftUnwrap(event, privkey);
 				const age = Math.floor(Date.now() / 1000) - inner.created_at;
-				if (age > SIGNAL_TTL_S) return; // stale relay replay — discard
-				const msg: SignalMessage = JSON.parse(inner.content);
+				if (age > SIGNAL_TTL_S) return;
+				const msg = JSON.parse(inner.content) as SignalMessage;
 				dbg('in', 'rtc', `signal ${msg.type} sess:${msg.sessionId.slice(0, 8)} from:${inner.pubkey.slice(0, 8)}`, msg);
 				handler(msg, inner.pubkey);
 			} catch {
-				// ignore undecryptable events (gift-wrapped for other recipients)
+				// Undecryptable — not meant for this recipient
 			}
 		}
 	);
@@ -47,17 +51,15 @@ export async function sendSignal(
 	privkey: Uint8Array,
 	fromPubkey: string,
 	toPubkey: string,
-	kind: number,
 	msg: SignalMessage
 ): Promise<void> {
 	dbg('out', 'rtc', `signal ${msg.type} sess:${msg.sessionId.slice(0, 8)} to:${toPubkey.slice(0, 8)}`, msg);
 	const inner = finalizeEvent({
-		kind,
+		kind: KIND_SIGNAL,
 		created_at: Math.floor(Date.now() / 1000),
 		tags: [['p', toPubkey]],
 		content: JSON.stringify(msg)
 	}, privkey);
-
 	const wrapped = giftWrap(inner, privkey, toPubkey);
 	await publish(wrapped);
 }
@@ -69,9 +71,7 @@ export async function sendOffer(
 	sdp: string,
 	sessionId: string
 ): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, KIND_SIGNAL_OFFER, {
-		type: 'offer', sdp, sessionId
-	});
+	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'offer', sdp, sessionId });
 }
 
 export async function sendOfferRequest(
@@ -80,9 +80,7 @@ export async function sendOfferRequest(
 	toPubkey: string,
 	sessionId: string
 ): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, KIND_SIGNAL_OFFER, {
-		type: 'offer-request', sessionId
-	});
+	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'offer-request', sessionId });
 }
 
 export async function sendAnswer(
@@ -92,25 +90,7 @@ export async function sendAnswer(
 	sdp: string,
 	sessionId: string
 ): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, KIND_SIGNAL_ANSWER, {
-		type: 'answer', sdp, sessionId
-	});
-}
-
-export async function sendIce(
-	privkey: Uint8Array,
-	fromPubkey: string,
-	toPubkey: string,
-	candidate: RTCIceCandidate,
-	sessionId: string
-): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, KIND_SIGNAL_ICE, {
-		type: 'ice',
-		candidate: candidate.candidate,
-		sdpMid: candidate.sdpMid,
-		sdpMLineIndex: candidate.sdpMLineIndex,
-		sessionId
-	});
+	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'answer', sdp, sessionId });
 }
 
 export async function sendHangup(
@@ -119,7 +99,5 @@ export async function sendHangup(
 	toPubkey: string,
 	sessionId: string
 ): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, KIND_SIGNAL_ICE, {
-		type: 'hangup', sessionId
-	});
+	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'hangup', sessionId });
 }

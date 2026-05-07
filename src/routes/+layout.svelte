@@ -1,8 +1,6 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
 	import { identity } from '$lib/store/identity';
 	import { loadOrCreateIdentity } from '$lib/nostr/keys';
 	import { loadSettings, settings } from '$lib/store/settings';
@@ -20,8 +18,7 @@
 		setRelays([$settings.relayUrl]);
 		ready = true;
 
-		const isSetup = $page.url.pathname === '/setup';
-		if (!isSetup && !id) goto('/setup');
+		// Identity is always created in loadOrCreateIdentity; no setup redirect needed
 	});
 </script>
 

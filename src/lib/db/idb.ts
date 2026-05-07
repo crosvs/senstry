@@ -1,9 +1,13 @@
 import { openDB as idbOpenDB, type IDBPDatabase } from 'idb';
 
 export const DB_NAME = 'senstry';
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 let _db: IDBPDatabase | null = null;
+
+export function _resetDbForTest(): void {
+	_db = null;
+}
 
 export async function openDB(): Promise<IDBPDatabase> {
 	if (_db) return _db;
@@ -18,13 +22,37 @@ export async function openDB(): Promise<IDBPDatabase> {
 				events.createIndex('type', 'type');
 			}
 			if (oldVersion < 2) {
-				// Remove legacy clip stores if they exist
 				if (db.objectStoreNames.contains('clips')) db.deleteObjectStore('clips');
 				if (db.objectStoreNames.contains('clipIndex')) db.deleteObjectStore('clipIndex');
-				// Continuous recording segments store
 				const seg = db.createObjectStore('segments', { keyPath: 'segmentId' });
 				seg.createIndex('startTime', 'startTime');
 				seg.createIndex('pinned_start', ['pinned', 'startTime']);
+			}
+			if (oldVersion < 3) {
+				// New stores
+				const invites = db.createObjectStore('pendingInvites', { keyPath: 'inviteId' });
+				invites.createIndex('expiresAt', 'expiresAt');
+				invites.createIndex('status', 'status');
+
+				const refs = db.createObjectStore('footageRefs', { keyPath: 'refId' });
+				refs.createIndex('originMonitor', 'originMonitor');
+				refs.createIndex('startTime', 'startTime');
+				refs.createIndex('type', 'type');
+				refs.createIndex('pinned_start', ['pinned', 'startTime']);
+
+				const photos = db.createObjectStore('photos', { keyPath: 'photoId' });
+				photos.createIndex('capturedAt', 'capturedAt');
+				photos.createIndex('originMonitor', 'originMonitor');
+
+				const outbox = db.createObjectStore('outbox', { keyPath: 'outboxId' });
+				outbox.createIndex('status', 'status');
+				outbox.createIndex('kind', 'kind');
+				outbox.createIndex('createdAt', 'createdAt');
+
+				// Add new indexes to events store
+				// (existing store — only add indexes not present from older migrations)
+				// originMonitor and publishedAt are new fields; we can't add indexes without
+				// recreating the store, so we rely on the field being present on new records.
 			}
 		}
 	});

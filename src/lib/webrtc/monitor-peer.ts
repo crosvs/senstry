@@ -1,107 +1,137 @@
 import { createPeer, onIceStateChange, waitForIceGathering } from './peer';
-import { listenForSignals, sendOffer, sendAnswer } from './signaling';
-import { getCoverageMap, getSegmentsInRange } from '$lib/db/segments';
-import { streamState } from '$lib/store/stream';
-import { subscribe } from '$lib/nostr/client';
-import { decrypt } from '$lib/nostr/crypto';
-import { addPairedDevice } from '$lib/store/identity';
-import { KIND_PAIR_ACK } from '$lib/nostr/events';
-import type { NostrEvent } from 'nostr-tools';
+import { sendOffer, sendHangup } from './signaling';
+import { getCoverageMap, getSegmentsInRange, getSegmentById } from '$lib/db/segments';
+import type { SignalMessage } from './signaling';
 
-interface Session {
+interface MonitorSession {
 	pc: RTCPeerConnection;
 	viewerPubkey: string;
 	sessionId: string;
 	dataChannel: RTCDataChannel | null;
+	idleTimer: ReturnType<typeof setTimeout> | null;
+	generation: number;
 }
 
-let session: Session | null = null;
-let signalSub: { close: () => void } | null = null;
-let pairSub: { close: () => void } | null = null;
+// One session per connected viewer, keyed by viewer pubkey.
+const sessions = new Map<string, MonitorSession>();
+let globalGeneration = 0;
 
-// Incremented on every closeSession() so stale ICE/data callbacks from old PCs are ignored.
-let generation = 0;
+// Stream provided when the monitor is armed. Set by the route before signals arrive.
+let activeStream: MediaStream | null = null;
+let idleTimeoutMs = 120_000;
 
-function closeSession(): void {
-	generation++;
-	session?.pc.close();
-	session = null;
+export function setMonitorStream(stream: MediaStream | null): void {
+	activeStream = stream;
 }
 
-export function startMonitorSignaling(
+export function setIdleTimeout(ms: number): void {
+	idleTimeoutMs = ms;
+}
+
+function closeSession(viewerPubkey: string): void {
+	const s = sessions.get(viewerPubkey);
+	if (!s) return;
+	if (s.idleTimer) clearTimeout(s.idleTimer);
+	s.pc.close();
+	sessions.delete(viewerPubkey);
+}
+
+function resetIdleTimer(
 	privkey: Uint8Array,
 	monitorPubkey: string,
-	stream: MediaStream
+	session: MonitorSession
 ): void {
-	signalSub?.close();
-	startPairListener(privkey, monitorPubkey);
-	signalSub = listenForSignals(privkey, monitorPubkey, async (msg, fromPubkey) => {
-		if (msg.type === 'offer-request') {
-			// Ignore if we already have an active session for this sessionId
-			if (session?.sessionId === msg.sessionId) return;
-			await handleOfferRequest(privkey, monitorPubkey, fromPubkey, msg.sessionId, stream);
-		} else if (session && msg.sessionId === session.sessionId) {
-			if (msg.type === 'answer' && msg.sdp) {
-				await session.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-			} else if (msg.type === 'hangup') {
-				closeSession();
-			}
-		}
-	});
+	if (session.idleTimer) clearTimeout(session.idleTimer);
+	session.idleTimer = setTimeout(async () => {
+		await sendHangup(privkey, monitorPubkey, session.viewerPubkey, session.sessionId);
+		closeSession(session.viewerPubkey);
+	}, idleTimeoutMs);
 }
 
-async function handleOfferRequest(
+export async function handleOfferRequest(
 	privkey: Uint8Array,
 	monitorPubkey: string,
-	viewerPubkey: string,
-	sessionId: string,
-	stream: MediaStream
+	msg: SignalMessage,
+	fromPubkey: string
 ): Promise<void> {
-	closeSession();
-	const myGeneration = generation; // snapshot after closeSession incremented it
-	const pc = createPeer();
-	session = { pc, viewerPubkey, sessionId, dataChannel: null };
-	streamState.set('connecting');
+	// If an existing session for this viewer is still connected, don't replace it.
+	const existing = sessions.get(fromPubkey);
+	if (existing && existing.sessionId === msg.sessionId) return;
 
-	for (const track of stream.getTracks()) {
-		pc.addTrack(track, stream);
+	closeSession(fromPubkey);
+	const myGeneration = ++globalGeneration;
+
+	const pc = createPeer();
+	const session: MonitorSession = {
+		pc,
+		viewerPubkey: fromPubkey,
+		sessionId: msg.sessionId,
+		dataChannel: null,
+		idleTimer: null,
+		generation: myGeneration
+	};
+	sessions.set(fromPubkey, session);
+
+	// Add live stream tracks only if the monitor is currently active.
+	if (activeStream) {
+		for (const track of activeStream.getTracks()) {
+			pc.addTrack(track, activeStream);
+		}
 	}
 
 	const dc = pc.createDataChannel('data');
 	session.dataChannel = dc;
 	dc.onmessage = (e) => {
-		if (generation !== myGeneration) return;
-		handleDataMessage(dc, e.data);
+		if (sessions.get(fromPubkey)?.generation !== myGeneration) return;
+		resetIdleTimer(privkey, monitorPubkey, session);
+		handleDataMessage(dc, e.data, monitorPubkey);
 	};
 
 	onIceStateChange(pc, (state) => {
-		if (generation !== myGeneration) return;
-		if (state === 'connected') streamState.set('connected');
-		if (state === 'failed' || state === 'closed') {
-			streamState.set('failed');
-			closeSession();
-		}
+		if (sessions.get(fromPubkey)?.generation !== myGeneration) return;
+		if (state === 'failed' || state === 'closed') closeSession(fromPubkey);
 	});
 
 	const offer = await pc.createOffer();
 	await pc.setLocalDescription(offer);
-	await waitForIceGathering(pc); // embed all candidates in SDP — no trickle ICE events
-	await sendOffer(privkey, monitorPubkey, viewerPubkey, pc.localDescription!.sdp!, sessionId);
+	await waitForIceGathering(pc);
+	try {
+		await sendOffer(privkey, monitorPubkey, fromPubkey, pc.localDescription!.sdp!, msg.sessionId);
+	} catch (e) {
+		closeSession(fromPubkey);
+		throw e;
+	}
+
+	resetIdleTimer(privkey, monitorPubkey, session);
 }
 
-async function handleDataMessage(dc: RTCDataChannel, raw: string): Promise<void> {
+export async function handleAnswer(
+	msg: SignalMessage,
+	fromPubkey: string
+): Promise<void> {
+	const session = sessions.get(fromPubkey);
+	if (!session || session.sessionId !== msg.sessionId || !msg.sdp) return;
+	await session.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+}
+
+export function handleHangup(msg: SignalMessage, fromPubkey: string): void {
+	const session = sessions.get(fromPubkey);
+	if (session?.sessionId === msg.sessionId) closeSession(fromPubkey);
+}
+
+async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor: string): Promise<void> {
 	let req: { type: string } & Record<string, unknown>;
 	try { req = JSON.parse(raw); } catch { return; }
 
 	if (req.type === 'coverage-request') {
-		const segments = await getCoverageMap();
+		const segments = await getCoverageMap(originMonitor);
 		dc.send(JSON.stringify({ type: 'coverage-map', segments }));
 		return;
 	}
 
 	if (req.type === 'segment-request') {
 		const requestTime = req.time as number;
-		const candidates = await getSegmentsInRange(requestTime, requestTime);
+		const candidates = await getSegmentsInRange(requestTime, requestTime, originMonitor);
 		const segment = candidates.find((s) => s.startTime <= requestTime && s.endTime > requestTime);
 
 		if (!segment) {
@@ -109,87 +139,81 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string): Promise<void>
 			return;
 		}
 
-		const CHUNK = 32 * 1024;
-		const buf = await segment.blob.arrayBuffer();
-		const bytes = new Uint8Array(buf);
-		const total = Math.ceil(bytes.length / CHUNK) || 1;
+		await sendSegmentOverDc(dc, segment, { requestTime });
+	}
 
-		dc.send(JSON.stringify({
-			type: 'segment-meta',
-			requestTime,
-			startTime: segment.startTime,
-			endTime: segment.endTime,
-			mimeType: segment.mimeType,
-			sizeBytes: segment.sizeBytes
-		}));
+	if (req.type === 'segment-request-by-id') {
+		const segmentId = req.segmentId as string;
+		const segment = await getSegmentById(segmentId);
 
-		for (let i = 0; i < total; i++) {
-			const slice = bytes.slice(i * CHUNK, (i + 1) * CHUNK);
-			const b64 = btoa(String.fromCharCode(...slice));
-			dc.send(JSON.stringify({
-				type: 'segment-chunk',
-				requestTime,
-				startTime: segment.startTime,
-				index: i,
-				total,
-				data: b64
-			}));
+		if (!segment) {
+			dc.send(JSON.stringify({ type: 'segment-error-by-id', segmentId, reason: 'not-stored' }));
+			return;
 		}
+
+		await sendSegmentOverDc(dc, segment, { segmentId });
+	}
+}
+
+async function sendSegmentOverDc(
+	dc: RTCDataChannel,
+	segment: Awaited<ReturnType<typeof getSegmentById>> & object,
+	key: { requestTime: number } | { segmentId: string }
+): Promise<void> {
+	const CHUNK = 32 * 1024;
+	const buf = await segment.blob.arrayBuffer();
+	const bytes = new Uint8Array(buf);
+	const total = Math.ceil(bytes.length / CHUNK) || 1;
+
+	const byId = 'segmentId' in key;
+	dc.send(JSON.stringify({
+		type: byId ? 'segment-meta-by-id' : 'segment-meta',
+		...key,
+		startTime: segment.startTime,
+		endTime: segment.endTime,
+		mimeType: segment.mimeType,
+		sizeBytes: segment.sizeBytes,
+		originMonitor: segment.originMonitor
+	}));
+
+	for (let i = 0; i < total; i++) {
+		const slice = bytes.slice(i * CHUNK, (i + 1) * CHUNK);
+		const b64 = btoa(String.fromCharCode(...slice));
+		dc.send(JSON.stringify({
+			type: byId ? 'segment-chunk-by-id' : 'segment-chunk',
+			...key,
+			startTime: segment.startTime,
+			index: i,
+			total,
+			data: b64
+		}));
+	}
+}
+
+export function stopAllMonitorSessions(): void {
+	for (const viewerPubkey of sessions.keys()) {
+		closeSession(viewerPubkey);
 	}
 }
 
 export interface MonitorSessionInfo {
-	sessionId: string | null;
-	viewerPubkey: string | null;
-	iceState: RTCIceConnectionState | null;
+	viewerPubkey: string;
+	sessionId: string;
+	iceState: RTCIceConnectionState;
 	dcState: RTCDataChannelState | null;
 	trackCount: number;
 }
 
-export function getMonitorSessionInfo(): MonitorSessionInfo {
-	return {
-		sessionId: session?.sessionId ?? null,
-		viewerPubkey: session?.viewerPubkey ?? null,
-		iceState: session?.pc?.iceConnectionState ?? null,
-		dcState: session?.dataChannel?.readyState ?? null,
-		trackCount: session?.pc
-			? session.pc.getSenders().filter((s) => s.track).length
-			: 0
-	};
+export function getMonitorSessionInfos(): MonitorSessionInfo[] {
+	return Array.from(sessions.values()).map((s) => ({
+		viewerPubkey: s.viewerPubkey,
+		sessionId: s.sessionId,
+		iceState: s.pc.iceConnectionState,
+		dcState: s.dataChannel?.readyState ?? null,
+		trackCount: s.pc.getSenders().length,
+	}));
 }
 
-export async function getMonitorRTCStats(): Promise<RTCStatsReport | null> {
-	if (!session?.pc) return null;
-	return session.pc.getStats();
-}
-
-export function startPairListener(privkey: Uint8Array, monitorPubkey: string): void {
-	pairSub?.close();
-	pairSub = subscribe(
-		{ kinds: [KIND_PAIR_ACK], '#p': [monitorPubkey] },
-		async (event: NostrEvent) => {
-			try {
-				const payload = JSON.parse(decrypt(privkey, event.pubkey, event.content)) as {
-					type: string; senderPubkey: string; label: string; timestamp: number
-				};
-				if (payload.type !== 'pair-ack') return;
-				await addPairedDevice({ pubkey: payload.senderPubkey, label: payload.label, addedAt: Date.now() });
-			} catch {
-				// ignore undecryptable events (not meant for this monitor)
-			}
-		}
-	);
-}
-
-export function stopPairListener(): void {
-	pairSub?.close();
-	pairSub = null;
-}
-
-export function stopMonitorSignaling(): void {
-	signalSub?.close();
-	signalSub = null;
-	stopPairListener();
-	closeSession();
-	streamState.set('idle');
+export async function getMonitorRTCStats(viewerPubkey: string): Promise<RTCStatsReport | null> {
+	return sessions.get(viewerPubkey)?.pc.getStats() ?? null;
 }

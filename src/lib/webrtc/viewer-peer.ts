@@ -1,8 +1,9 @@
 import { createPeer, onTrack, onIceStateChange, waitForIceGathering } from './peer';
-import { listenForSignals, sendOfferRequest, sendAnswer } from './signaling';
+import { sendOfferRequest, sendAnswer } from './signaling';
 import { streamState, remoteStream } from '$lib/store/stream';
+import type { SignalMessage } from './signaling';
 
-interface Session {
+interface ViewerSession {
 	pc: RTCPeerConnection;
 	monitorPubkey: string;
 	sessionId: string;
@@ -13,92 +14,101 @@ interface PendingSegment {
 	mimeType: string;
 	startTime: number;
 	endTime: number;
+	originMonitor: string;
 	chunks: string[];
 	total: number;
-	resolve: (r: { mimeType: string; blob: Blob; startTime: number; endTime: number }) => void;
+	resolve: (r: { mimeType: string; blob: Blob; startTime: number; endTime: number; originMonitor: string }) => void;
 	reject: (reason: string) => void;
 }
 
-let session: Session | null = null;
-let signalSub: { close: () => void } | null = null;
-let connectPromise: Promise<void> | null = null;
+// One session per target monitor, keyed by monitorPubkey.
+const sessions = new Map<string, ViewerSession>();
+const connectPromises = new Map<string, Promise<void>>();
+const lastConnectAttempts = new Map<string, number>();
 
-// Incremented on every closeSession() so stale callbacks from old PCs are ignored.
 let generation = 0;
-
-// Prevent rapid-fire reconnection storms that get the relay to rate-limit us.
-let lastConnectAttemptAt = 0;
 const MIN_CONNECT_INTERVAL_MS = 4_000;
 
 let pendingCoverage: ((segments: [number, number][]) => void) | null = null;
 let coverageRejectTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingSegments = new Map<number, PendingSegment>();
+const pendingSegmentsById = new Map<string, PendingSegment>();
 
-function closeSession(): void {
+function closeSession(monitorPubkey: string): void {
 	generation++;
-	session?.pc.close();
-	session = null;
-	connectPromise = null;
+	const s = sessions.get(monitorPubkey);
+	if (s) { s.pc.close(); sessions.delete(monitorPubkey); }
+	connectPromises.delete(monitorPubkey);
 	remoteStream.set(null);
 }
+
+// Called by signal-router when an offer/answer/hangup arrives.
+export async function handleViewerSignal(msg: SignalMessage, fromPubkey: string): Promise<void> {
+	const session = sessions.get(fromPubkey);
+	if (!session || session.sessionId !== msg.sessionId) return;
+
+	if (msg.type === 'offer' && msg.sdp) {
+		await session.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+		const answer = await session.pc.createAnswer();
+		await session.pc.setLocalDescription(answer);
+		await waitForIceGathering(session.pc);
+		// privkey/pubkey injected via closure when ensureConnection is called — stored in a module-level ref
+		if (_pendingAnswerContext) {
+			const { privkey, viewerPubkey } = _pendingAnswerContext;
+			await sendAnswer(privkey, viewerPubkey, fromPubkey, session.pc.localDescription!.sdp!, msg.sessionId);
+		}
+	} else if (msg.type === 'hangup') {
+		closeSession(fromPubkey);
+	}
+}
+
+// Module-level context for sendAnswer — set during ensureConnection, cleared on close.
+let _pendingAnswerContext: { privkey: Uint8Array; viewerPubkey: string } | null = null;
 
 export async function ensureConnection(
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string
 ): Promise<void> {
-	if (session?.dataChannel?.readyState === 'open' && session.monitorPubkey === monitorPubkey) return;
-	if (connectPromise) return connectPromise;
+	const existing = sessions.get(monitorPubkey);
+	if (existing?.dataChannel?.readyState === 'open') return;
+
+	const inFlight = connectPromises.get(monitorPubkey);
+	if (inFlight) return inFlight;
 
 	const now = Date.now();
-	if (now - lastConnectAttemptAt < MIN_CONNECT_INTERVAL_MS) {
-		throw new Error('reconnect cooldown — wait a moment');
-	}
-	lastConnectAttemptAt = now;
+	const last = lastConnectAttempts.get(monitorPubkey) ?? 0;
+	if (now - last < MIN_CONNECT_INTERVAL_MS) throw new Error('reconnect cooldown — wait a moment');
+	lastConnectAttempts.set(monitorPubkey, now);
 
 	const myGeneration = ++generation;
+	_pendingAnswerContext = { privkey, viewerPubkey };
 
-	connectPromise = new Promise<void>((resolve, reject) => {
+	const promise = new Promise<void>((resolve, reject) => {
 		const timeout = setTimeout(() => {
 			if (generation !== myGeneration) return;
-			connectPromise = null;
+			connectPromises.delete(monitorPubkey);
 			reject(new Error('Connection timed out'));
 		}, 30_000);
 
 		const sessionId = crypto.randomUUID();
-
-		signalSub?.close();
-		signalSub = listenForSignals(privkey, viewerPubkey, async (msg, _fromPubkey) => {
-			if (!session || msg.sessionId !== sessionId || generation !== myGeneration) return;
-
-			if (msg.type === 'offer' && msg.sdp) {
-				await session.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-				const answer = await session.pc.createAnswer();
-				await session.pc.setLocalDescription(answer);
-				await waitForIceGathering(session.pc); // embed all candidates — no trickle ICE
-				await sendAnswer(privkey, viewerPubkey, monitorPubkey, session.pc.localDescription!.sdp!, sessionId);
-			} else if (msg.type === 'hangup') {
-				if (generation === myGeneration) closeSession();
-			}
-		});
-
 		const pc = createPeer();
+		sessions.set(monitorPubkey, { pc, monitorPubkey, sessionId, dataChannel: null });
+		streamState.set('connecting');
 
 		pc.ondatachannel = (e) => {
 			if (generation !== myGeneration) return;
-			session!.dataChannel = e.channel;
+			const s = sessions.get(monitorPubkey);
+			if (s) s.dataChannel = e.channel;
 			e.channel.onmessage = (ev) => handleDataMessage(ev.data);
 			const open = () => {
 				if (generation !== myGeneration) return;
 				clearTimeout(timeout);
-				connectPromise = null;
+				connectPromises.delete(monitorPubkey);
 				resolve();
 			};
-			if (e.channel.readyState === 'open') {
-				open();
-			} else {
-				e.channel.onopen = open;
-			}
+			if (e.channel.readyState === 'open') open();
+			else e.channel.onopen = open;
 		};
 
 		onTrack(pc, (stream) => {
@@ -111,29 +121,27 @@ export async function ensureConnection(
 			if (generation !== myGeneration) return;
 			if (state === 'failed' || state === 'closed') {
 				clearTimeout(timeout);
-				connectPromise = null;
+				connectPromises.delete(monitorPubkey);
 				streamState.set('failed');
 				reject(new Error('ICE failed'));
-				closeSession();
+				closeSession(monitorPubkey);
 			}
 		});
 
-		session = { pc, monitorPubkey, sessionId, dataChannel: null };
-		streamState.set('connecting');
 		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId);
 	});
 
-	return connectPromise;
+	connectPromises.set(monitorPubkey, promise);
+	return promise;
 }
 
-// Force-close the current session and reconnect. Use for explicit user retry only.
 export async function requestLiveView(
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string
 ): Promise<void> {
-	closeSession();
-	lastConnectAttemptAt = 0; // bypass cooldown for explicit user-initiated reconnect
+	closeSession(monitorPubkey);
+	lastConnectAttempts.delete(monitorPubkey);
 	return ensureConnection(privkey, viewerPubkey, monitorPubkey);
 }
 
@@ -142,47 +150,35 @@ export async function requestCoverageMap(
 	viewerPubkey: string,
 	monitorPubkey: string
 ): Promise<[number, number][]> {
-	try {
-		await ensureConnection(privkey, viewerPubkey, monitorPubkey);
-	} catch {
-		throw new Error('offline');
-	}
+	try { await ensureConnection(privkey, viewerPubkey, monitorPubkey); }
+	catch { throw new Error('offline'); }
+	const session = sessions.get(monitorPubkey);
 	if (!session?.dataChannel) throw new Error('offline');
 
-	// Cancel any previous pending coverage request
-	if (coverageRejectTimer !== null) {
-		clearTimeout(coverageRejectTimer);
-		coverageRejectTimer = null;
-		pendingCoverage = null;
-	}
+	if (coverageRejectTimer !== null) { clearTimeout(coverageRejectTimer); coverageRejectTimer = null; pendingCoverage = null; }
 
 	return new Promise<[number, number][]>((resolve, reject) => {
 		coverageRejectTimer = setTimeout(() => {
-			coverageRejectTimer = null;
-			pendingCoverage = null;
+			coverageRejectTimer = null; pendingCoverage = null;
 			reject(new Error('coverage timeout'));
 		}, 10_000);
-
 		pendingCoverage = (segments) => {
 			if (coverageRejectTimer !== null) { clearTimeout(coverageRejectTimer); coverageRejectTimer = null; }
 			resolve(segments);
 		};
-		session!.dataChannel!.send(JSON.stringify({ type: 'coverage-request' }));
+		session.dataChannel!.send(JSON.stringify({ type: 'coverage-request' }));
 	});
 }
 
-// Request the segment containing `time`. Returns blob + actual segment boundaries.
 export async function requestSegment(
 	time: number,
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string
-): Promise<{ mimeType: string; blob: Blob; startTime: number; endTime: number }> {
-	try {
-		await ensureConnection(privkey, viewerPubkey, monitorPubkey);
-	} catch {
-		throw new Error('offline');
-	}
+): Promise<{ mimeType: string; blob: Blob; startTime: number; endTime: number; originMonitor: string }> {
+	try { await ensureConnection(privkey, viewerPubkey, monitorPubkey); }
+	catch { throw new Error('offline'); }
+	const session = sessions.get(monitorPubkey);
 	if (!session?.dataChannel) throw new Error('offline');
 
 	return new Promise((resolve, reject) => {
@@ -190,17 +186,39 @@ export async function requestSegment(
 			pendingSegments.delete(time);
 			reject(new Error('segment timeout'));
 		}, 30_000);
-
 		pendingSegments.set(time, {
-			mimeType: '',
-			startTime: 0,
-			endTime: 0,
-			chunks: [],
-			total: 0,
+			mimeType: '', startTime: 0, endTime: 0, originMonitor: '',
+			chunks: [], total: 0,
 			resolve: (r) => { clearTimeout(timer); resolve(r); },
 			reject: (reason) => { clearTimeout(timer); pendingSegments.delete(time); reject(new Error(reason)); }
 		});
-		session!.dataChannel!.send(JSON.stringify({ type: 'segment-request', time }));
+		session.dataChannel!.send(JSON.stringify({ type: 'segment-request', time }));
+	});
+}
+
+export async function requestSegmentById(
+	segmentId: string,
+	privkey: Uint8Array,
+	viewerPubkey: string,
+	monitorPubkey: string
+): Promise<{ mimeType: string; blob: Blob; startTime: number; endTime: number; originMonitor: string }> {
+	try { await ensureConnection(privkey, viewerPubkey, monitorPubkey); }
+	catch { throw new Error('offline'); }
+	const session = sessions.get(monitorPubkey);
+	if (!session?.dataChannel) throw new Error('offline');
+
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			pendingSegmentsById.delete(segmentId);
+			reject(new Error('segment timeout'));
+		}, 30_000);
+		pendingSegmentsById.set(segmentId, {
+			mimeType: '', startTime: 0, endTime: 0, originMonitor: '',
+			chunks: [], total: 0,
+			resolve: (r) => { clearTimeout(timer); resolve(r); },
+			reject: (reason) => { clearTimeout(timer); pendingSegmentsById.delete(segmentId); reject(new Error(reason)); }
+		});
+		session.dataChannel!.send(JSON.stringify({ type: 'segment-request-by-id', segmentId }));
 	});
 }
 
@@ -223,6 +241,7 @@ function handleDataMessage(raw: string): void {
 			pending.mimeType = msg.mimeType as string;
 			pending.startTime = msg.startTime as number;
 			pending.endTime = msg.endTime as number;
+			pending.originMonitor = (msg.originMonitor as string) ?? '';
 			pending.total = Math.ceil((msg.sizeBytes as number) / (32 * 1024)) || 1;
 		}
 		return;
@@ -234,16 +253,9 @@ function handleDataMessage(raw: string): void {
 		pending.chunks[msg.index as number] = msg.data as string;
 		if (pending.chunks.filter(Boolean).length === (msg.total as number)) {
 			pendingSegments.delete(requestTime);
-			const binary = pending.chunks.map((b64) =>
-				Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
-			);
+			const binary = pending.chunks.map((b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
 			const blob = new Blob(binary, { type: pending.mimeType });
-			pending.resolve({
-				mimeType: pending.mimeType,
-				blob,
-				startTime: pending.startTime,
-				endTime: pending.endTime
-			});
+			pending.resolve({ mimeType: pending.mimeType, blob, startTime: pending.startTime, endTime: pending.endTime, originMonitor: pending.originMonitor });
 		}
 		return;
 	}
@@ -251,37 +263,70 @@ function handleDataMessage(raw: string): void {
 	if (msg.type === 'segment-error') {
 		const pending = pendingSegments.get(requestTime);
 		if (pending) pending.reject(msg.reason as string);
+		return;
+	}
+
+	const segmentId = msg.segmentId as string;
+
+	if (msg.type === 'segment-meta-by-id') {
+		const pending = pendingSegmentsById.get(segmentId);
+		if (pending) {
+			pending.mimeType = msg.mimeType as string;
+			pending.startTime = msg.startTime as number;
+			pending.endTime = msg.endTime as number;
+			pending.originMonitor = (msg.originMonitor as string) ?? '';
+			pending.total = Math.ceil((msg.sizeBytes as number) / (32 * 1024)) || 1;
+		}
+		return;
+	}
+
+	if (msg.type === 'segment-chunk-by-id') {
+		const pending = pendingSegmentsById.get(segmentId);
+		if (!pending) return;
+		pending.chunks[msg.index as number] = msg.data as string;
+		if (pending.chunks.filter(Boolean).length === (msg.total as number)) {
+			pendingSegmentsById.delete(segmentId);
+			const binary = pending.chunks.map((b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+			const blob = new Blob(binary, { type: pending.mimeType });
+			pending.resolve({ mimeType: pending.mimeType, blob, startTime: pending.startTime, endTime: pending.endTime, originMonitor: pending.originMonitor });
+		}
+		return;
+	}
+
+	if (msg.type === 'segment-error-by-id') {
+		const pending = pendingSegmentsById.get(segmentId);
+		if (pending) pending.reject(msg.reason as string);
 	}
 }
 
 export interface ViewerSessionInfo {
-	sessionId: string | null;
-	monitorPubkey: string | null;
-	iceState: RTCIceConnectionState | null;
+	monitorPubkey: string;
+	sessionId: string;
+	iceState: RTCIceConnectionState;
 	dcState: RTCDataChannelState | null;
 	trackCount: number;
 }
 
-export function getViewerSessionInfo(): ViewerSessionInfo {
-	return {
-		sessionId: session?.sessionId ?? null,
-		monitorPubkey: session?.monitorPubkey ?? null,
-		iceState: session?.pc?.iceConnectionState ?? null,
-		dcState: session?.dataChannel?.readyState ?? null,
-		trackCount: session?.pc
-			? session.pc.getReceivers().length
-			: 0
-	};
+export function getViewerSessionInfos(): ViewerSessionInfo[] {
+	return Array.from(sessions.values()).map((s) => ({
+		monitorPubkey: s.monitorPubkey,
+		sessionId: s.sessionId,
+		iceState: s.pc.iceConnectionState,
+		dcState: s.dataChannel?.readyState ?? null,
+		trackCount: s.pc.getReceivers().length,
+	}));
 }
 
-export async function getViewerRTCStats(): Promise<RTCStatsReport | null> {
-	if (!session?.pc) return null;
-	return session.pc.getStats();
+export async function getViewerRTCStats(monitorPubkey: string): Promise<RTCStatsReport | null> {
+	return sessions.get(monitorPubkey)?.pc.getStats() ?? null;
 }
 
-export function stopViewer(): void {
-	signalSub?.close();
-	signalSub = null;
-	closeSession();
+export function stopViewer(monitorPubkey?: string): void {
+	if (monitorPubkey) {
+		closeSession(monitorPubkey);
+	} else {
+		for (const pk of sessions.keys()) closeSession(pk);
+	}
+	_pendingAnswerContext = null;
 	streamState.set('idle');
 }
