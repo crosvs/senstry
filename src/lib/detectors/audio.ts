@@ -1,8 +1,15 @@
 import type { Detector, DetectionEvent, AudioDetectionData } from './types';
 import type { TriggerConfig } from '$lib/store/triggers';
 
+export type DetectorTriggerState =
+	| { status: 'idle' }
+	| { status: 'active'; startedAt: number; minDurationMs: number }
+	| { status: 'settling'; endsAt: number };
+
 export class AudioDetector implements Detector<AudioDetectionData> {
 	onDetection: ((event: DetectionEvent<AudioDetectionData>) => void) | null = null;
+	onFiringChange: ((firing: boolean) => void) | null = null;
+	onStateChange: ((state: DetectorTriggerState) => void) | null = null;
 
 	private ctx: AudioContext | null = null;
 	private analyser: AnalyserNode | null = null;
@@ -60,6 +67,8 @@ export class AudioDetector implements Detector<AudioDetectionData> {
 				this.isOpen = true;
 				this.eventStart = now;
 				this.peakDb = db;
+				this.onFiringChange?.(true);
+				this.onStateChange?.({ status: 'active', startedAt: this.eventStart, minDurationMs: this.minDurationMs });
 			} else {
 				this.peakDb = Math.max(this.peakDb, db);
 			}
@@ -68,9 +77,12 @@ export class AudioDetector implements Detector<AudioDetectionData> {
 			if (this.cooldownTimer !== null) {
 				clearTimeout(this.cooldownTimer);
 				this.cooldownTimer = null;
+				// Re-entered active from settling — keep original startedAt
+				this.onStateChange?.({ status: 'active', startedAt: this.eventStart, minDurationMs: this.minDurationMs });
 			}
 		} else if (this.isOpen && this.cooldownTimer === null) {
-			// Audio fell below threshold — start cooldown before closing event
+			const endsAt = Date.now() + this.cooldownMs;
+			this.onStateChange?.({ status: 'settling', endsAt });
 			this.cooldownTimer = setTimeout(() => {
 				this.cooldownTimer = null;
 				const durationMs = this.lastAbove - this.eventStart;
@@ -82,6 +94,8 @@ export class AudioDetector implements Detector<AudioDetectionData> {
 					});
 				}
 				this.isOpen = false;
+				this.onFiringChange?.(false);
+				this.onStateChange?.({ status: 'idle' });
 				this.eventStart = 0;
 				this.peakDb = -Infinity;
 			}, this.cooldownMs);

@@ -110,6 +110,9 @@
 </script>
 
 <DevSection title="Pairing">
+  {#snippet summary()}
+    {$pairedDevices.length} paired
+  {/snippet}
   {#snippet actions()}
     <button class="act-btn danger" onclick={resetAll}>Reset</button>
   {/snippet}
@@ -154,8 +157,8 @@
         {#if editingNickname === dev.pubkey}
           <input class="text-input" bind:value={editNicknameVal} onblur={() => saveNickname(dev.pubkey)} onkeydown={(e) => e.key === 'Enter' && saveNickname(dev.pubkey)} />
         {:else}
-          <span class="nickname">{dev.nickname}</span>
-          <button class="act-btn" onclick={() => { editingNickname = dev.pubkey; editNicknameVal = dev.nickname; }}>Edit</button>
+          <span class="nickname">{dev.nickname || '—'}</span>
+          <button class="act-btn nick-edit-btn" onclick={() => { editingNickname = dev.pubkey; editNicknameVal = dev.nickname; }}>{dev.nickname ? 'edit nickname' : 'add nickname'}</button>
         {/if}
         <span class="pubkey-short" title={dev.pubkey}>{dev.pubkey.slice(0, 16)}…</span>
         <button class="rm-btn" onclick={() => removeDevice(dev.pubkey)}>✕</button>
@@ -201,6 +204,8 @@
   }
   .nickname { font-weight: 600; color: var(--color-text); flex: 1; min-width: 80px; }
   .pubkey-short { font-family: ui-monospace, monospace; color: var(--color-muted); font-size: 10px; margin-left: auto; }
+  .nick-edit-btn { font-size: 9px; opacity: 0.6; }
+  .nick-edit-btn:hover { opacity: 1; }
   .rm-btn { font-size: 11px; padding: 0 4px; border: none; background: none; color: var(--color-muted); cursor: pointer; }
   .rm-btn:hover { color: var(--color-danger); }
   .empty { font-size: 11px; color: var(--color-muted); text-align: center; padding: 8px 0; }

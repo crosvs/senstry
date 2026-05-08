@@ -1,34 +1,27 @@
 import { openDB } from './idb';
+import { randomUUID } from '$lib/utils';
 
 export interface FootageRef {
 	refId: string;
-	nostrEventId: string | null;
 	originMonitor: string;
-	type: 'video' | 'photo';
-	startTime: number;            // unix seconds
-	endTime: number;              // unix seconds
-	segmentIds: string[];         // IDs in local segments store; empty on viewer side
-	snapshotIds: string[];        // IDs in local photos store (photo events only)
-	pinned: boolean;
+	triggerType: string;
+	startTime: number;       // unix seconds — pre-roll window start
+	endTime: number;         // unix seconds — post-roll window end
+	triggerTime: number;     // unix seconds — when the trigger actually fired
+	nostrEventId: string | null;
+	publishedAt: number | null;  // unix ms; null = not yet published
 	deleted: boolean;
-	nostrDeleteEventId: string | null;
-	publishedAt: number | null;   // unix ms; null = queued/unpublished
-	updatedAt: number;            // unix ms; used for resync detection
-	backupSources: string[];      // pubkeys of peers holding a backup copy
 }
 
 export async function createFootageRef(
-	ref: Omit<FootageRef, 'refId' | 'nostrEventId' | 'deleted' | 'nostrDeleteEventId' | 'publishedAt' | 'updatedAt' | 'backupSources'>
+	ref: Omit<FootageRef, 'refId' | 'nostrEventId' | 'publishedAt' | 'deleted'>
 ): Promise<FootageRef> {
 	const record: FootageRef = {
 		...ref,
-		refId: crypto.randomUUID(),
+		refId: randomUUID(),
 		nostrEventId: null,
-		deleted: false,
-		nostrDeleteEventId: null,
 		publishedAt: null,
-		updatedAt: Date.now(),
-		backupSources: []
+		deleted: false,
 	};
 	const db = await openDB();
 	await db.put('footageRefs', record);
@@ -39,7 +32,7 @@ export async function updateFootageRef(refId: string, patch: Partial<FootageRef>
 	const db = await openDB();
 	const existing = await db.get('footageRefs', refId) as FootageRef | undefined;
 	if (!existing) return null;
-	const updated = { ...existing, ...patch, updatedAt: Date.now() };
+	const updated = { ...existing, ...patch };
 	await db.put('footageRefs', updated);
 	return updated;
 }
@@ -79,16 +72,14 @@ export async function getFootageRefsInRange(
 	);
 }
 
-// Soft-delete: marks deleted, clears segment/snapshot links (caller deletes actual blobs).
 export async function softDeleteFootageRef(refId: string): Promise<FootageRef | null> {
-	return updateFootageRef(refId, { deleted: true, segmentIds: [], snapshotIds: [] });
+	return updateFootageRef(refId, { deleted: true });
 }
 
-// Returns all refs where updatedAt > publishedAt (or publishedAt is null) — needs re-publish.
 export async function getUnpublishedRefs(): Promise<FootageRef[]> {
 	const db = await openDB();
 	const all = await db.getAll('footageRefs') as FootageRef[];
-	return all.filter((r) => !r.deleted && (r.publishedAt == null || r.updatedAt > r.publishedAt));
+	return all.filter((r) => !r.deleted && r.publishedAt == null);
 }
 
 export async function markRefPublished(refId: string, nostrEventId: string): Promise<void> {
@@ -97,17 +88,31 @@ export async function markRefPublished(refId: string, nostrEventId: string): Pro
 	if (ref) await db.put('footageRefs', { ...ref, nostrEventId, publishedAt: Date.now() });
 }
 
-export async function addBackupSource(refId: string, pubkey: string): Promise<void> {
-	const db = await openDB();
-	const ref = await db.get('footageRefs', refId) as FootageRef | undefined;
-	if (!ref) return;
-	if (ref.backupSources.includes(pubkey)) return;
-	await db.put('footageRefs', { ...ref, backupSources: [...ref.backupSources, pubkey], updatedAt: Date.now() });
-}
-
 export async function getAllFootageRefs(): Promise<FootageRef[]> {
 	const db = await openDB();
 	return db.getAll('footageRefs') as Promise<FootageRef[]>;
+}
+
+// Called on the viewer side when a FootageRef arrives via Nostr.
+// Uses the monitor's original refId so WebRTC segment requests can use the same ID.
+// Idempotent: if the ref already exists and is not deleted, returns it unchanged.
+export async function receiveFootageRef(
+	refId: string,
+	ref: Omit<FootageRef, 'refId' | 'nostrEventId' | 'publishedAt' | 'deleted'>,
+	nostrEventId: string
+): Promise<{ ref: FootageRef; isNew: boolean }> {
+	const db = await openDB();
+	const existing = await db.get('footageRefs', refId) as FootageRef | undefined;
+	if (existing && !existing.deleted) return { ref: existing, isNew: false };
+	const record: FootageRef = {
+		...ref,
+		refId,
+		nostrEventId,
+		publishedAt: Date.now(),
+		deleted: false,
+	};
+	await db.put('footageRefs', record);
+	return { ref: record, isNew: true };
 }
 
 export async function clearFootageRefsForMonitor(originMonitor: string): Promise<void> {

@@ -36,6 +36,17 @@
   function fmt(ts: number): string {
     return new Date(ts).toLocaleTimeString('en', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
+
+  let copyLabel = $state('Copy');
+  function copyLogs() {
+    const text = entries.map(e =>
+      `${fmt(e.ts)} ${e.dir.toUpperCase().padEnd(5)} [${e.source}] ${e.label}`
+    ).join('\n');
+    navigator.clipboard.writeText(text).then(() => {
+      copyLabel = 'Copied!';
+      setTimeout(() => { copyLabel = 'Copy'; }, 1500);
+    });
+  }
 </script>
 
 <div class="log-wrap">
@@ -45,6 +56,7 @@
       <input type="checkbox" bind:checked={autoScroll} />
       auto-scroll
     </label>
+    <button class="clear-btn" onclick={copyLogs}>{copyLabel}</button>
     <button class="clear-btn" onclick={() => clearLog()}>Clear</button>
   </div>
   <div class="log-body" bind:this={el}>

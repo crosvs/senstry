@@ -1,7 +1,7 @@
 import { openDB as idbOpenDB, type IDBPDatabase } from 'idb';
 
 export const DB_NAME = 'senstry';
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 let _db: IDBPDatabase | null = null;
 
@@ -24,12 +24,9 @@ export async function openDB(): Promise<IDBPDatabase> {
 			if (oldVersion < 2) {
 				if (db.objectStoreNames.contains('clips')) db.deleteObjectStore('clips');
 				if (db.objectStoreNames.contains('clipIndex')) db.deleteObjectStore('clipIndex');
-				const seg = db.createObjectStore('segments', { keyPath: 'segmentId' });
-				seg.createIndex('startTime', 'startTime');
-				seg.createIndex('pinned_start', ['pinned', 'startTime']);
+				// segments store created in v4 block (OPFS-compatible schema, no blob field)
 			}
 			if (oldVersion < 3) {
-				// New stores
 				const invites = db.createObjectStore('pendingInvites', { keyPath: 'inviteId' });
 				invites.createIndex('expiresAt', 'expiresAt');
 				invites.createIndex('status', 'status');
@@ -48,11 +45,14 @@ export async function openDB(): Promise<IDBPDatabase> {
 				outbox.createIndex('status', 'status');
 				outbox.createIndex('kind', 'kind');
 				outbox.createIndex('createdAt', 'createdAt');
-
-				// Add new indexes to events store
-				// (existing store — only add indexes not present from older migrations)
-				// originMonitor and publishedAt are new fields; we can't add indexes without
-				// recreating the store, so we rely on the field being present on new records.
+			}
+			if (oldVersion < 4) {
+				// Migrate segments to OPFS-backed schema: drop blob field from IDB.
+				// Existing segment data is cleared (blobs can't be migrated synchronously).
+				if (db.objectStoreNames.contains('segments')) db.deleteObjectStore('segments');
+				const seg = db.createObjectStore('segments', { keyPath: 'segmentId' });
+				seg.createIndex('startTime', 'startTime');
+				seg.createIndex('pinned_start', ['pinned', 'startTime']);
 			}
 		}
 	});
@@ -67,4 +67,43 @@ export async function getSetting<T>(key: string): Promise<T | undefined> {
 export async function putSetting<T>(key: string, value: T): Promise<void> {
 	const db = await openDB();
 	await db.put('settings', value, key);
+}
+
+// Deletes the database entirely (forcing LevelDB compaction) while preserving all
+// blob-free stores. The events store is dropped (legacy, may hold old blobs).
+// The caller should reload the page immediately after this returns.
+export async function compactDatabase(): Promise<void> {
+	const db = await openDB();
+
+	// Snapshot every store that holds no inline blobs.
+	const settingKeys = await db.getAllKeys('settings') as IDBValidKey[];
+	const settingVals = await db.getAll('settings');
+	const devices = await db.getAll('pairedDevices');
+	const invites = await db.getAll('pendingInvites');
+	const refs = await db.getAll('footageRefs');
+	const segments = await db.getAll('segments');
+	const outboxItems = await db.getAll('outbox');
+
+	db.close();
+	_db = null;
+
+	await new Promise<void>((resolve, reject) => {
+		const req = indexedDB.deleteDatabase(DB_NAME);
+		req.onsuccess = () => resolve();
+		req.onerror = () => reject(req.error);
+		req.onblocked = () => reject(new Error('Database is blocked; close other tabs and retry'));
+	});
+
+	const fresh = await openDB();
+	const tx = fresh.transaction(
+		['settings', 'pairedDevices', 'pendingInvites', 'footageRefs', 'segments', 'outbox'],
+		'readwrite'
+	);
+	for (let i = 0; i < settingKeys.length; i++) tx.objectStore('settings').put(settingVals[i], settingKeys[i]);
+	for (const r of devices) tx.objectStore('pairedDevices').put(r);
+	for (const r of invites) tx.objectStore('pendingInvites').put(r);
+	for (const r of refs) tx.objectStore('footageRefs').put(r);
+	for (const r of segments) tx.objectStore('segments').put(r);
+	for (const r of outboxItems) tx.objectStore('outbox').put(r);
+	await tx.done;
 }

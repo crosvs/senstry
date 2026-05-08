@@ -9,6 +9,7 @@ export interface SignalMessage {
 	type: 'offer-request' | 'offer' | 'answer' | 'hangup' | 'ping' | 'pong';
 	sessionId: string;
 	sdp?: string;
+	mode?: 'live' | 'data'; // live = viewer wants stream tracks; data = segment/coverage only
 }
 
 export type SignalHandler = (msg: SignalMessage, fromPubkey: string) => void | Promise<void>;
@@ -78,9 +79,10 @@ export async function sendOfferRequest(
 	privkey: Uint8Array,
 	fromPubkey: string,
 	toPubkey: string,
-	sessionId: string
+	sessionId: string,
+	mode: 'live' | 'data' = 'data'
 ): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'offer-request', sessionId });
+	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'offer-request', sessionId, mode });
 }
 
 export async function sendAnswer(

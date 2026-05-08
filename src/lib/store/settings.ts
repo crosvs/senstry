@@ -12,7 +12,9 @@ export interface VideoEventConfig {
 	videoHeight: number;
 	videoBitsPerSec: number;  // 0 = browser default
 	audioBitsPerSec: number;
+	videoCodec: string;
 	enabled: boolean;
+	pinLifetimeSec: number | null;  // null = don't pin; 0 = forever; positive = seconds
 }
 
 export interface PhotoEventConfig {
@@ -21,7 +23,9 @@ export interface PhotoEventConfig {
 	intervalSec: number;
 	imageWidth: number;
 	imageQuality: number;  // 0.0–1.0
+	imageFormat: string;
 	enabled: boolean;
+	pinLifetimeSec: number | null;  // null = don't pin; 0 = forever; positive = seconds
 }
 
 export interface AppSettings {
@@ -30,7 +34,7 @@ export interface AppSettings {
 	pauseNostr: boolean;
 	storeEvents: boolean;
 	rtcIdleTimeoutMs: number;
-	nostrRateLimit: number;  // events per minute, default 200
+	nostrRateLimit: number;       // events per minute, default 200
 	videoConfig: VideoEventConfig;
 	photoConfig: PhotoEventConfig;
 }
@@ -44,7 +48,9 @@ const defaultVideoConfig: VideoEventConfig = {
 	videoHeight: 0,
 	videoBitsPerSec: 0,
 	audioBitsPerSec: 0,
-	enabled: true
+	videoCodec: '',
+	enabled: true,
+	pinLifetimeSec: 7 * 24 * 3600,   // 7 days
 };
 
 const defaultPhotoConfig: PhotoEventConfig = {
@@ -53,7 +59,9 @@ const defaultPhotoConfig: PhotoEventConfig = {
 	intervalSec: 2,
 	imageWidth: 1280,
 	imageQuality: 0.85,
-	enabled: false
+	imageFormat: 'image/jpeg',
+	enabled: false,
+	pinLifetimeSec: 30 * 24 * 3600,  // 30 days
 };
 
 const defaults: AppSettings = {

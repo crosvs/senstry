@@ -81,6 +81,9 @@
 </script>
 
 <DevSection title="Relay">
+  {#snippet summary()}
+    {$settings.relayUrl.replace('wss://', '').replace('ws://', '')} · {activeSubs.length} sub{activeSubs.length === 1 ? '' : 's'} · {publishedLast60s}/min
+  {/snippet}
   {#snippet actions()}
     <button class="act-btn" onclick={resetDefault}>Reset Default</button>
   {/snippet}

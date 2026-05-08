@@ -1,4 +1,4 @@
-import { savePhoto } from '$lib/db/photos';
+import { saveSegment } from '$lib/db/segments';
 import { dbg } from '$lib/store/debug';
 
 export interface PhotoCaptureConfig {
@@ -6,6 +6,7 @@ export interface PhotoCaptureConfig {
 	intervalSec: number;
 	imageWidth: number;
 	imageQuality: number;  // 0.0–1.0
+	imageFormat?: string;
 }
 
 // Captures snapshotCount JPEG frames from a video stream, separated by intervalSec.
@@ -41,10 +42,10 @@ export async function capturePhotosOnTrigger(
 				canvas.width = width;
 				canvas.height = Math.round(bitmap.height * scale);
 				ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-				const blob = await canvasToBlob(canvas, 'image/jpeg', config.imageQuality);
+				const blob = await canvasToBlob(canvas, config.imageFormat ?? 'image/jpeg', config.imageQuality);
 				if (blob) {
 					const capturedAt = triggerTime + i * config.intervalSec;
-					const id = await savePhoto(blob, 'image/jpeg', canvas.width, canvas.height, capturedAt, originMonitor);
+					const id = await saveSegment(blob, config.imageFormat ?? 'image/jpeg', capturedAt, capturedAt + 1, originMonitor);
 					photoIds.push(id);
 					dbg('info', 'detector', `photo captured: ${id} (${blob.size} bytes)`);
 				}
@@ -68,10 +69,10 @@ export async function capturePhotosOnTrigger(
 			canvas.width = width;
 			canvas.height = Math.round(video.videoHeight * scale);
 			ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-			const blob = await canvasToBlob(canvas, 'image/jpeg', config.imageQuality);
+			const blob = await canvasToBlob(canvas, config.imageFormat ?? 'image/jpeg', config.imageQuality);
 			if (blob) {
 				const capturedAt = triggerTime + i * config.intervalSec;
-				const id = await savePhoto(blob, 'image/jpeg', canvas.width, canvas.height, capturedAt, originMonitor);
+				const id = await saveSegment(blob, config.imageFormat ?? 'image/jpeg', capturedAt, capturedAt + 1, originMonitor);
 				photoIds.push(id);
 			}
 			if (i < config.snapshotCount - 1) {

@@ -1,4 +1,5 @@
 import { openDB } from './idb';
+import { randomUUID } from '$lib/utils';
 import type { NostrEvent } from 'nostr-tools';
 
 export interface OutboxItem {
@@ -14,7 +15,7 @@ export interface OutboxItem {
 
 export async function enqueue(event: NostrEvent, relays: string[]): Promise<OutboxItem> {
 	const item: OutboxItem = {
-		outboxId: crypto.randomUUID(),
+		outboxId: randomUUID(),
 		event,
 		createdAt: Date.now(),
 		kind: event.kind,

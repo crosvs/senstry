@@ -11,14 +11,15 @@
 	let ready = $state(false);
 
 	onMount(async () => {
+		// Request persistent storage before any OPFS writes so Chrome grants a meaningful quota.
+		navigator.storage?.persist().catch(() => {});
+
 		await loadSettings();
 		const id = await loadOrCreateIdentity();
 		identity.set(id);
 		await loadPairedDevices();
 		setRelays([$settings.relayUrl]);
 		ready = true;
-
-		// Identity is always created in loadOrCreateIdentity; no setup redirect needed
 	});
 </script>
 

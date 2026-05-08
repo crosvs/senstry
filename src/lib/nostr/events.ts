@@ -7,8 +7,11 @@ export const KIND_INVITE_ACK      = 5000; // replaces v1 PAIR_ACK
 export const KIND_SIGNAL          = 5001; // replaces v1 5001/5002/5003
 export const KIND_TRIGGER         = 5010;
 export const KIND_ARM_STATE       = 5011;
-export const KIND_FOOTAGE_REF     = 5020; // NIP-33 addressable footage reference
-export const KIND_FOOTAGE_DELETE  = 5021; // NIP-09-style delete for footage ref
+// Kinds 30020/30021 use NIP-33 parameterized-replaceable range so relays index
+// them for '#p' tag queries. Kind 5020 (NIP-90 DVM range) is accepted by relays
+// but not reliably returned on REQ with tag filters.
+export const KIND_FOOTAGE_REF     = 30020;
+export const KIND_FOOTAGE_DELETE  = 30021;
 export const KIND_BACKUP_REQUEST  = 5022; // viewer asks monitor to send footage for backup
 export const KIND_BACKUP_ACK      = 5023; // monitor confirms backup stored
 export const KIND_RESYNC_REQUEST  = 5024; // request monitor to re-publish all footage refs
@@ -106,29 +109,47 @@ export function buildFootageRefEvent(
 	monitorPubkey: string,
 	viewerPubkey: string,
 	refId: string,
-	type: 'video' | 'photo',
+	triggerType: string,
 	startTime: number,
 	endTime: number,
-	encodingHint: string,
-	triggerEventId: string | null,
+	triggerTime: number,
 	deleted = false
 ): NostrEvent {
-	const durationSec = endTime - startTime;
 	const content = encrypt(privkey, viewerPubkey, JSON.stringify({
-		type,
 		refId,
 		originMonitor: monitorPubkey,
+		triggerType,
 		startTime,
 		endTime,
-		durationSec,
+		triggerTime,
 		deleted,
-		triggerEventId,
-		encodingHint
 	}));
 	return finalizeEvent({
 		kind: KIND_FOOTAGE_REF,
 		created_at: Math.floor(Date.now() / 1000),
 		tags: [['p', viewerPubkey], ['d', refId], ['v', '2']],
+		content
+	}, privkey);
+}
+
+// Bundles multiple footage refs into a single event for offline catch-up sync.
+// The `d` tag is a time-based digest ID so each sync produces a unique addressable event.
+export function buildFootageDigestEvent(
+	privkey: Uint8Array,
+	monitorPubkey: string,
+	viewerPubkey: string,
+	refs: Array<{ refId: string; triggerType: string; startTime: number; endTime: number; triggerTime: number }>
+): NostrEvent {
+	const digestId = `digest-${Math.floor(Date.now() / 1000)}`;
+	const content = encrypt(privkey, viewerPubkey, JSON.stringify({
+		type: 'digest',
+		originMonitor: monitorPubkey,
+		refs
+	}));
+	return finalizeEvent({
+		kind: KIND_FOOTAGE_REF,
+		created_at: Math.floor(Date.now() / 1000),
+		tags: [['p', viewerPubkey], ['d', digestId], ['v', '2']],
 		content
 	}, privkey);
 }

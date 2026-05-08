@@ -4,14 +4,13 @@ import {
 	createFootageRef, updateFootageRef, getFootageRef,
 	getFootageRefsForDay, softDeleteFootageRef,
 	clearFootageRefsForMonitor, getAllFootageRefs,
-	getUnpublishedRefs, markRefPublished,
+	getUnpublishedRefs, markRefPublished, receiveFootageRef,
 } from './footage';
 import { _resetDbForTest } from './idb';
 
 const MONITOR_A = 'a'.repeat(64);
 const MONITOR_B = 'b'.repeat(64);
 
-// A fixed day boundary for deterministic tests (2025-05-07 00:00 UTC)
 const DAY_START = 1746576000;
 const DAY_END = DAY_START + 86400;
 
@@ -22,12 +21,10 @@ beforeEach(() => {
 
 const BASE = {
 	originMonitor: MONITOR_A,
-	type: 'video' as const,
+	triggerType: 'audio',
 	startTime: DAY_START + 100,
 	endTime: DAY_START + 160,
-	segmentIds: [] as string[],
-	snapshotIds: [] as string[],
-	pinned: false,
+	triggerTime: DAY_START + 130,
 };
 
 // ── createFootageRef ──────────────────────────────────────────────────────────
@@ -44,9 +41,6 @@ describe('createFootageRef', () => {
 		expect(ref.deleted).toBe(false);
 		expect(ref.nostrEventId).toBeNull();
 		expect(ref.publishedAt).toBeNull();
-		expect(ref.nostrDeleteEventId).toBeNull();
-		expect(ref.backupSources).toEqual([]);
-		expect(ref.updatedAt).toBeGreaterThan(0);
 	});
 
 	it('persists the ref to IDB', async () => {
@@ -61,35 +55,26 @@ describe('createFootageRef', () => {
 // ── updateFootageRef ──────────────────────────────────────────────────────────
 
 describe('updateFootageRef', () => {
-	it('updates segmentIds and persists', async () => {
+	it('updates endTime and persists', async () => {
 		const ref = await createFootageRef(BASE);
-		const segIds = ['seg-1', 'seg-2', 'seg-3'];
-		const updated = await updateFootageRef(ref.refId, { segmentIds: segIds });
-		expect(updated!.segmentIds).toEqual(segIds);
+		const updated = await updateFootageRef(ref.refId, { endTime: BASE.endTime + 60 });
+		expect(updated!.endTime).toBe(BASE.endTime + 60);
 
 		const fetched = await getFootageRef(ref.refId);
-		expect(fetched!.segmentIds).toEqual(segIds);
+		expect(fetched!.endTime).toBe(BASE.endTime + 60);
 	});
 
 	it('returns null for an unknown refId', async () => {
-		const result = await updateFootageRef('nonexistent', { segmentIds: ['x'] });
+		const result = await updateFootageRef('nonexistent', { endTime: 9999 });
 		expect(result).toBeNull();
 	});
 
 	it('only patches specified fields, leaves others intact', async () => {
 		const ref = await createFootageRef({ ...BASE, startTime: 9999 });
-		await updateFootageRef(ref.refId, { segmentIds: ['x'] });
+		await updateFootageRef(ref.refId, { endTime: 99999 });
 		const fetched = await getFootageRef(ref.refId);
 		expect(fetched!.startTime).toBe(9999);
-		expect(fetched!.segmentIds).toEqual(['x']);
-	});
-
-	it('bumps updatedAt on every patch', async () => {
-		const ref = await createFootageRef(BASE);
-		const before = ref.updatedAt;
-		await new Promise(r => setTimeout(r, 5)); // ensure time advances
-		const updated = await updateFootageRef(ref.refId, { segmentIds: ['x'] });
-		expect(updated!.updatedAt).toBeGreaterThan(before);
+		expect(fetched!.triggerType).toBe('audio');
 	});
 });
 
@@ -98,7 +83,7 @@ describe('updateFootageRef', () => {
 describe('getFootageRefsForDay', () => {
 	it('returns refs whose startTime falls within the day window', async () => {
 		await createFootageRef(BASE); // in window
-		await createFootageRef({ ...BASE, startTime: DAY_END + 100, endTime: DAY_END + 200 }); // next day
+		await createFootageRef({ ...BASE, startTime: DAY_END + 100, endTime: DAY_END + 200, triggerTime: DAY_END + 130 }); // next day
 
 		const refs = await getFootageRefsForDay(DAY_START, DAY_END, MONITOR_A);
 		expect(refs).toHaveLength(1);
@@ -133,12 +118,10 @@ describe('getFootageRefsForDay', () => {
 // ── softDeleteFootageRef ──────────────────────────────────────────────────────
 
 describe('softDeleteFootageRef', () => {
-	it('marks deleted and clears segment/snapshot IDs', async () => {
-		const ref = await createFootageRef({ ...BASE, segmentIds: ['s1', 's2'], snapshotIds: ['p1'] });
+	it('marks deleted', async () => {
+		const ref = await createFootageRef(BASE);
 		const updated = await softDeleteFootageRef(ref.refId);
 		expect(updated!.deleted).toBe(true);
-		expect(updated!.segmentIds).toEqual([]);
-		expect(updated!.snapshotIds).toEqual([]);
 	});
 
 	it('persists the deletion to IDB', async () => {
@@ -170,8 +153,8 @@ describe('clearFootageRefsForMonitor', () => {
 		expect(all.filter(r => r.originMonitor === MONITOR_B)).toHaveLength(1);
 	});
 
-	it('removes pinned and deleted refs too', async () => {
-		const ref = await createFootageRef({ ...BASE, pinned: true });
+	it('removes deleted refs too', async () => {
+		const ref = await createFootageRef(BASE);
 		await softDeleteFootageRef(ref.refId);
 		await clearFootageRefsForMonitor(MONITOR_A);
 		expect(await getFootageRef(ref.refId)).toBeUndefined();
@@ -198,14 +181,46 @@ describe('publish tracking', () => {
 		expect(fetched!.nostrEventId).toBe('nostr-event-id-123');
 		expect(fetched!.publishedAt).not.toBeNull();
 	});
+});
 
-	it('re-queues ref when updatedAt > publishedAt', async () => {
-		const ref = await createFootageRef(BASE);
-		await markRefPublished(ref.refId, 'ev-1');
-		await new Promise(r => setTimeout(r, 5));
-		await updateFootageRef(ref.refId, { segmentIds: ['new-seg'] });
+// ── receiveFootageRef ─────────────────────────────────────────────────────────
 
-		const unpublished = await getUnpublishedRefs();
-		expect(unpublished.map(r => r.refId)).toContain(ref.refId);
+describe('receiveFootageRef', () => {
+	const REMOTE_ID = 'remote-ref-id-from-monitor';
+	const NOSTR_EVENT_ID = 'nostr-event-' + 'a'.repeat(54);
+
+	it('creates a new ref with the given refId', async () => {
+		const { ref, isNew } = await receiveFootageRef(REMOTE_ID, BASE, NOSTR_EVENT_ID);
+		expect(isNew).toBe(true);
+		expect(ref.refId).toBe(REMOTE_ID);
+		expect(ref.originMonitor).toBe(BASE.originMonitor);
+		expect(ref.triggerType).toBe(BASE.triggerType);
+		expect(ref.startTime).toBe(BASE.startTime);
+		expect(ref.endTime).toBe(BASE.endTime);
+		expect(ref.triggerTime).toBe(BASE.triggerTime);
+	});
+
+	it('persists to IDB with nostrEventId set', async () => {
+		await receiveFootageRef(REMOTE_ID, BASE, NOSTR_EVENT_ID);
+		const fetched = await getFootageRef(REMOTE_ID);
+		expect(fetched).toBeDefined();
+		expect(fetched!.nostrEventId).toBe(NOSTR_EVENT_ID);
+		expect(fetched!.publishedAt).not.toBeNull();
+		expect(fetched!.deleted).toBe(false);
+	});
+
+	it('is idempotent — second call returns existing ref with isNew=false', async () => {
+		await receiveFootageRef(REMOTE_ID, BASE, NOSTR_EVENT_ID);
+		const { ref: ref2, isNew } = await receiveFootageRef(REMOTE_ID, BASE, 'different-event-id');
+		expect(isNew).toBe(false);
+		expect(ref2.nostrEventId).toBe(NOSTR_EVENT_ID); // original event ID preserved
+	});
+
+	it('re-receives if the existing ref was soft-deleted', async () => {
+		await receiveFootageRef(REMOTE_ID, BASE, NOSTR_EVENT_ID);
+		await softDeleteFootageRef(REMOTE_ID);
+		const { ref, isNew } = await receiveFootageRef(REMOTE_ID, BASE, 'newer-event');
+		expect(isNew).toBe(true);
+		expect(ref.deleted).toBe(false);
 	});
 });

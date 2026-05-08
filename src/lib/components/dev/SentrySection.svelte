@@ -3,10 +3,12 @@
   import { identity, pairedDevices } from '$lib/store/identity';
   import { settings } from '$lib/store/settings';
   import { triggers, loadTriggers } from '$lib/store/triggers';
-  import { AudioDetector } from '$lib/detectors/audio';
-  import { saveSegment, pinRange, PRE_ROLL_S, POST_ROLL_S } from '$lib/db/segments';
+  import { AudioDetector, type DetectorTriggerState } from '$lib/detectors/audio';
+  import { capturePhotosOnTrigger } from '$lib/detectors/photo';
+  import { saveSegment, pinRange, PRE_ROLL_S, POST_ROLL_S, SEGMENT_DURATION_S } from '$lib/db/segments';
   import { createFootageRef, updateFootageRef } from '$lib/db/footage';
-  import { buildTriggerEvent } from '$lib/nostr/events';
+  import { buildTriggerEvent, buildFootageRefEvent } from '$lib/nostr/events';
+  import { get } from 'svelte/store';
   import { publish, getRelays } from '$lib/nostr/client';
   import { enqueue } from '$lib/db/outbox';
   import {
@@ -22,9 +24,13 @@
   import LogPanel from './LogPanel.svelte';
   import type { SignalMessage } from '$lib/webrtc/signaling';
 
+  export type AlertSession = { triggerType: string; startTime: number; endTime: number; mimeType: string };
+
   interface Props {
     signalRouterActive?: boolean;
     autoAccept?: boolean;
+    triggerStates?: Record<string, DetectorTriggerState>;
+    activeAlerts?: AlertSession[];
     onSignalRouterChange?: (active: boolean) => void;
     onAutoAcceptChange?: (auto: boolean) => void;
     onPendingOffer?: (fromPubkey: string, msg: SignalMessage) => void;
@@ -33,6 +39,8 @@
   let {
     signalRouterActive = $bindable(false),
     autoAccept = $bindable(true),
+    triggerStates = $bindable<Record<string, DetectorTriggerState>>({}),
+    activeAlerts = $bindable<AlertSession[]>([]),
     onPendingOffer,
     acceptOffer = null,
   }: Props = $props();
@@ -48,11 +56,31 @@
   let videoEl: HTMLVideoElement | undefined = $state();
   let armed = $state(false);
   let error = $state('');
+  let showRaw = $state(false);
+  let monitorSnapshot = $state<{ settings: typeof $settings; triggers: typeof $triggers } | null>(null);
   let sessions = $state<MonitorSessionInfo[]>([]);
   let showPreview = $state<Record<string, boolean>>({});
   let signalSub: { close: () => void } | null = null;
   let segmentStart = 0;
   let sessionTick: ReturnType<typeof setInterval>;
+
+  // Footage session accumulator — one session per trigger type.
+  // Triggers within footageSessionMs of each other extend the same ref instead of
+  // creating separate publications.
+  interface FootageSession {
+    refId: string;
+    startTime: number;
+    endTime: number;
+    mimeType: string;
+    timer: ReturnType<typeof setTimeout> | null;
+  }
+  const footageSessions = new Map<string, FootageSession>();
+
+  function syncAlerts() {
+    activeAlerts = [...footageSessions.entries()].map(([triggerType, s]) => ({
+      triggerType, startTime: s.startTime, endTime: s.endTime, mimeType: s.mimeType
+    }));
+  }
 
   sessionTick = setInterval(() => {
     sessions = getMonitorSessionInfos();
@@ -102,11 +130,19 @@
     error = '';
     transitionMonitor('starting');
     await loadTriggers();
+    monitorSnapshot = { settings: { ...$settings }, triggers: [...$triggers] };
+    // Request persistent storage so the browser grants a larger OPFS quota.
+    // Must be called close to a user gesture; result is advisory (no throw on denial).
+    await navigator.storage?.persist().catch(() => {});
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: $settings.videoConfig.recordVideo,
-        audio: true,
-      });
+      const vcfg = $settings.videoConfig;
+      const videoConstraints: MediaTrackConstraints | boolean = vcfg.recordVideo
+        ? {
+            ...(vcfg.videoWidth > 0 && { width: { ideal: vcfg.videoWidth } }),
+            ...(vcfg.videoHeight > 0 && { height: { ideal: vcfg.videoHeight } }),
+          }
+        : false;
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: true });
       if (videoEl) videoEl.srcObject = stream;
       setMonitorStream(stream);
       setIdleTimeout($settings.rtcIdleTimeoutMs);
@@ -122,27 +158,57 @@
   function startRecording() {
     if (!stream) return;
     const useVideo = $settings.videoConfig.recordVideo;
+    const vcfg = $settings.videoConfig;
+    const userCodec = vcfg.videoCodec ?? '';
     const mimeType = useVideo
-      ? (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus' : 'video/webm')
+      ? (userCodec && MediaRecorder.isTypeSupported(userCodec) ? userCodec
+         : MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus'
+         : 'video/webm')
       : (MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm');
+    const videoBps = vcfg.videoBitsPerSec > 0 ? vcfg.videoBitsPerSec : 500_000;
+    const audioBps = vcfg.audioBitsPerSec > 0 ? vcfg.audioBitsPerSec : 64_000;
     const recordStream = useVideo ? stream : new MediaStream(stream.getAudioTracks());
-    recorder = new MediaRecorder(recordStream, { mimeType });
-    let initChunk: Blob | null = null;
-    recorder.ondataavailable = async (e) => {
-      if (e.data.size === 0 || !$identity) return;
-      const now = Math.floor(Date.now() / 1000);
-      const start = segmentStart || now - 10;
-      segmentStart = now;
-      const blob = initChunk ? new Blob([initChunk, e.data], { type: mimeType }) : new Blob([e.data], { type: mimeType });
-      if (!initChunk) initChunk = e.data;
-      try {
-        await saveSegment(blob, mimeType, start, now, $identity.pubkey);
-      } catch (err) {
-        dbg('warn', 'idb', 'segment save failed', err);
-      }
-    };
+    dbg('info', 'idb', `recorder started: ${mimeType}`);
     segmentStart = Math.floor(Date.now() / 1000);
-    recorder.start(10_000);
+
+    // Stop/restart per segment so each blob is a self-contained WebM with its own
+    // init data and a fresh keyframe — avoids all segments showing the same first clip.
+    function recordSegment() {
+      if (!stream) return;
+      const segStart = segmentStart;
+      const chunks: Blob[] = [];
+      const rec = new MediaRecorder(recordStream, { mimeType, videoBitsPerSecond: videoBps, audioBitsPerSecond: audioBps });
+
+      rec.ondataavailable = (e) => {
+        dbg('info', 'idb', `chunk: size=${e.data.size}`);
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      rec.onstop = async () => {
+        const blob = new Blob(chunks, { type: mimeType });
+        if (blob.size > 0 && $identity) {
+          try {
+            const sid = await saveSegment(blob, mimeType, segStart, segmentStart, $identity.pubkey);
+            dbg('info', 'idb', `segment saved [${segStart}–${segmentStart}] ${blob.size}B id:${sid.slice(0, 8)}`);
+          } catch (err) {
+            dbg('warn', 'idb', `segment save failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        if (stream && get(monitorState) === 'active') recordSegment();
+      };
+
+      rec.onerror = (e) => dbg('warn', 'idb', `recorder error: ${(e as ErrorEvent).message ?? e}`);
+      recorder = rec;
+      rec.start();
+      setTimeout(() => {
+        if (rec.state === 'recording') {
+          segmentStart = Math.floor(Date.now() / 1000);
+          rec.stop();
+        }
+      }, SEGMENT_DURATION_S * 1000);
+    }
+
+    recordSegment();
   }
 
   function startDetectors() {
@@ -154,6 +220,9 @@
       det.onDetection = async (evt) => {
         if (!armed || !$identity) return;
         await handleTriggerFired(evt, cfg.name);
+      };
+      det.onStateChange = (state: DetectorTriggerState) => {
+        triggerStates = { ...triggerStates, [cfg.id]: state };
       };
       det.start(stream);
       detectors.push(det);
@@ -174,36 +243,115 @@
     meterRaf = requestAnimationFrame(tick);
   }
 
+  async function closeAlertSession(
+    s: { refId: string; startTime: number; endTime: number; mimeType: string; timer: ReturnType<typeof setTimeout> | null },
+    triggerType: string
+  ) {
+    const cfg = get(settings);
+    const now = Math.floor(Date.now() / 1000);
+    const toUntil = (lifetimeSec: number | null) =>
+      lifetimeSec == null ? null : lifetimeSec === 0 ? 0 : now + lifetimeSec;
+    const vUntil = toUntil(cfg.videoConfig.pinLifetimeSec);
+    const pUntil = toUntil(cfg.photoConfig.pinLifetimeSec);
+    if (vUntil !== null) await pinRange(s.startTime, s.endTime, vUntil, 'video/');
+    if (pUntil !== null) await pinRange(s.startTime, s.endTime, pUntil, 'image/');
+    dbg('info', 'idb', `alert closed: ${s.refId.slice(0, 8)}… [${s.startTime}–${s.endTime}]`);
+    const id = get(identity);
+    if (!id || !isPublishing(get(monitorState)) || get(settings).pauseNostr) return;
+    const relays = getRelays();
+    for (const device of get(pairedDevices)) {
+      const fev = buildFootageRefEvent(
+        id.privkey, id.pubkey, device.pubkey,
+        s.refId, triggerType, s.startTime, s.endTime, s.startTime + PRE_ROLL_S
+      );
+      dbg('info', 'rtc', `publishing alert ${s.refId.slice(0, 8)}… to ${device.pubkey.slice(0, 8)} (kind:5020)`);
+      try { await publish(fev); } catch { await enqueue(fev, relays); }
+    }
+  }
+
   async function handleTriggerFired(
     evt: { type: string; data: { peakDb: number; durationMs: number }; timestamp: number },
     triggerName: string
   ) {
     if (!$identity) return;
+    const triggerCfg = $triggers.find(t => t.name === triggerName) ?? $triggers[0];
     const eventEnd = evt.timestamp + Math.ceil(evt.data.durationMs / 1000);
     const from = evt.timestamp - PRE_ROLL_S;
     const to = eventEnd + POST_ROLL_S;
+    const mimeType = $settings.videoConfig.recordVideo ? 'video/webm' : 'audio/webm';
     let footageRefId: string | null = null;
+
     if (isStoring($monitorState)) {
-      // Pin any pre-roll segments that exist right now so enforceRollingBuffer won't evict them.
-      const preSegIds = await pinRange(from, Math.floor(Date.now() / 1000));
-      const ref = await createFootageRef({
-        originMonitor: $identity.pubkey,
-        type: $settings.videoConfig.recordVideo ? 'video' : 'video',
-        startTime: from,
-        endTime: to,
-        segmentIds: preSegIds,
-        snapshotIds: [],
-        pinned: false,
-      });
-      footageRefId = ref.refId;
-      // After the post-roll window closes, pin the post-roll segments and update the ref.
-      const refId = ref.refId;
-      setTimeout(async () => {
-        const allSegIds = await pinRange(from, to);
-        await updateFootageRef(refId, { segmentIds: allSegIds });
-        dbg('info', 'idb', `footage ref updated post-roll: ${refId.slice(0, 8)}… segs:${allSegIds.length}`);
-      }, POST_ROLL_S * 1000);
+      let session = footageSessions.get(evt.type);
+
+      // If an existing session's window has already passed, close it immediately
+      // and start fresh rather than extending indefinitely.
+      if (session && from > session.endTime) {
+        if (session.timer) clearTimeout(session.timer);
+        await closeAlertSession(session, evt.type);
+        session = undefined;
+        footageSessions.delete(evt.type);
+      }
+
+      if (!session) {
+        const ref = await createFootageRef({
+          originMonitor: $identity.pubkey,
+          triggerType: evt.type,
+          startTime: from,
+          endTime: to,
+          triggerTime: evt.timestamp,
+        });
+        session = { refId: ref.refId, startTime: from, endTime: to, mimeType, timer: null };
+        footageSessions.set(evt.type, session);
+        syncAlerts();
+        dbg('info', 'idb', `alert created: ${ref.refId.slice(0, 8)}… [${from}–${to}]`);
+      } else {
+        // Trigger overlaps the current window — extend to cover it.
+        const newEnd = Math.max(session.endTime, to);
+        if (newEnd > session.endTime) {
+          await updateFootageRef(session.refId, { endTime: newEnd });
+          session.endTime = newEnd;
+          syncAlerts();
+          dbg('info', 'idb', `alert extended: ${session.refId.slice(0, 8)}… end→${newEnd}`);
+        }
+      }
+
+      footageRefId = session.refId;
+
+      // Schedule close at session.endTime + 2s buffer. Rescheduled whenever endTime grows.
+      if (session.timer) clearTimeout(session.timer);
+      const msUntilClose = Math.max(2000, (session.endTime * 1000 - Date.now()) + 2000);
+      const capturedRefId = session.refId;
+      session.timer = setTimeout(async () => {
+        const s = footageSessions.get(evt.type);
+        if (!s || s.refId !== capturedRefId) return;
+        footageSessions.delete(evt.type);
+        syncAlerts();
+        await closeAlertSession(s, evt.type);
+      }, msUntilClose);
     }
+
+    // Capture photos if configured — fire-and-forget (intervals may span several seconds)
+    if ($settings.photoConfig.enabled && stream) {
+      capturePhotosOnTrigger(
+        stream,
+        {
+          snapshotCount: $settings.photoConfig.snapshotCount,
+          intervalSec: $settings.photoConfig.intervalSec,
+          imageWidth: $settings.photoConfig.imageWidth,
+          imageQuality: $settings.photoConfig.imageQuality,
+          imageFormat: $settings.photoConfig.imageFormat ?? 'image/jpeg',
+        },
+        $identity.pubkey,
+        evt.timestamp
+      ).then(ids => {
+        if (ids.length) dbg('info', 'detector', `${ids.length} photo(s) stored for trigger ${evt.type}`);
+      }).catch(err => {
+        dbg('warn', 'detector', `photo capture error: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+
+    // Publish trigger notification (5010) — uses its own shorter publish cooldown.
     const relays = getRelays();
     for (const device of $pairedDevices) {
       const ev = buildTriggerEvent(
@@ -212,8 +360,15 @@
         { peakDb: evt.data.peakDb, durationMs: evt.data.durationMs, triggerName },
         footageRefId
       );
+      const cooldownKey = `trigger:${evt.type}:${device.pubkey}`;
+      const cooldownMs = triggerCfg?.notifyCooldownMs ?? triggerCfg?.publishCooldownMs ?? 30_000;
       if (isPublishing($monitorState) && !$settings.pauseNostr) {
-        try { await publish(ev); } catch { await enqueue(ev, relays); }
+        try {
+          await publish(ev, { cooldownKey, cooldownMs });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : '';
+          if (msg !== 'cooldown') await enqueue(ev, relays);
+        }
       } else {
         await enqueue(ev, relays);
       }
@@ -222,6 +377,10 @@
 
   function stopMonitor() {
     transitionMonitor('stopping');
+    for (const s of footageSessions.values()) {
+      if (s.timer) clearTimeout(s.timer);
+    }
+    footageSessions.clear();
     if (meterRaf !== null) cancelAnimationFrame(meterRaf);
     meterCtx?.close();
     detectors.forEach(d => d.stop());
@@ -232,6 +391,9 @@
     stopAllMonitorSessions();
     stream = null;
     recorder = null;
+    triggerStates = {};
+    activeAlerts = [];
+    monitorSnapshot = null;
     transitionMonitor('idle');
     peakDb = -Infinity;
   }
@@ -244,9 +406,25 @@
 
   const meterPct = $derived(Math.max(0, Math.min(100, (peakDb + 60) * (100 / 60))));
   const isActive = $derived($monitorState === 'active' || $monitorState === 'starting');
+
+  const statusBadge = $derived(
+    isActive && armed ? { label: 'RUNNING · ARMED', color: 'var(--color-danger)' }
+    : isActive        ? { label: 'RUNNING',          color: 'var(--color-success)' }
+    : sessions.some(s => s.iceState === 'connected' || s.iceState === 'completed')
+                      ? { label: 'CONNECTED',        color: 'var(--color-accent)' }
+    : signalRouterActive && autoAccept
+                      ? { label: 'LISTENING · AUTO', color: 'var(--color-warning)' }
+    : signalRouterActive
+                      ? { label: 'LISTENING',        color: 'var(--color-warning)' }
+    : armed           ? { label: 'ARMED',            color: 'var(--color-danger)' }
+                      : { label: 'IDLE',             color: 'var(--color-border)' }
+  );
 </script>
 
-<DevSection title="Sentry" badge={isActive ? 'RUNNING' : armed ? 'ARMED' : 'IDLE'} badgeColor={isActive ? 'var(--color-success)' : armed ? 'var(--color-danger)' : 'var(--color-border)'}>
+<DevSection title="Sentry" badge={statusBadge.label} badgeColor={statusBadge.color}>
+  {#snippet actions()}
+    <button class="act-btn" onclick={() => (showRaw = !showRaw)}>{showRaw ? 'Hide' : 'View'} Raw</button>
+  {/snippet}
 
   <!-- Controls -->
   <div class="ctrl-row">
@@ -266,6 +444,10 @@
 
   {#if error}
     <div class="err-msg">{error}</div>
+  {/if}
+
+  {#if showRaw}
+    <pre class="raw">{JSON.stringify(monitorSnapshot ?? { settings: $settings, triggers: $triggers }, null, 2)}</pre>
   {/if}
 
   <!-- Camera -->
@@ -356,4 +538,5 @@
   .sess-nick { font-weight: 600; color: var(--color-text); min-width: 80px; }
   .sess-state { color: var(--color-muted); }
   .rtc-preview { width: 100%; border-radius: 6px; background: #000; max-height: 160px; margin-top: 2px; }
+  .raw { font-size: 10px; font-family: ui-monospace, monospace; background: #09090b; padding: 10px; border-radius: 6px; overflow: auto; max-height: 300px; color: #a3e635; margin: 0; }
 </style>

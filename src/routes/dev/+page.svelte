@@ -7,17 +7,21 @@
   import IdentitySection from '$lib/components/dev/IdentitySection.svelte';
   import RelaySection from '$lib/components/dev/RelaySection.svelte';
   import PairingSection from '$lib/components/dev/PairingSection.svelte';
-  import TestConnectionSection from '$lib/components/dev/TestConnectionSection.svelte';
+  import DevicesSection from '$lib/components/dev/DevicesSection.svelte';
   import SettingsSection from '$lib/components/dev/SettingsSection.svelte';
   import SentrySection from '$lib/components/dev/SentrySection.svelte';
   import ContentViewerSection from '$lib/components/dev/ContentViewerSection.svelte';
   import SegmentStorageSection from '$lib/components/dev/SegmentStorageSection.svelte';
   import type { SignalMessage } from '$lib/webrtc/signaling';
+  import type { DetectorTriggerState } from '$lib/detectors/audio';
+  import type { AlertSession } from '$lib/components/dev/SentrySection.svelte';
 
   // ── Shared page-level state ───────────────────────────────────────────────
   let selectedMonitorPubkey = $state<string | null>(null);
   let signalRouterActive = $state(false);
   let autoAccept = $state(true);
+  let triggerStates = $state<Record<string, DetectorTriggerState>>({});
+  let activeAlerts = $state<AlertSession[]>([]);
 
   interface PendingOffer { fromPubkey: string; msg: SignalMessage; }
   let pendingOffers = $state<PendingOffer[]>([]);
@@ -62,12 +66,13 @@
     <IdentitySection />
     <RelaySection />
     <PairingSection />
-    <TestConnectionSection />
-    <SettingsSection />
+    <SettingsSection {triggerStates} {activeAlerts} />
 
     <SentrySection
       bind:signalRouterActive
       bind:autoAccept
+      bind:triggerStates
+      bind:activeAlerts
       onPendingOffer={handlePendingOffer}
       acceptOffer={acceptingOffer}
     />
@@ -90,29 +95,14 @@
       </div>
     {/if}
 
-    <!-- Monitor device picker -->
-    <div class="monitor-picker">
-      <div class="picker-title">SELECT MONITOR DEVICE</div>
-      <div class="picker-row">
-        <button
-          class="picker-btn"
-          class:selected={selectedMonitorPubkey === null}
-          onclick={() => (selectedMonitorPubkey = null)}
-        >
-          Own device
-        </button>
-        {#each $pairedDevices as dev (dev.pubkey)}
-          <button
-            class="picker-btn"
-            class:selected={selectedMonitorPubkey === dev.pubkey}
-            onclick={() => (selectedMonitorPubkey = dev.pubkey)}
-          >
-            {dev.nickname}
-          </button>
-        {/each}
-      </div>
+    <!-- Device-scoped sections divider -->
+    <div class="scope-divider" title="All sections below are scoped to the device selected here. Identity, relay, pairing, settings, and sentry above apply globally.">
+      <span class="scope-line"></span>
+      <span class="scope-label">Device scope ↓</span>
+      <span class="scope-line"></span>
     </div>
 
+    <DevicesSection bind:selectedMonitorPubkey />
     <ContentViewerSection {selectedMonitorPubkey} />
     <SegmentStorageSection {selectedMonitorPubkey} />
   </div>
@@ -189,36 +179,15 @@
   .offer-btn.accept { background: var(--color-success); color: white; border-color: var(--color-success); }
   .offer-btn.decline { background: none; color: var(--color-danger); border-color: var(--color-danger); }
   .offer-btn.ignore { background: none; color: var(--color-muted); border-color: var(--color-border); }
-  .monitor-picker {
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    background: var(--color-surface);
+
+  .scope-divider {
+    display: flex; align-items: center; gap: 8px;
+    cursor: help;
+    padding: 4px 0;
   }
-  .picker-title {
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--color-muted);
-    margin-bottom: 8px;
-  }
-  .picker-row { display: flex; gap: 6px; flex-wrap: wrap; }
-  .picker-btn {
-    font-size: 11px;
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid var(--color-border);
-    background: var(--color-bg);
-    color: var(--color-muted);
-    cursor: pointer;
-    font-family: inherit;
-    font-weight: 500;
-  }
-  .picker-btn:hover { color: var(--color-text); }
-  .picker-btn.selected {
-    background: var(--color-accent);
-    color: white;
-    border-color: var(--color-accent);
+  .scope-line { flex: 1; height: 1px; background: var(--color-border); }
+  .scope-label {
+    font-size: 9px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.1em; color: var(--color-muted); white-space: nowrap;
   }
 </style>

@@ -31,6 +31,9 @@
 </script>
 
 <DevSection title="Identity">
+  {#snippet summary()}
+    {$settings.selfLabel || 'unnamed'} · {$identity ? toNpub($identity.pubkey).slice(0, 16) + '…' : '—'}
+  {/snippet}
   {#snippet actions()}
     <button class="act-btn" onclick={regenerate}>Generate New</button>
   {/snippet}

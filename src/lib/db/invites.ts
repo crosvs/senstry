@@ -1,4 +1,5 @@
 import { openDB } from './idb';
+import { randomUUID } from '$lib/utils';
 
 export interface PendingInvite {
 	inviteId: string;
@@ -14,7 +15,7 @@ export async function createInvite(ttlMs = 5 * 60 * 1000): Promise<PendingInvite
 	const secretBytes = crypto.getRandomValues(new Uint8Array(32));
 	const secret = Array.from(secretBytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 	const invite: PendingInvite = {
-		inviteId: crypto.randomUUID(),
+		inviteId: randomUUID(),
 		secret,
 		createdAt: now,
 		expiresAt: now + ttlMs,

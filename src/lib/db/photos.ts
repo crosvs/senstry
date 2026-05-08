@@ -1,4 +1,5 @@
 import { openDB } from './idb';
+import { randomUUID } from '$lib/utils';
 
 export interface PhotoRecord {
 	photoId: string;
@@ -20,7 +21,7 @@ export async function savePhoto(
 	capturedAt: number,
 	originMonitor: string
 ): Promise<string> {
-	const photoId = crypto.randomUUID();
+	const photoId = randomUUID();
 	const record: PhotoRecord = {
 		photoId, blob, mimeType, width, height,
 		capturedAt,

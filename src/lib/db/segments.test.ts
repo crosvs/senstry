@@ -3,7 +3,7 @@ import { IDBFactory } from 'fake-indexeddb';
 import {
 	saveSegment, pinRange, getSegmentById, getSegmentsInRange,
 	getCoverageMap, clearForMonitor, getStorageUsed,
-	MAX_ROLLING_SEGMENTS,
+	MAX_ROLLING_SEGMENTS, _setTestBlobStore, _resetOpfsDirForTest,
 } from './segments';
 import { _resetDbForTest } from './idb';
 
@@ -13,6 +13,8 @@ const MONITOR_B = 'b'.repeat(64);
 beforeEach(() => {
 	(globalThis as Record<string, unknown>).indexedDB = new IDBFactory();
 	_resetDbForTest();
+	_resetOpfsDirForTest();
+	_setTestBlobStore(new Map<string, Blob>());
 });
 
 function blob(content = 'x') {

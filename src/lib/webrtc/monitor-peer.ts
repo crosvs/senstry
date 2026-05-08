@@ -1,6 +1,6 @@
 import { createPeer, onIceStateChange, waitForIceGathering } from './peer';
 import { sendOffer, sendHangup } from './signaling';
-import { getCoverageMap, getSegmentsInRange, getSegmentById } from '$lib/db/segments';
+import { getCoverageMap, getSegmentsInRange, getSegmentById, type SegmentWithBlob } from '$lib/db/segments';
 import type { SignalMessage } from './signaling';
 
 interface MonitorSession {
@@ -72,8 +72,10 @@ export async function handleOfferRequest(
 	};
 	sessions.set(fromPubkey, session);
 
-	// Add live stream tracks only if the monitor is currently active.
-	if (activeStream) {
+	// Only add live stream tracks when the viewer explicitly requested live mode.
+	// Data-mode connections (segment/coverage fetch) skip this to avoid
+	// unintended live stream side-effects and unnecessary bandwidth.
+	if (activeStream && msg.mode === 'live') {
 		for (const track of activeStream.getTracks()) {
 			pc.addTrack(track, activeStream);
 		}
@@ -124,18 +126,29 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 	try { req = JSON.parse(raw); } catch { return; }
 
 	if (req.type === 'coverage-request') {
-		const segments = await getCoverageMap(originMonitor);
-		dc.send(JSON.stringify({ type: 'coverage-map', segments }));
+		const mimePrefix = req.mimePrefix as string | undefined;
+		const segments = await getCoverageMap(originMonitor, mimePrefix);
+		dc.send(JSON.stringify({ type: 'coverage-map', segments, mimePrefix: mimePrefix ?? null }));
 		return;
 	}
 
 	if (req.type === 'segment-request') {
 		const requestTime = req.time as number;
+		const mimePrefix = req.mimePrefix as string | undefined;
 		const candidates = await getSegmentsInRange(requestTime, requestTime, originMonitor);
-		const segment = candidates.find((s) => s.startTime <= requestTime && s.endTime > requestTime);
+		const meta = candidates.find((s) =>
+			s.startTime <= requestTime && s.endTime > requestTime &&
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+		);
 
-		if (!segment) {
+		if (!meta) {
 			dc.send(JSON.stringify({ type: 'segment-error', requestTime, reason: 'not-stored' }));
+			return;
+		}
+
+		const segment = await getSegmentById(meta.segmentId);
+		if (!segment) {
+			dc.send(JSON.stringify({ type: 'segment-error', requestTime, reason: 'blob-missing' }));
 			return;
 		}
 
@@ -143,21 +156,34 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 	}
 
 	if (req.type === 'segment-request-by-id') {
-		const segmentId = req.segmentId as string;
-		const segment = await getSegmentById(segmentId);
+		const id = req.segmentId as string;
+		let segment = await getSegmentById(id);
+
+		// Fallback: id may be a footage ref ID — scan its time range for segments.
+		if (!segment) {
+			const { getFootageRef } = await import('$lib/db/footage');
+			const ref = await getFootageRef(id);
+			if (ref) {
+				const rangeSegs = await getSegmentsInRange(ref.startTime, ref.endTime, ref.originMonitor);
+				for (const meta of rangeSegs) {
+					const s = await getSegmentById(meta.segmentId);
+					if (s) { segment = s; break; }
+				}
+			}
+		}
 
 		if (!segment) {
-			dc.send(JSON.stringify({ type: 'segment-error-by-id', segmentId, reason: 'not-stored' }));
+			dc.send(JSON.stringify({ type: 'segment-error-by-id', segmentId: id, reason: 'not-stored' }));
 			return;
 		}
 
-		await sendSegmentOverDc(dc, segment, { segmentId });
+		await sendSegmentOverDc(dc, segment, { segmentId: id });
 	}
 }
 
 async function sendSegmentOverDc(
 	dc: RTCDataChannel,
-	segment: Awaited<ReturnType<typeof getSegmentById>> & object,
+	segment: SegmentWithBlob,
 	key: { requestTime: number } | { segmentId: string }
 ): Promise<void> {
 	const CHUNK = 32 * 1024;
@@ -166,9 +192,13 @@ async function sendSegmentOverDc(
 	const total = Math.ceil(bytes.length / CHUNK) || 1;
 
 	const byId = 'segmentId' in key;
+	// Propagate the root monitor's ID through viewer chains (ViewerA re-serving to ViewerB)
+	// so all downstream viewers deduplicate against the same canonical ID.
+	const canonicalSegmentId = segment.backupOf ?? segment.segmentId;
 	dc.send(JSON.stringify({
 		type: byId ? 'segment-meta-by-id' : 'segment-meta',
 		...key,
+		segmentId: canonicalSegmentId,  // always included so viewer can set backupOf
 		startTime: segment.startTime,
 		endTime: segment.endTime,
 		mimeType: segment.mimeType,
