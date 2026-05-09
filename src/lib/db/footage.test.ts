@@ -22,6 +22,7 @@ beforeEach(() => {
 const BASE = {
 	originMonitor: MONITOR_A,
 	triggerType: 'audio',
+	sourceId: 'default-mic',
 	startTime: DAY_START + 100,
 	endTime: DAY_START + 160,
 	triggerTime: DAY_START + 130,

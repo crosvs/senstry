@@ -1,7 +1,7 @@
 import { openDB as idbOpenDB, type IDBPDatabase } from 'idb';
 
 export const DB_NAME = 'senstry';
-export const DB_VERSION = 4;
+export const DB_VERSION = 5;
 
 let _db: IDBPDatabase | null = null;
 
@@ -53,6 +53,11 @@ export async function openDB(): Promise<IDBPDatabase> {
 				const seg = db.createObjectStore('segments', { keyPath: 'segmentId' });
 				seg.createIndex('startTime', 'startTime');
 				seg.createIndex('pinned_start', ['pinned', 'startTime']);
+			}
+			if (oldVersion < 5) {
+				// v5 adds sourceId to segments and footageRefs.
+				// Schema is unchanged (no new indexes); existing records without sourceId
+				// are treated as 'default-mic' lazily at read time via `?? 'default-mic'`.
 			}
 		}
 	});

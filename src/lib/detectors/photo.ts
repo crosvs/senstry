@@ -5,6 +5,7 @@ export interface PhotoCaptureConfig {
 	snapshotCount: number;
 	intervalSec: number;
 	imageWidth: number;
+	imageHeight: number;   // 0 = proportional to width (auto aspect ratio)
 	imageQuality: number;  // 0.0–1.0
 	imageFormat?: string;
 }
@@ -15,7 +16,8 @@ export async function capturePhotosOnTrigger(
 	stream: MediaStream,
 	config: PhotoCaptureConfig,
 	originMonitor: string,
-	triggerTime: number
+	triggerTime: number,
+	sourceId = 'default-cam'
 ): Promise<string[]> {
 	const videoTrack = stream.getVideoTracks()[0];
 	if (!videoTrack) {
@@ -38,14 +40,14 @@ export async function capturePhotosOnTrigger(
 			try {
 				const bitmap = await imageCapture.grabFrame();
 				const width = config.imageWidth > 0 ? config.imageWidth : bitmap.width;
-				const scale = width / bitmap.width;
+				const height = config.imageHeight > 0 ? config.imageHeight : Math.round(bitmap.height * (width / bitmap.width));
 				canvas.width = width;
-				canvas.height = Math.round(bitmap.height * scale);
+				canvas.height = height;
 				ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
 				const blob = await canvasToBlob(canvas, config.imageFormat ?? 'image/jpeg', config.imageQuality);
 				if (blob) {
 					const capturedAt = triggerTime + i * config.intervalSec;
-					const id = await saveSegment(blob, config.imageFormat ?? 'image/jpeg', capturedAt, capturedAt + 1, originMonitor);
+					const id = await saveSegment(blob, config.imageFormat ?? 'image/jpeg', capturedAt, capturedAt + 1, originMonitor, sourceId);
 					photoIds.push(id);
 					dbg('info', 'detector', `photo captured: ${id} (${blob.size} bytes)`);
 				}
@@ -65,14 +67,14 @@ export async function capturePhotosOnTrigger(
 
 		for (let i = 0; i < config.snapshotCount; i++) {
 			const width = config.imageWidth > 0 ? config.imageWidth : video.videoWidth;
-			const scale = width / video.videoWidth;
+			const height = config.imageHeight > 0 ? config.imageHeight : Math.round(video.videoHeight * (width / video.videoWidth));
 			canvas.width = width;
-			canvas.height = Math.round(video.videoHeight * scale);
+			canvas.height = height;
 			ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 			const blob = await canvasToBlob(canvas, config.imageFormat ?? 'image/jpeg', config.imageQuality);
 			if (blob) {
 				const capturedAt = triggerTime + i * config.intervalSec;
-				const id = await saveSegment(blob, config.imageFormat ?? 'image/jpeg', capturedAt, capturedAt + 1, originMonitor);
+				const id = await saveSegment(blob, config.imageFormat ?? 'image/jpeg', capturedAt, capturedAt + 1, originMonitor, sourceId);
 				photoIds.push(id);
 			}
 			if (i < config.snapshotCount - 1) {

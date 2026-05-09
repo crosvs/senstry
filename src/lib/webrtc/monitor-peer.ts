@@ -16,12 +16,24 @@ interface MonitorSession {
 const sessions = new Map<string, MonitorSession>();
 let globalGeneration = 0;
 
-// Stream provided when the monitor is armed. Set by the route before signals arrive.
-let activeStream: MediaStream | null = null;
+// Streams provided when the monitor is armed — one per open source, keyed by sourceId.
+const activeStreams = new Map<string, MediaStream>();
 let idleTimeoutMs = 120_000;
 
+// Pass all open source streams so any source can be served to viewers.
+export function setMonitorStreams(streams: Map<string, MediaStream>): void {
+	activeStreams.clear();
+	for (const [id, stream] of streams) activeStreams.set(id, stream);
+}
+
+// Compat shim — used by stopMonitor to clear, and for single-stream callers.
 export function setMonitorStream(stream: MediaStream | null): void {
-	activeStream = stream;
+	activeStreams.clear();
+	if (stream) activeStreams.set('default', stream);
+}
+
+export function getAvailableMonitorSourceIds(): string[] {
+	return Array.from(activeStreams.keys());
 }
 
 export function setIdleTimeout(ms: number): void {
@@ -75,10 +87,19 @@ export async function handleOfferRequest(
 	// Only add live stream tracks when the viewer explicitly requested live mode.
 	// Data-mode connections (segment/coverage fetch) skip this to avoid
 	// unintended live stream side-effects and unnecessary bandwidth.
-	if (activeStream && msg.mode === 'live') {
-		for (const track of activeStream.getTracks()) {
-			pc.addTrack(track, activeStream);
+	if (activeStreams.size > 0 && msg.mode === 'live') {
+		const requestedSource = msg.sourceId as string | undefined;
+		const streamsToAdd = requestedSource && activeStreams.has(requestedSource)
+			? [activeStreams.get(requestedSource)!]
+			: Array.from(activeStreams.values());
+		// Combine all selected source tracks into a single composite MediaStream.
+		// Using separate per-source streams causes the viewer's ontrack events to fire
+		// once per source, each overwriting remoteStream — last one wins, dropping prior tracks.
+		const composite = new MediaStream();
+		for (const stream of streamsToAdd) {
+			for (const track of stream.getTracks()) composite.addTrack(track);
 		}
+		for (const track of composite.getTracks()) pc.addTrack(track, composite);
 	}
 
 	const dc = pc.createDataChannel('data');
@@ -124,6 +145,11 @@ export function handleHangup(msg: SignalMessage, fromPubkey: string): void {
 async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor: string): Promise<void> {
 	let req: { type: string } & Record<string, unknown>;
 	try { req = JSON.parse(raw); } catch { return; }
+
+	if (req.type === 'source-list-request') {
+		dc.send(JSON.stringify({ type: 'source-list', sourceIds: Array.from(activeStreams.keys()) }));
+		return;
+	}
 
 	if (req.type === 'coverage-request') {
 		const mimePrefix = req.mimePrefix as string | undefined;

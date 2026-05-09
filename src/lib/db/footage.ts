@@ -5,6 +5,7 @@ export interface FootageRef {
 	refId: string;
 	originMonitor: string;
 	triggerType: string;
+	sourceId: string;        // which input source produced this footage; legacy records default to 'default-mic'
 	startTime: number;       // unix seconds — pre-roll window start
 	endTime: number;         // unix seconds — post-roll window end
 	triggerTime: number;     // unix seconds — when the trigger actually fired
@@ -45,7 +46,8 @@ export async function getFootageRef(refId: string): Promise<FootageRef | undefin
 export async function getFootageRefsForDay(
 	dayStartUnix: number,
 	dayEndUnix: number,
-	originMonitor?: string
+	originMonitor?: string,
+	sourceId?: string
 ): Promise<FootageRef[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('footageRefs', 'startTime') as FootageRef[];
@@ -53,14 +55,16 @@ export async function getFootageRefsForDay(
 		r.startTime >= dayStartUnix &&
 		r.startTime < dayEndUnix &&
 		!r.deleted &&
-		(originMonitor == null || r.originMonitor === originMonitor)
+		(originMonitor == null || r.originMonitor === originMonitor) &&
+		(sourceId == null || (r.sourceId ?? 'default-mic') === sourceId)
 	);
 }
 
 export async function getFootageRefsInRange(
 	fromUnix: number,
 	toUnix: number,
-	originMonitor?: string
+	originMonitor?: string,
+	sourceId?: string
 ): Promise<FootageRef[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('footageRefs', 'startTime') as FootageRef[];
@@ -68,7 +72,8 @@ export async function getFootageRefsInRange(
 		r.endTime >= fromUnix &&
 		r.startTime <= toUnix &&
 		!r.deleted &&
-		(originMonitor == null || r.originMonitor === originMonitor)
+		(originMonitor == null || r.originMonitor === originMonitor) &&
+		(sourceId == null || (r.sourceId ?? 'default-mic') === sourceId)
 	);
 }
 

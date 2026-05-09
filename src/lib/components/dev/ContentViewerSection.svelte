@@ -2,7 +2,7 @@
   import { identity, pairedDevices } from '$lib/store/identity';
   import { remoteStream } from '$lib/store/stream';
   import {
-    ensureConnection, requestLiveView, requestCoverageMap,
+    ensureConnection, requestLiveView, requestSourceList, requestCoverageMap,
     requestSegment, requestSegmentById,
     getViewerSessionInfos, stopViewer, type ViewerSessionInfo
   } from '$lib/webrtc/viewer-peer';
@@ -23,6 +23,10 @@
   let liveStatus = $state('');
   let liveLoading = $state(false);
   let sessions = $state<ViewerSessionInfo[]>([]);
+  // Source selection — '' = all sources (composite), populated after querying monitor
+  let liveSourceId = $state('');
+  let liveSourceOptions = $state<string[]>([]);
+  let fetchingSourceList = $state(false);
 
   const sessionTick = setInterval(() => { sessions = getViewerSessionInfos(); }, 2000);
 
@@ -34,7 +38,7 @@
     if (!$identity || !selectedMonitorPubkey) { liveStatus = 'Select a monitor device first'; return; }
     liveLoading = true; liveStatus = 'Connecting…';
     try {
-      await requestLiveView($identity.privkey, $identity.pubkey, selectedMonitorPubkey);
+      await requestLiveView($identity.privkey, $identity.pubkey, selectedMonitorPubkey, liveSourceId || undefined);
       liveStatus = '✓ Connected';
     } catch (e) {
       liveStatus = `✗ ${e instanceof Error ? e.message : 'Failed'}`;
@@ -44,6 +48,18 @@
   function disconnect() {
     stopViewer(selectedMonitorPubkey ?? undefined);
     liveStatus = 'Disconnected'; sessions = [];
+  }
+
+  async function fetchSources() {
+    if (!$identity || !selectedMonitorPubkey) return;
+    fetchingSourceList = true;
+    try {
+      liveSourceOptions = await requestSourceList($identity.privkey, $identity.pubkey, selectedMonitorPubkey);
+    } catch {
+      liveSourceOptions = [];
+    } finally {
+      fetchingSourceList = false;
+    }
   }
 
   // ── Recorded Viewer ──────────────────────────────────────────────────────
@@ -70,11 +86,19 @@
 
   let viewerVideoEl = $state<HTMLVideoElement | undefined>();
   let viewerImgEl = $state<HTMLImageElement | undefined>();
+  let viewerError = $state('');
 
   const currentSeg = $derived(currentIdx >= 0 ? fetchedSegs[currentIdx] : null);
 
+  // Reads an OPFS-backed blob fully into memory so it survives IDB/OPFS deletion.
+  async function materializeBlob(blob: Blob): Promise<Blob> {
+    const buf = await blob.arrayBuffer();
+    return new Blob([buf], { type: blob.type });
+  }
+
   $effect(() => {
-    if (!currentSeg) { currentViewerUrl = null; return; }
+    if (!currentSeg) { currentViewerUrl = null; viewerError = ''; return; }
+    viewerError = '';
     // Capture url locally so cleanup can revoke it without reading reactive $state
     const url = URL.createObjectURL(currentSeg.blob);
     currentViewerUrl = url;
@@ -269,7 +293,8 @@
         const withBlob = await getSegmentById(meta.segmentId);
         if (!withBlob) continue;
         existing.add(key);
-        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob: withBlob.blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
+        const blob = await materializeBlob(withBlob.blob);
+        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
         added++;
       }
       fetchStatus = added === 0 ? '✗ No new segments' : `✓ ${added} local segment${added !== 1 ? 's' : ''}`;
@@ -299,7 +324,8 @@
         const withBlob = await getSegmentById(meta.segmentId);
         if (!withBlob) continue;
         existing.add(key);
-        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob: withBlob.blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
+        const blob = await materializeBlob(withBlob.blob);
+        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
         added++;
       }
 
@@ -449,7 +475,8 @@
       }
       if (seg) {
         const key = `idb-${seg.segmentId}`;
-        pushSeg({ key, source: 'idb', mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, blob: seg.blob, segmentId: seg.segmentId, backupOf: seg.backupOf });
+        const blob = await materializeBlob(seg.blob);
+        pushSeg({ key, source: 'idb', mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, blob, segmentId: seg.segmentId, backupOf: seg.backupOf });
         showSeg(fetchedSegs.findIndex(s => s.key === key));
         segIdStatus = `✓ Local [${fmtTs(seg.startTime)}–${fmtTs(seg.endTime)}]`;
       } else {
@@ -471,7 +498,7 @@
     savingKeys = new Set([...savingKeys, seg.key]);
     try {
       // segmentId on an RTC fetch is the canonical ID from the monitor chain — use as backupOf
-      await saveSegment(seg.blob, seg.mimeType, seg.startTime, seg.endTime, selectedMonitorPubkey, seg.segmentId ?? null);
+      await saveSegment(seg.blob, seg.mimeType, seg.startTime, seg.endTime, selectedMonitorPubkey, 'default-mic', seg.segmentId ?? null);
       savedKeys = new Set([...savedKeys, seg.key]);
       dbg('info', 'idb', `saved remote segment [${fmtTs(seg.startTime)}–${fmtTs(seg.endTime)}] as monitor ${selectedMonitorPubkey.slice(0, 8)}`);
     } catch (e) {
@@ -498,6 +525,16 @@
       {liveLoading ? 'Connecting…' : 'Connect Live'}
     </button>
     <button class="act-btn" onclick={disconnect} disabled={sessions.length === 0}>Disconnect</button>
+    <button class="act-btn" onclick={fetchSources} disabled={fetchingSourceList || !selectedMonitorPubkey}
+      title="Query the monitor for its available source IDs">
+      {fetchingSourceList ? '…' : 'Sources ↓'}
+    </button>
+    <select class="source-select" bind:value={liveSourceId} title="Select a source to receive, or leave as 'All' for a composite of all sources">
+      <option value="">All sources</option>
+      {#each liveSourceOptions as srcId}
+        <option value={srcId}>{srcId}</option>
+      {/each}
+    </select>
     {#if liveStatus}
       <span class="status" class:ok={liveStatus.startsWith('✓')} class:err={liveStatus.startsWith('✗')}>{liveStatus}</span>
     {/if}
@@ -514,11 +551,15 @@
   <div class="subsec-title" style="margin-top:10px">Recorded Viewer</div>
 
   <div class="viewer-box">
-    {#if currentSeg}
+    {#if viewerError}
+      <div class="viewer-empty viewer-err">{viewerError}</div>
+    {:else if currentSeg}
       {#if currentSeg.mimeType.startsWith('image/')}
-        <img bind:this={viewerImgEl} alt="Snapshot" class="viewer-media" />
+        <img bind:this={viewerImgEl} alt="Snapshot" class="viewer-media"
+          onerror={() => { viewerError = '✗ Could not load image — segment may have been deleted from storage'; }} />
       {:else}
-        <video bind:this={viewerVideoEl} controls onended={handleVideoEnded} class="viewer-media"></video>
+        <video bind:this={viewerVideoEl} controls onended={handleVideoEnded} class="viewer-media"
+          onerror={() => { viewerError = '✗ Could not load video — segment may have been deleted from storage'; }}></video>
       {/if}
     {:else}
       <div class="viewer-empty">No segment loaded — fetch segments below and click Show</div>
@@ -644,6 +685,7 @@
     <div class="subsec-title-row" style="margin-top:8px">
       <span class="subsec-title" style="margin-top:0">Fetched Segments ({fetchedSegs.length})</span>
       <button class="raw-toggle" class:active={showRaw} onclick={() => showRaw = !showRaw}>Raw</button>
+      <button class="act-btn small-danger" onclick={clearSegments}>Clear All</button>
     </div>
     <div class="seg-table">
       <div class="seg-th">
@@ -730,6 +772,7 @@
   .viewer-box { width: 100%; background: #000; border-radius: 6px; min-height: 120px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-top: 4px; }
   .viewer-media { width: 100%; max-height: 240px; border-radius: 6px; display: block; object-fit: contain; }
   .viewer-empty { font-size: 10px; color: var(--color-muted); text-align: center; padding: 16px; }
+  .viewer-err { color: var(--color-danger); }
 
   .playback-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
   .nav-btn { font-size: 14px; padding: 2px 10px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); cursor: pointer; }
@@ -801,5 +844,6 @@
   .status { font-size: 10px; }
   .status.ok { color: var(--color-success); }
   .status.err { color: var(--color-danger); }
+  .source-select { font-size: 10px; padding: 2px 4px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: ui-monospace, monospace; max-width: 160px; }
   .empty { font-size: 11px; color: var(--color-muted); padding: 4px 0; }
 </style>

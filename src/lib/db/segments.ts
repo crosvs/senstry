@@ -1,5 +1,11 @@
 import { openDB } from './idb';
 import { randomUUID } from '$lib/utils';
+import { dbg } from '$lib/store/debug';
+
+function _fmtTs(unix: number): string {
+	const d = new Date(unix * 1000);
+	return d.toLocaleTimeString('en-GB', { hour12: false });
+}
 
 export const SEGMENT_DURATION_S = 10;
 export const PRE_ROLL_S = 30;
@@ -22,6 +28,7 @@ export interface Segment {
 	// null = no expiry (manual pin or legacy record); 0 = pinned forever; unix sec = expires at
 	pinnedUntil: number | null;
 	originMonitor: string;
+	sourceId: string;   // which input device produced this segment; legacy records default to 'default-mic'
 	backupOf: string | null;
 }
 
@@ -118,29 +125,43 @@ async function deleteSegmentBlob(segmentId: string): Promise<void> {
 
 // ── Rolling buffer ────────────────────────────────────────────────────────────
 
+function _isActivePinned(s: Segment): boolean {
+	if (!s.pinned) return false;
+	const until = s.pinnedUntil;
+	// null = no expiry (legacy manual pin), 0 = forever — both are permanently pinned
+	if (until === null || until === 0) return true;
+	return Math.floor(Date.now() / 1000) <= until;
+}
+
 async function enforceRollingBuffer(originMonitor: string): Promise<void> {
 	const db = await openDB();
 	const all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
 		.filter(s => s.originMonitor === originMonitor)
 		.sort((a, b) => a.startTime - b.startTime);
 
-	// Step 1: rolling buffer — evict oldest unpinned first.
+	// Step 1: rolling buffer — evict oldest unpinned segments to keep the rolling window trim.
 	const unpinned = all.filter(s => !s.pinned);
 	const evicted = new Set<string>();
 	const excessUnpinned = unpinned.length - (MAX_ROLLING_SEGMENTS - 1);
 	for (let i = 0; i < excessUnpinned; i++) {
-		await deleteSegmentBlob(unpinned[i].segmentId);
-		await db.delete('segments', unpinned[i].segmentId);
-		evicted.add(unpinned[i].segmentId);
+		const s = unpinned[i];
+		dbg('info', 'idb', `rolling-buf evict: ${s.segmentId.slice(0, 8)} [${_fmtTs(s.startTime)}–${_fmtTs(s.endTime)}] ${s.mimeType}`);
+		await deleteSegmentBlob(s.segmentId);
+		await db.delete('segments', s.segmentId);
+		evicted.add(s.segmentId);
 	}
 
-	// Step 2: hard cap — evict oldest segments (including pinned) if still over limit.
-	// Pinned segments accumulate from trigger sessions; without this cap they exhaust quota.
+	// Step 2: hard cap — evict oldest non-pinned segments if still over limit.
+	// Actively-pinned segments are exempt; they are bounded only by the storage quota
+	// (enforced separately in evictUnpinned when QuotaExceededError is thrown).
 	const remaining = all.filter(s => !evicted.has(s.segmentId));
-	const excessTotal = remaining.length - (HARD_CAP_SEGMENTS - 1);
+	const unpinnedRemaining = remaining.filter(s => !_isActivePinned(s));
+	const excessTotal = unpinnedRemaining.length - (HARD_CAP_SEGMENTS - 1);
 	for (let i = 0; i < excessTotal; i++) {
-		await deleteSegmentBlob(remaining[i].segmentId);
-		await db.delete('segments', remaining[i].segmentId);
+		const s = unpinnedRemaining[i];
+		dbg('warn', 'idb', `hard-cap evict: ${s.segmentId.slice(0, 8)} [${_fmtTs(s.startTime)}–${_fmtTs(s.endTime)}] ${s.mimeType}`);
+		await deleteSegmentBlob(s.segmentId);
+		await db.delete('segments', s.segmentId);
 	}
 }
 
@@ -152,6 +173,7 @@ export async function saveSegment(
 	startTime: number,
 	endTime: number,
 	originMonitor: string,
+	sourceId: string,
 	backupOf: string | null = null,
 	existingId?: string
 ): Promise<string> {
@@ -183,6 +205,7 @@ export async function saveSegment(
 		pinned: false,
 		pinnedUntil: null,
 		originMonitor,
+		sourceId,
 		backupOf
 	};
 	const db = await openDB();
@@ -208,14 +231,16 @@ export async function pinRange(
 	fromTime: number,
 	toTime: number,
 	pinnedUntil: number = 0,
-	mimeTypePrefix?: string
+	mimeTypePrefix?: string,
+	sourceId?: string
 ): Promise<string[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
 	const toPin = all.filter((s) =>
 		s.endTime >= fromTime &&
 		s.startTime <= toTime &&
-		(mimeTypePrefix == null || s.mimeType.startsWith(mimeTypePrefix))
+		(mimeTypePrefix == null || s.mimeType.startsWith(mimeTypePrefix)) &&
+		(sourceId == null || (s.sourceId ?? 'default-mic') === sourceId)
 	);
 	const tx = db.transaction('segments', 'readwrite');
 	await Promise.all(toPin.map((s) => tx.store.put({
@@ -250,24 +275,26 @@ export async function getSegmentAt(time: number, originMonitor?: string): Promis
 	return getSegmentById(meta.segmentId);
 }
 
-export async function getSegmentsInRange(from: number, to: number, originMonitor?: string): Promise<Segment[]> {
+export async function getSegmentsInRange(from: number, to: number, originMonitor?: string, sourceId?: string): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
 	return all
 		.filter((s) =>
 			s.endTime >= from &&
 			s.startTime <= to &&
-			(originMonitor == null || s.originMonitor === originMonitor)
+			(originMonitor == null || s.originMonitor === originMonitor) &&
+			(sourceId == null || (s.sourceId ?? 'default-mic') === sourceId)
 		)
 		.sort((a, b) => a.startTime - b.startTime);
 }
 
-export async function getCoverageMap(originMonitor?: string, mimePrefix?: string): Promise<[number, number][]> {
+export async function getCoverageMap(originMonitor?: string, mimePrefix?: string, sourceId?: string): Promise<[number, number][]> {
 	const db = await openDB();
 	const all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
 		.filter((s) =>
 			(originMonitor == null || s.originMonitor === originMonitor) &&
-			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+			(sourceId == null || (s.sourceId ?? 'default-mic') === sourceId)
 		)
 		.sort((a, b) => a.startTime - b.startTime);
 
@@ -311,6 +338,7 @@ export async function evictUnpinned(ownMonitor?: string): Promise<void> {
 	for (const seg of all) {
 		if (!seg.pinned && seg.backupOf == null && now - seg.endTime > maxUnpinnedAge) {
 			if (ownMonitor == null || seg.originMonitor === ownMonitor) {
+				dbg('info', 'idb', `age-evict unpinned: ${seg.segmentId.slice(0, 8)} [${_fmtTs(seg.startTime)}] ${seg.mimeType}`);
 				await deleteSegmentBlob(seg.segmentId);
 				await db.delete('segments', seg.segmentId);
 			}
@@ -322,10 +350,13 @@ export async function evictUnpinned(ownMonitor?: string): Promise<void> {
 	let total = all.reduce((s, c) => s + c.sizeBytes, 0);
 	if (total <= quota) return;
 
+	dbg('warn', 'idb', `quota exceeded (${(total / 1024 / 1024).toFixed(1)} MB / ${(quota / 1024 / 1024).toFixed(1)} MB) — evicting`);
+
 	const ownUnpinned = all.filter((s) => !s.pinned && s.backupOf == null &&
 		(ownMonitor == null || s.originMonitor === ownMonitor));
 	for (const seg of ownUnpinned) {
 		if (total <= quota) break;
+		dbg('info', 'idb', `quota-evict unpinned: ${seg.segmentId.slice(0, 8)} [${_fmtTs(seg.startTime)}] ${seg.mimeType}`);
 		await deleteSegmentBlob(seg.segmentId);
 		await db.delete('segments', seg.segmentId);
 		total -= seg.sizeBytes;
@@ -334,6 +365,7 @@ export async function evictUnpinned(ownMonitor?: string): Promise<void> {
 	const backupUnpinned = all.filter((s) => !s.pinned && s.backupOf != null);
 	for (const seg of backupUnpinned) {
 		if (total <= quota) break;
+		dbg('info', 'idb', `quota-evict backup: ${seg.segmentId.slice(0, 8)} [${_fmtTs(seg.startTime)}] ${seg.mimeType}`);
 		await deleteSegmentBlob(seg.segmentId);
 		await db.delete('segments', seg.segmentId);
 		total -= seg.sizeBytes;
@@ -343,11 +375,80 @@ export async function evictUnpinned(ownMonitor?: string): Promise<void> {
 		const pinned = all.filter((s) => s.pinned).sort((a, b) => a.startTime - b.startTime);
 		for (const seg of pinned) {
 			if (total <= quota) break;
+			dbg('warn', 'idb', `quota-evict PINNED (last resort): ${seg.segmentId.slice(0, 8)} [${_fmtTs(seg.startTime)}] ${seg.mimeType}`);
 			await deleteSegmentBlob(seg.segmentId);
 			await db.delete('segments', seg.segmentId);
 			total -= seg.sizeBytes;
 		}
 	}
+}
+
+// ── Thinning ──────────────────────────────────────────────────────────────────
+
+// ThinningRule is imported from pipeline.ts at runtime; redeclared here to avoid a circular dep.
+export interface ThinningRule {
+	afterAgeSec: number;
+	keepOnePerSec: number;
+	mimePrefix: string;  // '' = all types; 'image/' | 'video/' | 'audio/' = specific type
+}
+
+// Thins out older unpinned segments according to the supplied rules.
+// Each rule: segments older than afterAgeSec (matching mimePrefix) are bucketed into
+// keepOnePerSec-wide windows; only the oldest in each bucket is kept, the rest deleted.
+// Actively-pinned segments are always exempt.
+// Rules sorted by afterAgeSec desc so the most-aggressive pass runs first — a segment
+// kept by a coarser rule is never then deleted by a finer one.
+export async function thinSegments(rules: ThinningRule[], originMonitor?: string): Promise<number> {
+	if (!rules.length) return 0;
+	const db = await openDB();
+	const now = Math.floor(Date.now() / 1000);
+	const all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
+		.filter(s =>
+			(originMonitor == null || s.originMonitor === originMonitor) &&
+			!_isActivePinned(s)
+		)
+		.sort((a, b) => a.startTime - b.startTime);
+
+	// Apply rules from most-aggressive (largest afterAgeSec) to least, so outer thinning
+	// doesn't interfere with inner thinning decisions.
+	const sorted = [...rules].sort((a, b) => b.afterAgeSec - a.afterAgeSec);
+	const toDelete = new Set<string>();
+	const kept = new Set<string>();
+
+	for (const rule of sorted) {
+		const eligible = all.filter(s =>
+			!toDelete.has(s.segmentId) &&
+			now - s.endTime >= rule.afterAgeSec &&
+			(!rule.mimePrefix || s.mimeType.startsWith(rule.mimePrefix))
+		);
+		// Group eligible into keepOnePerSec buckets; keep the first in each bucket
+		const buckets = new Map<number, Segment[]>();
+		for (const seg of eligible) {
+			const bucket = Math.floor(seg.startTime / rule.keepOnePerSec);
+			if (!buckets.has(bucket)) buckets.set(bucket, []);
+			buckets.get(bucket)!.push(seg);
+		}
+		for (const segsInBucket of buckets.values()) {
+			segsInBucket.sort((a, b) => a.startTime - b.startTime);
+			const keepId = segsInBucket[0].segmentId;
+			if (!kept.has(keepId)) kept.add(keepId);
+			for (let i = 1; i < segsInBucket.length; i++) {
+				const s = segsInBucket[i];
+				if (!kept.has(s.segmentId)) toDelete.add(s.segmentId);
+			}
+		}
+	}
+
+	const segById = new Map(all.map(s => [s.segmentId, s]));
+	for (const segId of toDelete) {
+		const s = segById.get(segId);
+		if (s) dbg('info', 'idb', `thin: ${segId.slice(0, 8)} [${_fmtTs(s.startTime)}] ${s.mimeType}`);
+		await deleteSegmentBlob(segId);
+		await db.delete('segments', segId);
+	}
+
+	if (toDelete.size > 0) dbg('info', 'idb', `thinning complete: removed ${toDelete.size} segment(s)`);
+	return toDelete.size;
 }
 
 export async function getDistinctOriginMonitors(): Promise<string[]> {
@@ -401,14 +502,17 @@ export async function expirePinnedSegments(): Promise<number> {
 }
 
 export async function deleteSegment(segmentId: string): Promise<void> {
-	await deleteSegmentBlob(segmentId);
 	const db = await openDB();
+	const seg = await db.get('segments', segmentId) as Segment | undefined;
+	if (seg) dbg('info', 'idb', `delete segment: ${segmentId.slice(0, 8)} [${_fmtTs(seg.startTime)}–${_fmtTs(seg.endTime)}] ${seg.mimeType}${seg.pinned ? ' (was pinned)' : ''}`);
+	await deleteSegmentBlob(segmentId);
 	await db.delete('segments', segmentId);
 }
 
 export async function clearAll(): Promise<void> {
 	const db = await openDB();
 	const all = await db.getAll('segments') as Segment[];
+	dbg('warn', 'idb', `clear all: deleting ${all.length} segment(s)`);
 	for (const seg of all) {
 		await deleteSegmentBlob(seg.segmentId);
 	}
@@ -418,10 +522,10 @@ export async function clearAll(): Promise<void> {
 export async function clearForMonitor(originMonitor: string): Promise<void> {
 	const db = await openDB();
 	const all = await db.getAll('segments') as Segment[];
-	for (const seg of all) {
-		if (seg.originMonitor === originMonitor) {
-			await deleteSegmentBlob(seg.segmentId);
-			await db.delete('segments', seg.segmentId);
-		}
+	const toDelete = all.filter(s => s.originMonitor === originMonitor);
+	dbg('warn', 'idb', `clear monitor ${originMonitor.slice(0, 8)}: deleting ${toDelete.length} segment(s)`);
+	for (const seg of toDelete) {
+		await deleteSegmentBlob(seg.segmentId);
+		await db.delete('segments', seg.segmentId);
 	}
 }

@@ -62,13 +62,18 @@ export function buildTriggerEvent(
 	detectionType: string,
 	monitorLabel: string,
 	data: Record<string, unknown>,
-	footageRefId: string | null = null
+	footageRefId: string | null = null,
+	sourceId = 'default-mic',
+	messageTemplate?: string,
+	includeData = true
 ): NostrEvent {
 	const content = encrypt(privkey, viewerPubkey, JSON.stringify({
 		type: detectionType,
 		monitorLabel,
+		sourceId,
 		timestamp: Math.floor(Date.now() / 1000),
-		data,
+		...(includeData && { data }),
+		...(messageTemplate && { message: messageTemplate }),
 		footageRefId
 	}));
 	return finalizeEvent({
@@ -77,7 +82,8 @@ export function buildTriggerEvent(
 		tags: [
 			['p', viewerPubkey],
 			['d', monitorPubkey],
-			['t', detectionType]
+			['t', detectionType],
+			['s', sourceId]
 		],
 		content
 	}, privkey);
@@ -113,12 +119,14 @@ export function buildFootageRefEvent(
 	startTime: number,
 	endTime: number,
 	triggerTime: number,
+	sourceId = 'default-mic',
 	deleted = false
 ): NostrEvent {
 	const content = encrypt(privkey, viewerPubkey, JSON.stringify({
 		refId,
 		originMonitor: monitorPubkey,
 		triggerType,
+		sourceId,
 		startTime,
 		endTime,
 		triggerTime,
@@ -127,7 +135,7 @@ export function buildFootageRefEvent(
 	return finalizeEvent({
 		kind: KIND_FOOTAGE_REF,
 		created_at: Math.floor(Date.now() / 1000),
-		tags: [['p', viewerPubkey], ['d', refId], ['v', '2']],
+		tags: [['p', viewerPubkey], ['d', refId], ['v', '2'], ['s', sourceId]],
 		content
 	}, privkey);
 }

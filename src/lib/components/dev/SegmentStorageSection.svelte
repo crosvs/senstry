@@ -3,8 +3,9 @@
   import {
     getCoverageMap, getSegmentsInRange, getStorageUsed, clearForMonitor,
     cleanupOrphanedOpfsFiles, deleteSegment, pinSegment, unpinSegment,
-    expirePinnedSegments, type Segment
+    expirePinnedSegments, thinSegments, evictUnpinned, type Segment
   } from '$lib/db/segments';
+  import { storageCleanup, loadStorageCleanup } from '$lib/store/pipeline';
   import { onMount } from 'svelte';
   import {
     getAllFootageRefs, softDeleteFootageRef,
@@ -56,6 +57,14 @@
   let segGroups = $state<SegGroup[]>([]);
   let segLoading = $state(false);
   let segRangeTs = $state('');
+  let segDate = $state('');
+
+  function applyDateToRange(date: string): string {
+    if (!date) return '';
+    const from = Math.floor(new Date(date + 'T00:00:00').getTime() / 1000);
+    const to   = Math.floor(new Date(date + 'T23:59:59').getTime() / 1000);
+    return `${from}-${to}`;
+  }
 
   // Parse "startTime-endTime" or single "timestamp" into [from, to].
   function parseRange(input: string): [number, number] {
@@ -135,6 +144,7 @@
     endTime: number;
     triggerTime: number;
     originMonitor: string;
+    sourceId: string;
     publishedAt: number | null; // from IDB record; null for nostr-only
   }
 
@@ -142,6 +152,7 @@
   let alertsStatus = $state('');
   let alertsLoading = $state(false);
   let alertsRangeTs = $state('');
+  let alertsDate = $state('');
   let nostrSub: { close: () => void } | null = null;
   let coverageRaw = $state<[number, number][] | null>(null);
   let showCoverage = $state(false);
@@ -182,7 +193,7 @@
       if (idx !== undefined) {
         if (next[idx].source === 'nostr') { next[idx] = { ...next[idx], source: 'both', publishedAt: ref.publishedAt }; }
       } else {
-        next.push({ key: ref.refId, source: 'idb', refId: ref.refId, triggerType: ref.triggerType, startTime: ref.startTime, endTime: ref.endTime, triggerTime: ref.triggerTime, originMonitor: ref.originMonitor, publishedAt: ref.publishedAt });
+        next.push({ key: ref.refId, source: 'idb', refId: ref.refId, triggerType: ref.triggerType, startTime: ref.startTime, endTime: ref.endTime, triggerTime: ref.triggerTime, originMonitor: ref.originMonitor, sourceId: ref.sourceId ?? 'default-mic', publishedAt: ref.publishedAt });
         added++;
       }
     }
@@ -225,7 +236,7 @@
               if (idx >= 0) {
                 if (next[idx].source === 'idb') next[idx] = { ...next[idx], source: 'both' };
               } else {
-                next.push({ key: r.refId, source: 'nostr', refId: r.refId, triggerType: r.triggerType, startTime: r.startTime, endTime: r.endTime, triggerTime: r.triggerTime, originMonitor: payload.originMonitor ?? event.pubkey, publishedAt: null });
+                next.push({ key: r.refId, source: 'nostr', refId: r.refId, triggerType: r.triggerType, startTime: r.startTime, endTime: r.endTime, triggerTime: r.triggerTime, originMonitor: payload.originMonitor ?? event.pubkey, sourceId: payload.sourceId ?? event.tags.find((t: string[]) => t[0] === 's')?.[1] ?? 'default-mic', publishedAt: null });
               }
               return next.sort((a, b) => b.startTime - a.startTime);
             })();
@@ -263,7 +274,7 @@
     if (!a || a.source !== 'nostr') return;
     savingKeys = new Set([...savingKeys, key]);
     try {
-      await receiveFootageRef(a.refId, { originMonitor: a.originMonitor, triggerType: a.triggerType, startTime: a.startTime, endTime: a.endTime, triggerTime: a.triggerTime }, a.refId);
+      await receiveFootageRef(a.refId, { originMonitor: a.originMonitor, triggerType: a.triggerType, startTime: a.startTime, endTime: a.endTime, triggerTime: a.triggerTime, sourceId: a.sourceId }, a.refId);
       fetchedAlerts = fetchedAlerts.map(x => x.key === key ? { ...x, source: 'both', publishedAt: Date.now() } : x);
       dbg('info', 'idb', `alert saved: ${key.slice(0, 8)}`);
     } finally {
@@ -316,6 +327,23 @@
     await loadAll();
   }
 
+  let cleanupRunning = $state(false);
+  async function runCleanup() {
+    cleanupRunning = true;
+    try {
+      await loadStorageCleanup();
+      const cfg = $storageCleanup;
+      const expired = await expirePinnedSegments();
+      if (expired > 0) dbg('info', 'idb', `expired ${expired} pinned segment(s)`);
+      const thinned = await thinSegments(cfg.thinningRules, effectivePubkey ?? undefined);
+      await evictUnpinned(effectivePubkey ?? undefined);
+      dbg('info', 'idb', `cleanup done — thinned ${thinned}, expired ${expired}`);
+      await loadAll();
+    } finally {
+      cleanupRunning = false;
+    }
+  }
+
   let compacting = $state(false);
   async function runCompact() {
     if (!confirm(
@@ -358,6 +386,9 @@
 <DevSection title="Storage">
   {#snippet actions()}
     <button class="act-btn" onclick={loadAll}>Refresh</button>
+    <button class="act-btn" onclick={runCleanup} disabled={cleanupRunning}>
+      {cleanupRunning ? 'Cleaning…' : 'Run Cleanup'}
+    </button>
     <button class="act-btn" onclick={clearDevice}>Clear Device</button>
     <button class="act-btn danger" onclick={runCompact} disabled={compacting}>
       {compacting ? 'Compacting…' : 'Compact DB'}
@@ -367,7 +398,10 @@
   <!-- Stats -->
   <div class="stats-row">
     <span class="stat-item">Device: <b>{deviceLabel()}</b></span>
-    <span class="stat-item">{usedMb} MB used</span>
+    <span class="stat-item"
+      class:quota-warn={$storageCleanup.quotaMb > 0 && usedMb / $storageCleanup.quotaMb > 0.8}>
+      {usedMb} / {$storageCleanup.quotaMb} MB
+    </span>
     <span class="stat-item">{totalSegments} segments</span>
     {#if quotaTotalMb !== null}
       <span class="stat-item quota" class:quota-warn={quotaUsedMb !== null && quotaTotalMb > 0 && (quotaUsedMb / quotaTotalMb) > 0.8}>
@@ -383,9 +417,11 @@
   </div>
 
   <div class="filter-row">
+    <input type="date" class="date-input" bind:value={segDate}
+      onchange={() => { segRangeTs = applyDateToRange(segDate); }} />
     <input class="ts-input" bind:value={segRangeTs} placeholder="unix or start-end" />
     <button class="act-btn accent" onclick={loadSegments}>Filter</button>
-    <button class="act-btn" onclick={() => { segRangeTs = ''; loadSegments(); }}>All</button>
+    <button class="act-btn" onclick={() => { segRangeTs = ''; segDate = ''; loadSegments(); }}>All</button>
   </div>
 
   {#if segLoading}
@@ -449,6 +485,8 @@
 
   <!-- Alert fetch controls + time filter -->
   <div class="filter-row" style="margin-top:4px">
+    <input type="date" class="date-input" bind:value={alertsDate}
+      onchange={() => { alertsRangeTs = applyDateToRange(alertsDate); }} />
     <input class="ts-input" bind:value={alertsRangeTs} placeholder="unix or start-end" />
   </div>
   <div class="row" style="margin-top:4px">
@@ -541,6 +579,7 @@
   .subsec-hint { font-size: 10px; color: var(--color-border); }
 
   .filter-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .date-input { font-size: 11px; padding: 3px 6px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); font-family: inherit; }
   .ts-input { font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); font-family: inherit; flex: 1; min-width: 0; }
 
   .day-row { border: 1px solid var(--color-border); border-radius: 5px; overflow: hidden; }

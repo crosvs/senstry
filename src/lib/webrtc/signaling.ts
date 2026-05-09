@@ -10,6 +10,7 @@ export interface SignalMessage {
 	sessionId: string;
 	sdp?: string;
 	mode?: 'live' | 'data'; // live = viewer wants stream tracks; data = segment/coverage only
+	sourceId?: string;      // live mode only — which source stream to receive (omit = all sources)
 }
 
 export type SignalHandler = (msg: SignalMessage, fromPubkey: string) => void | Promise<void>;
@@ -80,9 +81,13 @@ export async function sendOfferRequest(
 	fromPubkey: string,
 	toPubkey: string,
 	sessionId: string,
-	mode: 'live' | 'data' = 'data'
+	mode: 'live' | 'data' = 'data',
+	sourceId?: string
 ): Promise<void> {
-	return sendSignal(privkey, fromPubkey, toPubkey, { type: 'offer-request', sessionId, mode });
+	return sendSignal(privkey, fromPubkey, toPubkey, {
+		type: 'offer-request', sessionId, mode,
+		...(sourceId && { sourceId }),
+	});
 }
 
 export async function sendAnswer(

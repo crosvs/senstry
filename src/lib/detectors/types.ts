@@ -5,9 +5,10 @@ export interface DetectionEvent<T = Record<string, unknown>> {
 }
 
 export interface Detector<T = Record<string, unknown>> {
-	start(stream: MediaStream): void;
+	start(stream?: MediaStream): void;
 	stop(): void;
 	onDetection: ((event: DetectionEvent<T>) => void) | null;
+	onFiringChange: ((firing: boolean) => void) | null;
 }
 
 export interface AudioDetectionData {

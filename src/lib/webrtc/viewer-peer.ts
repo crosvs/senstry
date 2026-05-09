@@ -49,6 +49,7 @@ function ensureViewerSubscription(privkey: Uint8Array, pubkey: string): void {
 const MIN_CONNECT_INTERVAL_MS = 4_000;
 
 let pendingCoverage: ((segments: [number, number][]) => void) | null = null;
+let pendingSourceList: ((ids: string[]) => void) | null = null;
 let coverageRejectTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingSegments = new Map<number, PendingSegment>();
 const pendingSegmentsById = new Map<string, PendingSegment>();
@@ -118,7 +119,8 @@ export async function ensureConnection(
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string,
-	mode: 'live' | 'data' = 'data'
+	mode: 'live' | 'data' = 'data',
+	sourceId?: string
 ): Promise<void> {
 	const existing = sessions.get(monitorPubkey);
 	// Reuse any open data channel. If upgrading to live, requestLiveView closes first.
@@ -183,7 +185,7 @@ export async function ensureConnection(
 			}
 		});
 
-		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId, mode);
+		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId, mode, sourceId);
 	});
 
 	connectPromises.set(monitorPubkey, promise);
@@ -193,11 +195,35 @@ export async function ensureConnection(
 export async function requestLiveView(
 	privkey: Uint8Array,
 	viewerPubkey: string,
-	monitorPubkey: string
+	monitorPubkey: string,
+	sourceId?: string
 ): Promise<void> {
 	closeSession(monitorPubkey);
 	lastConnectAttempts.delete(monitorPubkey);
-	return ensureConnection(privkey, viewerPubkey, monitorPubkey, 'live');
+	return ensureConnection(privkey, viewerPubkey, monitorPubkey, 'live', sourceId);
+}
+
+export async function requestSourceList(
+	privkey: Uint8Array,
+	viewerPubkey: string,
+	monitorPubkey: string
+): Promise<string[]> {
+	try { await ensureConnection(privkey, viewerPubkey, monitorPubkey); }
+	catch { throw new Error('offline'); }
+	const session = sessions.get(monitorPubkey);
+	if (!session?.dataChannel) throw new Error('offline');
+
+	return new Promise<string[]>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			pendingSourceList = null;
+			reject(new Error('source-list timeout'));
+		}, 5_000);
+		pendingSourceList = (ids) => {
+			clearTimeout(timer);
+			resolve(ids);
+		};
+		session.dataChannel!.send(JSON.stringify({ type: 'source-list-request' }));
+	});
 }
 
 export async function requestCoverageMap(
@@ -286,6 +312,13 @@ export async function requestSegmentById(
 function handleDataMessage(raw: string): void {
 	let msg: { type: string } & Record<string, unknown>;
 	try { msg = JSON.parse(raw); } catch { return; }
+
+	if (msg.type === 'source-list') {
+		const cb = pendingSourceList;
+		pendingSourceList = null;
+		cb?.(msg.sourceIds as string[]);
+		return;
+	}
 
 	if (msg.type === 'coverage-map') {
 		const cb = pendingCoverage;

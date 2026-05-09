@@ -13,14 +13,15 @@
   import ContentViewerSection from '$lib/components/dev/ContentViewerSection.svelte';
   import SegmentStorageSection from '$lib/components/dev/SegmentStorageSection.svelte';
   import type { SignalMessage } from '$lib/webrtc/signaling';
-  import type { DetectorTriggerState } from '$lib/detectors/audio';
+  import type { SensorState, LinkActivationState } from '$lib/store/pipeline';
   import type { AlertSession } from '$lib/components/dev/SentrySection.svelte';
 
   // ── Shared page-level state ───────────────────────────────────────────────
   let selectedMonitorPubkey = $state<string | null>(null);
   let signalRouterActive = $state(false);
   let autoAccept = $state(true);
-  let triggerStates = $state<Record<string, DetectorTriggerState>>({});
+  let sensorStates = $state<Record<string, SensorState>>({});
+  let linkStates = $state<Record<string, LinkActivationState>>({});
   let activeAlerts = $state<AlertSession[]>([]);
 
   interface PendingOffer { fromPubkey: string; msg: SignalMessage; }
@@ -66,12 +67,13 @@
     <IdentitySection />
     <RelaySection />
     <PairingSection />
-    <SettingsSection {triggerStates} {activeAlerts} />
+    <SettingsSection {sensorStates} {linkStates} {activeAlerts} />
 
     <SentrySection
       bind:signalRouterActive
       bind:autoAccept
-      bind:triggerStates
+      bind:sensorStates
+      bind:linkStates
       bind:activeAlerts
       onPendingOffer={handlePendingOffer}
       acceptOffer={acceptingOffer}
