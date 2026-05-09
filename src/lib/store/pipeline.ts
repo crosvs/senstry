@@ -31,10 +31,9 @@ export interface SensorConfig {
 	settlingMs: number;
 	// intervalMs: for schedule sensors — how often to fire (ms)
 	intervalMs?: number;
-	// timewindow fields
-	startHHMM?: string;      // "HH:MM" e.g. "22:00"
-	endHHMM?: string;        // "HH:MM" e.g. "05:30"
-	daysOfWeek?: number[];   // 0=Sun … 6=Sat; empty/undefined = all days
+	// timewindow: active hour-slots as (dayOfWeek * 24 + hour), 0=Sun 00:00 … 167=Sat 23:00
+	// Empty/undefined = no active hours (sensor never fires).
+	activeSlots?: number[];
 	// daterange fields
 	startIso?: string;       // ISO datetime e.g. "2026-05-10T22:00"
 	endIso?: string;
@@ -43,7 +42,10 @@ export interface SensorConfig {
 export type CaptureMethod =
 	| { id: string; name: string; type: 'video';  sourceId: string; priority: number;
 	    videoWidth: number; videoHeight: number;
-	    videoBitsPerSec: number; audioBitsPerSec: number; videoCodec: string; }
+	    videoBitsPerSec: number; audioBitsPerSec: number; videoCodec: string;
+	    // audioSourceId: mix audio from a separate source (e.g. mic) into the video recording.
+	    // Empty string = use audio tracks from the video source (if any).
+	    audioSourceId?: string; }
 	| { id: string; name: string; type: 'audio';  sourceId: string; priority: number;
 	    audioBitsPerSec: number; mimeType: string; }
 	| { id: string; name: string; type: 'photo';  sourceId: string;
@@ -350,20 +352,31 @@ export function newSource(): SourceConfig {
 	return { id: randomUUID(), name: 'New Source', type: 'microphone', deviceId: '' };
 }
 
+// Generates 168 slots for a typical weekday night window (Mon–Fri 22:00–06:00)
+function _nightSlots(): number[] {
+	const slots: number[] = [];
+	// Mon=1 … Fri=5 for the evening portion (22:00–23:00); Tue=2 … Sat=6 for the morning portion (00:00–05:59)
+	const eveningDays = [1, 2, 3, 4, 5]; // Mon–Fri nights
+	const morningDays = [2, 3, 4, 5, 6]; // Tue–Sat mornings
+	for (const d of eveningDays) { for (let h = 22; h < 24; h++) slots.push(d * 24 + h); }
+	for (const d of morningDays) { for (let h = 0; h < 6; h++) slots.push(d * 24 + h); }
+	return slots;
+}
+
 export function newSensor(sourceId: string, type: SensorConfig['type'] = 'audio'): SensorConfig {
 	if (type === 'schedule') {
 		return {
-			id: randomUUID(), name: 'New Timer', type: 'schedule',
+			id: randomUUID(), name: 'Periodic Timer', type: 'schedule',
 			sourceId: 'none', enabled: true,
 			thresholdDb: 0, minDurationMs: 0, settlingMs: 1000, intervalMs: 60_000,
 		};
 	}
 	if (type === 'timewindow') {
 		return {
-			id: randomUUID(), name: 'New Time Window', type: 'timewindow',
+			id: randomUUID(), name: 'Time Window', type: 'timewindow',
 			sourceId: 'none', enabled: true,
 			thresholdDb: 0, minDurationMs: 0, settlingMs: 0,
-			startHHMM: '22:00', endHHMM: '06:00', daysOfWeek: [],
+			activeSlots: _nightSlots(),
 		};
 	}
 	if (type === 'daterange') {
@@ -373,22 +386,36 @@ export function newSensor(sourceId: string, type: SensorConfig['type'] = 'audio'
 			`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 		const end = new Date(now.getTime() + 24 * 3600_000);
 		return {
-			id: randomUUID(), name: 'New Date Range', type: 'daterange',
+			id: randomUUID(), name: 'Date Range', type: 'daterange',
 			sourceId: 'none', enabled: true,
 			thresholdDb: 0, minDurationMs: 0, settlingMs: 0,
 			startIso: toIso(now), endIso: toIso(end),
 		};
 	}
 	return {
-		id: randomUUID(), name: 'New Sensor', type: 'audio',
+		id: randomUUID(), name: 'Audio Detection', type: 'audio',
 		sourceId, enabled: true,
 		thresholdDb: -45, releaseThresholdDb: -50, minDurationMs: 1500, settlingMs: 500,
 	};
 }
 
-export function newCapture(sourceId: string): CaptureMethod {
+export function newCapture(sourceId: string, type: CaptureMethod['type'] = 'audio'): CaptureMethod {
+	if (type === 'video') {
+		return {
+			id: randomUUID(), name: 'Video Recording', type: 'video',
+			sourceId, priority: 10,
+			videoWidth: 0, videoHeight: 0, videoBitsPerSec: 0, audioBitsPerSec: 64_000, videoCodec: '',
+			audioSourceId: '',
+		};
+	}
+	if (type === 'photo') {
+		return {
+			id: randomUUID(), name: 'Photo Capture', type: 'photo',
+			sourceId, imageWidth: 640, imageHeight: 0, imageQuality: 0.85, imageFormat: 'image/jpeg',
+		};
+	}
 	return {
-		id: randomUUID(), name: 'New Capture', type: 'audio',
+		id: randomUUID(), name: 'Audio Recording', type: 'audio',
 		sourceId, priority: 10, audioBitsPerSec: 64_000, mimeType: '',
 	};
 }
@@ -399,7 +426,7 @@ export function newNostrAction(): NostrAction {
 
 export function newLink(sensorId: string): Link {
 	return {
-		id: randomUUID(), name: 'New Link', enabled: true,
+		id: randomUUID(), name: 'Detection → Recording', enabled: true,
 		sensorId, onState: 'active', minStateDurationMs: 0,
 		captureId: null, nostrActionId: null,
 		preRollSec: 30, postRollSec: 30,

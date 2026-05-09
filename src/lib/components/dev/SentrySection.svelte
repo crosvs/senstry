@@ -224,9 +224,7 @@
         if (sensor.type === 'schedule') {
           det = new ScheduleDetector({ intervalMs: sensor.intervalMs, settlingMs: sensor.settlingMs });
         } else if (sensor.type === 'timewindow') {
-          det = new TimeWindowDetector({
-            startHHMM: sensor.startHHMM, endHHMM: sensor.endHHMM, daysOfWeek: sensor.daysOfWeek,
-          });
+          det = new TimeWindowDetector({ activeSlots: sensor.activeSlots ?? [] });
         } else if (sensor.type === 'daterange') {
           det = new DateRangeDetector({ startIso: sensor.startIso, endIso: sensor.endIso });
         } else {
@@ -394,7 +392,11 @@
       }
 
       // Sensor is in target state
-      if (firingLinks.has(link.id)) continue; // already firing
+      if (firingLinks.has(link.id)) {
+        // Already firing — cancel any pending deactivation (sensor came back while in post-roll)
+        _cancelLinkDeactivation(link.id);
+        continue;
+      }
 
       if (link.minStateDurationMs <= 0) {
         // Activate immediately
@@ -523,7 +525,20 @@
     const mimeType = _selectMimeType(cap);
     const videoBps = cap.type === 'video' ? (cap.videoBitsPerSec > 0 ? cap.videoBitsPerSec : 500_000) : undefined;
     const audioBps = 'audioBitsPerSec' in cap && cap.audioBitsPerSec > 0 ? cap.audioBitsPerSec : 64_000;
-    const recordStream = cap.type === 'video' ? stream : new MediaStream(stream.getAudioTracks());
+
+    // For video captures: build a mixed stream — video from the primary source, audio from
+    // audioSourceId (if set) or fall back to whatever audio the primary source has.
+    let recordStream: MediaStream;
+    if (cap.type === 'video') {
+      const videoTracks = stream.getVideoTracks();
+      const audioSource = (cap.audioSourceId && openStreams.get(cap.audioSourceId)) ?? null;
+      const audioTracks = audioSource
+        ? audioSource.getAudioTracks()
+        : stream.getAudioTracks();
+      recordStream = new MediaStream([...videoTracks, ...audioTracks]);
+    } else {
+      recordStream = new MediaStream(stream.getAudioTracks());
+    }
     const segStart = Math.floor(Date.now() / 1000);
 
     const slot: RecorderSlot = { recorder: null, captureId: cap.id, segmentStart: segStart, chunks: [] };

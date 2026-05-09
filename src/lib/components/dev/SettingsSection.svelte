@@ -112,7 +112,11 @@
     try {
       await savePipeline({
         sources:      localSources.map(s => ({ ...s })),
-        sensors:      localSensors.map(s => ({ ...s })),
+        // activeSlots is a Proxy array in $state — must spread to plain array for IDB structured-clone
+        sensors:      localSensors.map(s => ({
+          ...s,
+          ...(s.activeSlots !== undefined && { activeSlots: [...s.activeSlots] }),
+        })),
         captures:     localCaptures.map(c => ({ ...c })),
         nostrActions: localNostrActions.map(n => ({ ...n })),
         links:        localLinks.map(l => ({ ...l })),
@@ -273,7 +277,47 @@
     return compat.find(s => s.id === cap.sourceId) ? cap.sourceId : (compat[0]?.id ?? cap.sourceId);
   }
 
-  const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  // ── Availability grid (time-window sensor) ─────────────────────────────────
+  const GRID_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  let gridDrag: { sensorId: string; turnOn: boolean } | null = null;
+
+  function gridSlotActive(sen: SensorConfig, slot: number): boolean {
+    return (sen.activeSlots ?? []).includes(slot);
+  }
+
+  function gridSetSlot(sen: SensorConfig, slot: number, on: boolean) {
+    const current = sen.activeSlots ?? [];
+    const has = current.includes(slot);
+    if (on === has) return;
+    sen.activeSlots = on
+      ? [...current, slot].sort((a, b) => a - b)
+      : current.filter(s => s !== slot);
+    // Touch the array to ensure Svelte 5 fine-grained reactivity picks up the change
+    localSensors = localSensors.map(s => s.id === sen.id ? { ...sen, activeSlots: [...(sen.activeSlots ?? [])] } : s);
+  }
+
+  function gridPointerDown(e: PointerEvent, sen: SensorConfig, slot: number) {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const on = !gridSlotActive(sen, slot);
+    gridDrag = { sensorId: sen.id, turnOn: on };
+    gridSetSlot(sen, slot, on);
+  }
+
+  function gridPointerEnter(sen: SensorConfig, slot: number) {
+    if (!gridDrag || gridDrag.sensorId !== sen.id) return;
+    gridSetSlot(sen, slot, gridDrag.turnOn);
+  }
+
+  function gridPointerUp() { gridDrag = null; }
+
+  function gridSelectAll(sen: SensorConfig) {
+    sen.activeSlots = Array.from({ length: 168 }, (_, i) => i);
+    localSensors = localSensors.map(s => s.id === sen.id ? { ...sen, activeSlots: [...(sen.activeSlots ?? [])] } : s);
+  }
+  function gridClear(sen: SensorConfig) {
+    sen.activeSlots = [];
+    localSensors = localSensors.map(s => s.id === sen.id ? { ...sen, activeSlots: [] } : s);
+  }
 
   function changeSensorType(id: string, type: SensorConfig['type']) {
     localSensors = localSensors.map(s => {
@@ -285,7 +329,7 @@
       if (type === 'timewindow') {
         return { id: s.id, name: s.name, type: 'timewindow', sourceId: 'none',
           enabled: s.enabled, thresholdDb: 0, minDurationMs: 0, settlingMs: 0,
-          startHHMM: '22:00', endHHMM: '06:00', daysOfWeek: [] } as SensorConfig;
+          activeSlots: [] } as SensorConfig;
       }
       if (type === 'daterange') {
         const now = new Date();
@@ -300,13 +344,6 @@
       return { id: s.id, name: s.name, type: 'audio', sourceId: localSources[0]?.id ?? 'default-mic',
         enabled: s.enabled, thresholdDb: -45, releaseThresholdDb: -50, minDurationMs: 1500, settlingMs: 500 } as SensorConfig;
     });
-  }
-
-  function toggleDow(sensor: SensorConfig, day: number) {
-    const current = sensor.daysOfWeek ?? [];
-    sensor.daysOfWeek = current.includes(day) ? current.filter(d => d !== day) : [...current, day].sort();
-    // Trigger reactivity: replace the sensor in the array
-    localSensors = localSensors.map(s => s.id === sensor.id ? { ...sensor } : s);
   }
 </script>
 
@@ -495,40 +532,63 @@
           </label>
 
         {:else if sen.type === 'timewindow'}
-          <div class="field-row">
-            <span class="field-lbl">Start</span>
-            <input class="time-input" type="time" value={sen.startHHMM ?? '22:00'}
-              onchange={(e) => { sen.startHHMM = (e.target as HTMLInputElement).value; }} />
-          </div>
-          <div class="field-row">
-            <span class="field-lbl">End</span>
-            <input class="time-input" type="time" value={sen.endHHMM ?? '06:00'}
-              onchange={(e) => { sen.endHHMM = (e.target as HTMLInputElement).value; }} />
-          </div>
-          <div class="field-hint">If End is earlier than Start, the window crosses midnight.</div>
-          <div class="field-row">
-            <span class="field-lbl">Days</span>
-            <div class="dow-pills">
-              {#each DOW_LABELS as lbl, i}
-                {@const active = (sen.daysOfWeek ?? []).includes(i)}
-                <button class="dow-pill" class:active onclick={() => toggleDow(sen, i)}>{lbl}</button>
+          <!-- Availability grid: drag to paint active hours. Hours = columns, days = rows. -->
+          <div class="avail-wrap full-row">
+            <div class="avail-header-row">
+              <div class="avail-day-stub"></div>
+              {#each Array.from({ length: 24 }, (_, h) => h) as h}
+                <div class="avail-hr-lbl">{h % 6 === 0 ? String(h).padStart(2, '0') : ''}</div>
               {/each}
-              <span class="field-hint-inline">{(sen.daysOfWeek ?? []).length === 0 ? 'all days' : ''}</span>
+            </div>
+            {#each GRID_DAYS as dayName, d}
+              <div class="avail-row">
+                <div class="avail-day-lbl">{dayName}</div>
+                {#each Array.from({ length: 24 }, (_, h) => h) as h}
+                  {@const slot = d * 24 + h}
+                  {@const active = gridSlotActive(sen, slot)}
+                  <div class="avail-cell" class:active
+                    role="checkbox" aria-checked={active} tabindex="-1"
+                    onpointerdown={(e) => gridPointerDown(e, sen, slot)}
+                    onpointerenter={() => gridPointerEnter(sen, slot)}
+                    onpointerup={gridPointerUp}></div>
+                {/each}
+              </div>
+            {/each}
+            <div class="avail-footer">
+              <span class="field-hint-inline">{(sen.activeSlots ?? []).length} active hour-slot{(sen.activeSlots ?? []).length !== 1 ? 's' : ''}</span>
+              <button class="link-btn" onclick={() => gridSelectAll(sen)}>All</button>
+              <button class="link-btn" onclick={() => gridClear(sen)}>None</button>
+              <button class="link-btn" onclick={() => {
+                const weekdays = [1,2,3,4,5]; const s: number[] = [];
+                for (const d of weekdays) for (let h = 0; h < 24; h++) s.push(d * 24 + h);
+                sen.activeSlots = s;
+                localSensors = localSensors.map(x => x.id === sen.id ? { ...sen, activeSlots: [...s] } : x);
+              }}>Weekdays</button>
+              <button class="link-btn" onclick={() => {
+                const nights = [0,1,2,3,4,5,6]; const s: number[] = [];
+                for (const d of nights) for (let h of [22,23,0,1,2,3,4,5]) {
+                  const effectiveD = h < 6 ? (d + 1) % 7 : d;
+                  s.push(effectiveD * 24 + h);
+                }
+                const uniq = [...new Set(s)].sort((a, b) => a - b);
+                sen.activeSlots = uniq;
+                localSensors = localSensors.map(x => x.id === sen.id ? { ...sen, activeSlots: [...uniq] } : x);
+              }}>Nights</button>
             </div>
           </div>
 
         {:else if sen.type === 'daterange'}
-          <div class="field-row">
+          <div class="field-row full-row">
             <span class="field-lbl">Start</span>
             <input class="datetime-input" type="datetime-local" value={sen.startIso ?? ''}
               onchange={(e) => { sen.startIso = (e.target as HTMLInputElement).value; }} />
           </div>
-          <div class="field-row">
+          <div class="field-row full-row">
             <span class="field-lbl">End</span>
             <input class="datetime-input" type="datetime-local" value={sen.endIso ?? ''}
               onchange={(e) => { sen.endIso = (e.target as HTMLInputElement).value; }} />
           </div>
-          <div class="field-hint">One-time activation. Sensor becomes inactive after the end time.</div>
+          <div class="field-hint full-row">One-time activation between these datetimes. Becomes permanently inactive after the end.</div>
         {/if}
       </div>
     </div>
@@ -572,6 +632,16 @@
             <span class="field-lbl">Priority</span>
             <input class="num-input" type="number" min="1" step="1" value={cap.priority}
               oninput={(e) => patchCapture(cap.id, { priority: +(e.target as HTMLInputElement).value })} />
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Audio source</span>
+            <select class="field-select" value={cap.audioSourceId ?? ''}
+              onchange={(e) => patchCapture(cap.id, { audioSourceId: (e.target as HTMLSelectElement).value })}>
+              <option value="">From video source</option>
+              {#each localSources.filter(s => s.type === 'microphone') as src}
+                <option value={src.id}>{sourceOptionLabel(src)}</option>
+              {/each}
+            </select>
           </label>
           <label class="field-row">
             <span class="field-lbl">Codec</span>
@@ -758,33 +828,52 @@
             {/each}
           </select>
         </label>
-        <label class="field-row">
-          <span class="field-lbl">Pre-roll</span>
-          <div class="num-with-unit">
-            <input class="num-input" type="number" min="0" step="5" value={lnk.preRollSec}
-              oninput={(e) => { lnk.preRollSec = +(e.target as HTMLInputElement).value; }} />
-            <span class="unit">s</span>
-          </div>
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Post-roll</span>
-          <div class="num-with-unit">
-            <input class="num-input" type="number" min="0" step="5" value={lnk.postRollSec}
-              oninput={(e) => { lnk.postRollSec = +(e.target as HTMLInputElement).value; }} />
-            <span class="unit">s</span>
-          </div>
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Retrigger</span>
-          <select class="field-select" value={lnk.onRetrigger}
-            onchange={(e) => { lnk.onRetrigger = (e.target as HTMLSelectElement).value as 'extend' | 'ignore' | 'restart'; }}>
-            <option value="extend">Extend</option>
-            <option value="ignore">Ignore</option>
-            <option value="restart">Restart</option>
-          </select>
-        </label>
-        <label class="field-row pin-row">
-          <span class="field-lbl">Pin</span>
+        {#if capType === 'photo'}
+          <!-- Photo links: fire-and-forget, no pre/post-roll concept -->
+          <label class="field-row">
+            <span class="field-lbl">Snapshots</span>
+            <input class="num-input" type="number" min="1" step="1" value={lnk.snapshotCount}
+              oninput={(e) => { lnk.snapshotCount = +(e.target as HTMLInputElement).value; }} />
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Interval</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="0.5" value={lnk.intervalSec}
+                oninput={(e) => { lnk.intervalSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+        {:else}
+          <!-- Video/audio links: pre/post-roll control which recorded segments get pinned -->
+          <label class="field-row">
+            <span class="field-lbl">Pre-roll</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="5" value={lnk.preRollSec}
+                oninput={(e) => { lnk.preRollSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Post-roll</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="5" value={lnk.postRollSec}
+                oninput={(e) => { lnk.postRollSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+          <div class="field-hint full-row">Recording runs in {10}-second segments. Pre/post-roll pin segments in that window around the trigger. Set both to 0 to pin only the detection itself.</div>
+          <label class="field-row">
+            <span class="field-lbl">Retrigger</span>
+            <select class="field-select" value={lnk.onRetrigger}
+              onchange={(e) => { lnk.onRetrigger = (e.target as HTMLSelectElement).value as 'extend' | 'ignore' | 'restart'; }}>
+              <option value="extend">Extend window</option>
+              <option value="ignore">Ignore</option>
+              <option value="restart">Restart</option>
+            </select>
+          </label>
+        {/if}
+        <label class="field-row pin-row full-row">
+          <span class="field-lbl">Keep for</span>
           <button class="toggle-pill" style="background:{lnk.pinLifetimeSec !== null ? 'var(--color-success)' : 'var(--color-border)'}"
             onclick={() => { lnk.pinLifetimeSec = lnk.pinLifetimeSec !== null ? null : 7 * 86400; }}>
             <span class="pill-thumb" style="transform:translateX({lnk.pinLifetimeSec !== null ? '14px' : '2px'})"></span>
@@ -805,7 +894,6 @@
                 const newUnit = (e.target as HTMLSelectElement).value as PinUnit;
                 pinUnits = { ...pinUnits, [lnk.id]: newUnit };
                 const uSec = PIN_UNITS.find(u => u.label === newUnit)!.s;
-                // Convert existing value to new unit, preserve duration
                 if (lnk.pinLifetimeSec && lnk.pinLifetimeSec > 0) {
                   const count = Math.max(1, Math.round(lnk.pinLifetimeSec / uSec));
                   lnk.pinLifetimeSec = count * uSec;
@@ -822,23 +910,8 @@
             </label>
           {/if}
         </label>
-        {#if capType === 'photo'}
-          <label class="field-row">
-            <span class="field-lbl">Snapshots</span>
-            <input class="num-input" type="number" min="1" step="1" value={lnk.snapshotCount}
-              oninput={(e) => { lnk.snapshotCount = +(e.target as HTMLInputElement).value; }} />
-          </label>
-          <label class="field-row">
-            <span class="field-lbl">Interval</span>
-            <div class="num-with-unit">
-              <input class="num-input" type="number" min="0" step="0.5" value={lnk.intervalSec}
-                oninput={(e) => { lnk.intervalSec = +(e.target as HTMLInputElement).value; }} />
-              <span class="unit">s</span>
-            </div>
-          </label>
-        {/if}
         {#if isNoop(lnk)}
-          <div class="noop-warn">⚠ No capture or action — this link does nothing.</div>
+          <div class="noop-warn full-row">⚠ No capture or action — this link does nothing.</div>
         {/if}
       </div>
     </div>
@@ -1035,11 +1108,20 @@
   .remove-btn { font-size: 11px; padding: 0 5px; border: none; background: none; color: var(--color-muted); cursor: pointer; }
   .remove-btn:hover { color: var(--color-danger); }
 
-  /* Time-window and date-range sensor inputs */
-  .time-input { font-size: 11px; padding: 2px 5px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: inherit; }
-  .datetime-input { font-size: 11px; padding: 2px 5px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: inherit; width: 100%; max-width: 200px; }
-  .dow-pills { display: flex; gap: 3px; align-items: center; flex-wrap: wrap; }
-  .dow-pill { font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-muted); cursor: pointer; font-family: inherit; transition: background 0.12s, color 0.12s; }
-  .dow-pill.active { background: var(--color-accent); color: white; border-color: var(--color-accent); }
-  .dow-pill:hover:not(.active) { border-color: var(--color-accent); color: var(--color-accent); }
+  /* Date-range sensor inputs */
+  .datetime-input { font-size: 11px; padding: 2px 5px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: inherit; flex: 1; }
+
+  /* ── Availability grid (time-window sensor) ─────────────────────────────── */
+  .avail-wrap { user-select: none; touch-action: none; }
+  .avail-header-row { display: grid; grid-template-columns: 28px repeat(24, 1fr); gap: 1px; margin-bottom: 1px; }
+  .avail-row { display: grid; grid-template-columns: 28px repeat(24, 1fr); gap: 1px; }
+  .avail-day-stub { }
+  .avail-hr-lbl { font-size: 8px; color: var(--color-muted); text-align: center; line-height: 1; }
+  .avail-day-lbl { font-size: 9px; color: var(--color-muted); font-weight: 600; display: flex; align-items: center; }
+  .avail-cell { height: 14px; border-radius: 2px; background: var(--color-surface); cursor: crosshair; transition: background 0.06s; }
+  .avail-cell.active { background: var(--color-accent); }
+  .avail-cell:hover { opacity: 0.75; }
+  .avail-footer { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+  .link-btn { font-size: 9px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--color-border); background: none; color: var(--color-muted); cursor: pointer; font-family: inherit; }
+  .link-btn:hover { color: var(--color-text); border-color: var(--color-text); }
 </style>

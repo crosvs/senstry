@@ -1,37 +1,27 @@
 import type { Detector, DetectionEvent } from './types';
 import type { SensorConfig, SensorState } from '$lib/store/pipeline';
 
-// Activates during a recurring HH:MM–HH:MM window on selected days of week.
-// Handles midnight crossover (e.g. 22:00–05:30).
-// Day-of-week check is applied to the *start* of the window, not the end.
+// Activates during selected hour-slots in the weekly schedule.
+// activeSlots: array of (dayOfWeek * 24 + hour) values, 0 = Sunday 00:00, 167 = Saturday 23:00.
+// Transitions from idle to active at the start of an active slot (hour boundary).
+// Transitions from active to idle when leaving an active slot.
+// Polls every 60 seconds; accurate to the nearest minute within a slot.
 export class TimeWindowDetector implements Detector<Record<string, unknown>> {
 	onDetection: ((event: DetectionEvent<Record<string, unknown>>) => void) | null = null;
 	onFiringChange: ((firing: boolean) => void) | null = null;
 	onStateChange: ((state: SensorState) => void) | null = null;
 
-	private startH: number;
-	private startM: number;
-	private endH: number;
-	private endM: number;
-	private daysOfWeek: number[];  // 0=Sun … 6=Sat; empty = all days
-	private crossesMidnight: boolean;
+	private activeSet: Set<number>;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private isInWindow = false;
 
-	constructor(config: Pick<SensorConfig, 'startHHMM' | 'endHHMM' | 'daysOfWeek'>) {
-		const [sh, sm] = this._parseHHMM(config.startHHMM ?? '00:00');
-		const [eh, em] = this._parseHHMM(config.endHHMM ?? '00:00');
-		this.startH = sh; this.startM = sm;
-		this.endH   = eh; this.endM   = em;
-		this.daysOfWeek = config.daysOfWeek ?? [];
-		const startMins = sh * 60 + sm;
-		const endMins   = eh * 60 + em;
-		this.crossesMidnight = endMins <= startMins;
+	constructor(config: Pick<SensorConfig, 'activeSlots'>) {
+		this.activeSet = new Set(config.activeSlots ?? []);
 	}
 
 	start(_stream?: MediaStream): void {
 		this._tick();
-		this.timer = setInterval(() => this._tick(), 30_000);
+		this.timer = setInterval(() => this._tick(), 60_000);
 	}
 
 	stop(): void {
@@ -39,22 +29,22 @@ export class TimeWindowDetector implements Detector<Record<string, unknown>> {
 		this.isInWindow = false;
 	}
 
-	private _parseHHMM(s: string): [number, number] {
-		const parts = s.split(':');
-		return [parseInt(parts[0] ?? '0', 10), parseInt(parts[1] ?? '0', 10)];
+	private _currentSlot(now = new Date()): number {
+		return now.getDay() * 24 + now.getHours();
 	}
 
 	private _tick(): void {
 		const now = new Date();
-		const inWindow = this._isInWindow(now);
+		const inWindow = this.activeSet.has(this._currentSlot(now));
+
 		if (inWindow === this.isInWindow) {
-			// No transition — still update nextFireAt when outside the window
 			if (!inWindow) {
-				const nextMs = this._nextActivationMs(now);
-				this.onStateChange?.({ status: 'idle', nextFireAt: nextMs });
+				// Still outside — keep updating the countdown
+				this.onStateChange?.({ status: 'idle', nextFireAt: this._nextActivationMs(now) });
 			}
 			return;
 		}
+
 		this.isInWindow = inWindow;
 		if (inWindow) {
 			this.onFiringChange?.(true);
@@ -62,43 +52,29 @@ export class TimeWindowDetector implements Detector<Record<string, unknown>> {
 			this.onDetection?.({ type: 'timewindow', data: {}, timestamp: Math.floor(Date.now() / 1000) });
 		} else {
 			this.onFiringChange?.(false);
-			const nextMs = this._nextActivationMs(now);
-			this.onStateChange?.({ status: 'idle', nextFireAt: nextMs });
+			this.onStateChange?.({ status: 'idle', nextFireAt: this._nextActivationMs(now) });
 		}
-	}
-
-	private _isInWindow(now: Date): boolean {
-		const nowMs = now.getTime();
-		// Check windows that could have started today (d=0) or yesterday (d=1, for midnight-crossing windows)
-		for (let d = 0; d <= 1; d++) {
-			const startCandidate = new Date(now);
-			startCandidate.setDate(startCandidate.getDate() - d);
-			startCandidate.setHours(this.startH, this.startM, 0, 0);
-			if (startCandidate.getTime() > nowMs) continue; // start hasn't happened yet
-
-			const endCandidate = new Date(startCandidate);
-			if (this.crossesMidnight) endCandidate.setDate(endCandidate.getDate() + 1);
-			endCandidate.setHours(this.endH, this.endM, 0, 0);
-
-			if (nowMs < endCandidate.getTime()) {
-				// Now is between start and end — check if the start day is allowed
-				const startDay = startCandidate.getDay();
-				if (this.daysOfWeek.length === 0 || this.daysOfWeek.includes(startDay)) return true;
-			}
-		}
-		return false;
 	}
 
 	private _nextActivationMs(now: Date): number {
-		for (let d = 0; d <= 7; d++) {
-			const candidate = new Date(now);
-			candidate.setDate(candidate.getDate() + d);
-			candidate.setHours(this.startH, this.startM, 0, 0);
-			if (candidate.getTime() <= now.getTime()) continue;
-			if (this.daysOfWeek.length === 0 || this.daysOfWeek.includes(candidate.getDay())) {
+		// Walk forward up to 7 days × 24 hours looking for a slot that follows a non-active slot
+		// (i.e. the start of an active window, not the continuation of one).
+		const nowMs = now.getTime();
+		for (let offset = 1; offset <= 7 * 24; offset++) {
+			const candidate = new Date(nowMs + offset * 3_600_000);
+			candidate.setMinutes(0, 0, 0);
+			const slot = this._currentSlot(candidate);
+			const prevSlot = (slot + 167) % 168; // slot one hour earlier in the week cycle
+			if (this.activeSet.has(slot) && !this.activeSet.has(prevSlot)) {
 				return candidate.getTime();
 			}
 		}
-		return now.getTime() + 7 * 24 * 3600_000;
+		// Fallback: next active slot regardless of transition
+		for (let offset = 1; offset <= 7 * 24; offset++) {
+			const candidate = new Date(nowMs + offset * 3_600_000);
+			candidate.setMinutes(0, 0, 0);
+			if (this.activeSet.has(this._currentSlot(candidate))) return candidate.getTime();
+		}
+		return nowMs + 7 * 24 * 3_600_000;
 	}
 }
