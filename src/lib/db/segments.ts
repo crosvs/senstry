@@ -33,6 +33,15 @@ export interface Segment {
 	originMonitor: string;
 	sourceId: string;   // which input device produced this segment; legacy records default to 'default-mic'
 	backupOf: string | null;
+	contentHash: string; // SHA-256 hex of blob content; '' for pre-v6 records (hash unavailable)
+}
+
+export async function computeHash(blob: Blob): Promise<string> {
+	const buf = await blob.arrayBuffer();
+	const hashBuf = await crypto.subtle.digest('SHA-256', buf);
+	return Array.from(new Uint8Array(hashBuf))
+		.map(b => b.toString(16).padStart(2, '0'))
+		.join('');
 }
 
 export type SegmentWithBlob = Segment & { blob: Blob };
@@ -224,6 +233,8 @@ export async function saveSegment(
 		}
 	}
 
+	const contentHash = await computeHash(blob);
+
 	const record: Segment = {
 		segmentId,
 		mimeType,
@@ -234,7 +245,8 @@ export async function saveSegment(
 		pinnedUntil: null,
 		originMonitor,
 		sourceId,
-		backupOf
+		backupOf,
+		contentHash,
 	};
 	const db = await openDB();
 	await db.put('segments', record);
@@ -290,6 +302,12 @@ export async function getSegmentById(segmentId: string): Promise<SegmentWithBlob
 	const blob = await readSegmentBlob(segmentId);
 	if (!blob) return undefined;
 	return { ...meta, blob };
+}
+
+export async function getSegmentByHash(hash: string): Promise<Segment | undefined> {
+	if (!hash) return undefined;
+	const db = await openDB();
+	return db.getFromIndex('segments', 'contentHash', hash) as Promise<Segment | undefined>;
 }
 
 export async function getSegmentAt(time: number, originMonitor?: string): Promise<SegmentWithBlob | undefined> {

@@ -4,6 +4,7 @@ import { streamState, remoteStream } from '$lib/store/stream';
 import { dbg } from '$lib/store/debug';
 import type { SignalMessage } from './signaling';
 import { randomUUID } from '$lib/utils';
+import { computeHash } from '$lib/db/segments';
 
 interface ViewerSession {
 	pc: RTCPeerConnection;
@@ -19,6 +20,7 @@ interface PendingSegment {
 	endTime: number;
 	originMonitor: string;
 	segmentId: string;
+	contentHash: string;
 	chunks: string[];
 	total: number;
 	resolve: (r: { mimeType: string; blob: Blob; startTime: number; endTime: number; originMonitor: string; segmentId: string }) => void;
@@ -274,7 +276,7 @@ export async function requestSegment(
 			reject(new Error('segment timeout'));
 		}, 30_000);
 		pendingSegments.set(time, {
-			mimeType: '', startTime: 0, endTime: 0, originMonitor: '', segmentId: '',
+			mimeType: '', startTime: 0, endTime: 0, originMonitor: '', segmentId: '', contentHash: '',
 			chunks: [], total: 0,
 			resolve: (r) => { clearTimeout(timer); resolve(r); },
 			reject: (reason) => { clearTimeout(timer); pendingSegments.delete(time); reject(new Error(reason)); }
@@ -302,7 +304,7 @@ export async function requestSegmentById(
 			reject(new Error('segment timeout'));
 		}, 30_000);
 		pendingSegmentsById.set(segmentId, {
-			mimeType: '', startTime: 0, endTime: 0, originMonitor: '', segmentId: '',
+			mimeType: '', startTime: 0, endTime: 0, originMonitor: '', segmentId: '', contentHash: '',
 			chunks: [], total: 0,
 			resolve: (r) => { clearTimeout(timer); resolve(r); },
 			reject: (reason) => { clearTimeout(timer); pendingSegmentsById.delete(segmentId); reject(new Error(reason)); }
@@ -311,7 +313,7 @@ export async function requestSegmentById(
 	});
 }
 
-function handleDataMessage(raw: string): void {
+async function handleDataMessage(raw: string): Promise<void> {
 	let msg: { type: string } & Record<string, unknown>;
 	try { msg = JSON.parse(raw); } catch { return; }
 
@@ -339,6 +341,7 @@ function handleDataMessage(raw: string): void {
 			pending.endTime = msg.endTime as number;
 			pending.originMonitor = (msg.originMonitor as string) ?? '';
 			pending.segmentId = (msg.segmentId as string) ?? '';
+			pending.contentHash = (msg.contentHash as string) ?? '';
 			pending.total = Math.ceil((msg.sizeBytes as number) / (32 * 1024)) || 1;
 		}
 		return;
@@ -352,6 +355,14 @@ function handleDataMessage(raw: string): void {
 			pendingSegments.delete(requestTime);
 			const binary = pending.chunks.map((b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
 			const blob = new Blob(binary, { type: pending.mimeType });
+			if (pending.contentHash) {
+				const actual = await computeHash(blob);
+				if (actual !== pending.contentHash) {
+					dbg('warn', 'rtc', `segment hash mismatch at t=${requestTime}: expected ${pending.contentHash.slice(0, 8)}, got ${actual.slice(0, 8)}`);
+					pending.reject('hash-mismatch');
+					return;
+				}
+			}
 			pending.resolve({ mimeType: pending.mimeType, blob, startTime: pending.startTime, endTime: pending.endTime, originMonitor: pending.originMonitor, segmentId: pending.segmentId });
 		}
 		return;
@@ -375,6 +386,7 @@ function handleDataMessage(raw: string): void {
 			// msg.segmentId may differ from the request key if the server resolved
 			// a footage-ref ID to its canonical segment ID — capture whichever is sent.
 			pending.segmentId = (msg.segmentId as string) || segmentId;
+			pending.contentHash = (msg.contentHash as string) ?? '';
 			pending.total = Math.ceil((msg.sizeBytes as number) / (32 * 1024)) || 1;
 		}
 		return;
@@ -388,6 +400,14 @@ function handleDataMessage(raw: string): void {
 			pendingSegmentsById.delete(segmentId);
 			const binary = pending.chunks.map((b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
 			const blob = new Blob(binary, { type: pending.mimeType });
+			if (pending.contentHash) {
+				const actual = await computeHash(blob);
+				if (actual !== pending.contentHash) {
+					dbg('warn', 'rtc', `segment hash mismatch for id=${segmentId.slice(0, 8)}: expected ${pending.contentHash.slice(0, 8)}, got ${actual.slice(0, 8)}`);
+					pending.reject('hash-mismatch');
+					return;
+				}
+			}
 			pending.resolve({ mimeType: pending.mimeType, blob, startTime: pending.startTime, endTime: pending.endTime, originMonitor: pending.originMonitor, segmentId: pending.segmentId });
 		}
 		return;

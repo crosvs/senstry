@@ -254,7 +254,8 @@ async function sendSegmentOverDc(
 		endTime: segment.endTime,
 		mimeType: segment.mimeType,
 		sizeBytes: segment.sizeBytes,
-		originMonitor: segment.originMonitor
+		originMonitor: segment.originMonitor,
+		contentHash: (segment as { contentHash?: string }).contentHash ?? '',
 	}));
 
 	for (let i = 0; i < total; i++) {

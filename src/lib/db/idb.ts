@@ -1,7 +1,7 @@
 import { openDB as idbOpenDB, type IDBPDatabase } from 'idb';
 
 export const DB_NAME = 'senstry';
-export const DB_VERSION = 5;
+export const DB_VERSION = 6;
 
 let _db: IDBPDatabase | null = null;
 
@@ -12,7 +12,7 @@ export function _resetDbForTest(): void {
 export async function openDB(): Promise<IDBPDatabase> {
 	if (_db) return _db;
 	_db = await idbOpenDB(DB_NAME, DB_VERSION, {
-		upgrade(db, oldVersion) {
+		upgrade(db, oldVersion, _newVersion, tx) {
 			if (oldVersion < 1) {
 				db.createObjectStore('settings');
 				const devices = db.createObjectStore('pairedDevices', { keyPath: 'pubkey' });
@@ -58,6 +58,11 @@ export async function openDB(): Promise<IDBPDatabase> {
 				// v5 adds sourceId to segments and footageRefs.
 				// Schema is unchanged (no new indexes); existing records without sourceId
 				// are treated as 'default-mic' lazily at read time via `?? 'default-mic'`.
+			}
+			if (oldVersion < 6) {
+				// v6 adds contentHash (SHA-256 hex) to segments for integrity verification.
+				// Existing records keep contentHash=undefined (treated as '' at read time).
+				tx.objectStore('segments').createIndex('contentHash', 'contentHash', { unique: false });
 			}
 		}
 	});
