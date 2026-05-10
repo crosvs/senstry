@@ -322,6 +322,32 @@ export async function getSegmentAt(time: number, originMonitor?: string): Promis
 	return getSegmentById(meta.segmentId);
 }
 
+export async function getSegmentsAfter(after: number, count: number, originMonitor?: string, mimePrefix?: string): Promise<Segment[]> {
+	const db = await openDB();
+	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
+	return all
+		.filter(s =>
+			s.startTime >= after &&
+			(originMonitor == null || s.originMonitor === originMonitor) &&
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+		)
+		.sort((a, b) => a.startTime - b.startTime)
+		.slice(0, count);
+}
+
+export async function getSegmentsBefore(before: number, count: number, originMonitor?: string, mimePrefix?: string): Promise<Segment[]> {
+	const db = await openDB();
+	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
+	return all
+		.filter(s =>
+			s.endTime <= before &&
+			(originMonitor == null || s.originMonitor === originMonitor) &&
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+		)
+		.sort((a, b) => b.startTime - a.startTime) // newest first
+		.slice(0, count);
+}
+
 export async function getSegmentsInRange(from: number, to: number, originMonitor?: string, sourceId?: string): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];

@@ -50,9 +50,22 @@ function ensureViewerSubscription(privkey: Uint8Array, pubkey: string): void {
 }
 const MIN_CONNECT_INTERVAL_MS = 4_000;
 
+export interface RemoteSegmentMeta {
+	segmentId: string;
+	startTime: number;
+	endTime: number;
+	mimeType: string;
+	sizeBytes: number;
+	contentHash: string;
+}
+
 let pendingCoverage: ((segments: [number, number][]) => void) | null = null;
 let pendingSourceList: ((ids: string[]) => void) | null = null;
 let coverageRejectTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingSegmentsAfter: ((segs: RemoteSegmentMeta[]) => void) | null = null;
+let pendingSegmentsBefore: ((segs: RemoteSegmentMeta[]) => void) | null = null;
+let segmentsAfterTimer: ReturnType<typeof setTimeout> | null = null;
+let segmentsBeforeTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingSegments = new Map<number, PendingSegment>();
 const pendingSegmentsById = new Map<string, PendingSegment>();
 
@@ -313,6 +326,58 @@ export async function requestSegmentById(
 	});
 }
 
+export async function requestSegmentsAfter(
+	after: number,
+	count: number,
+	privkey: Uint8Array,
+	viewerPubkey: string,
+	monitorPubkey: string
+): Promise<RemoteSegmentMeta[]> {
+	try { await ensureConnection(privkey, viewerPubkey, monitorPubkey); }
+	catch { throw new Error('offline'); }
+	const session = sessions.get(monitorPubkey);
+	if (!session?.dataChannel) throw new Error('offline');
+
+	return new Promise<RemoteSegmentMeta[]>((resolve, reject) => {
+		if (segmentsAfterTimer !== null) { clearTimeout(segmentsAfterTimer); segmentsAfterTimer = null; pendingSegmentsAfter = null; }
+		segmentsAfterTimer = setTimeout(() => {
+			segmentsAfterTimer = null; pendingSegmentsAfter = null;
+			reject(new Error('segments-after timeout'));
+		}, 10_000);
+		pendingSegmentsAfter = (segs) => {
+			if (segmentsAfterTimer !== null) { clearTimeout(segmentsAfterTimer); segmentsAfterTimer = null; }
+			resolve(segs);
+		};
+		session.dataChannel!.send(JSON.stringify({ type: 'segments-after-request', after, count }));
+	});
+}
+
+export async function requestSegmentsBefore(
+	before: number,
+	count: number,
+	privkey: Uint8Array,
+	viewerPubkey: string,
+	monitorPubkey: string
+): Promise<RemoteSegmentMeta[]> {
+	try { await ensureConnection(privkey, viewerPubkey, monitorPubkey); }
+	catch { throw new Error('offline'); }
+	const session = sessions.get(monitorPubkey);
+	if (!session?.dataChannel) throw new Error('offline');
+
+	return new Promise<RemoteSegmentMeta[]>((resolve, reject) => {
+		if (segmentsBeforeTimer !== null) { clearTimeout(segmentsBeforeTimer); segmentsBeforeTimer = null; pendingSegmentsBefore = null; }
+		segmentsBeforeTimer = setTimeout(() => {
+			segmentsBeforeTimer = null; pendingSegmentsBefore = null;
+			reject(new Error('segments-before timeout'));
+		}, 10_000);
+		pendingSegmentsBefore = (segs) => {
+			if (segmentsBeforeTimer !== null) { clearTimeout(segmentsBeforeTimer); segmentsBeforeTimer = null; }
+			resolve(segs);
+		};
+		session.dataChannel!.send(JSON.stringify({ type: 'segments-before-request', before, count }));
+	});
+}
+
 async function handleDataMessage(raw: string): Promise<void> {
 	let msg: { type: string } & Record<string, unknown>;
 	try { msg = JSON.parse(raw); } catch { return; }
@@ -328,6 +393,20 @@ async function handleDataMessage(raw: string): Promise<void> {
 		const cb = pendingCoverage;
 		pendingCoverage = null;
 		cb?.(msg.segments as [number, number][]);
+		return;
+	}
+
+	if (msg.type === 'segments-after') {
+		const cb = pendingSegmentsAfter;
+		pendingSegmentsAfter = null;
+		cb?.(msg.segments as RemoteSegmentMeta[]);
+		return;
+	}
+
+	if (msg.type === 'segments-before') {
+		const cb = pendingSegmentsBefore;
+		pendingSegmentsBefore = null;
+		cb?.(msg.segments as RemoteSegmentMeta[]);
 		return;
 	}
 

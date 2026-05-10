@@ -1,6 +1,6 @@
 import { createPeer, onIceStateChange, waitForIceGathering } from './peer';
 import { sendOffer, sendHangup } from './signaling';
-import { getCoverageMap, getSegmentsInRange, getSegmentById, type SegmentWithBlob } from '$lib/db/segments';
+import { getCoverageMap, getSegmentsInRange, getSegmentById, getSegmentsAfter, getSegmentsBefore, type SegmentWithBlob } from '$lib/db/segments';
 import type { SignalMessage } from './signaling';
 import type { ChannelConfig } from '$lib/store/pipeline';
 
@@ -180,6 +180,44 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 		const mimePrefix = req.mimePrefix as string | undefined;
 		const segments = await getCoverageMap(originMonitor, mimePrefix);
 		dc.send(JSON.stringify({ type: 'coverage-map', segments, mimePrefix: mimePrefix ?? null }));
+		return;
+	}
+
+	if (req.type === 'segments-after-request') {
+		const after = req.after as number;
+		const count = Math.min((req.count as number | undefined) ?? 5, 20);
+		const segs = await getSegmentsAfter(after, count, originMonitor);
+		dc.send(JSON.stringify({
+			type: 'segments-after',
+			after,
+			segments: segs.map(s => ({
+				segmentId: s.backupOf ?? s.segmentId,
+				startTime: s.startTime,
+				endTime: s.endTime,
+				mimeType: s.mimeType,
+				sizeBytes: s.sizeBytes,
+				contentHash: (s as { contentHash?: string }).contentHash ?? '',
+			})),
+		}));
+		return;
+	}
+
+	if (req.type === 'segments-before-request') {
+		const before = req.before as number;
+		const count = Math.min((req.count as number | undefined) ?? 5, 20);
+		const segs = await getSegmentsBefore(before, count, originMonitor);
+		dc.send(JSON.stringify({
+			type: 'segments-before',
+			before,
+			segments: segs.map(s => ({
+				segmentId: s.backupOf ?? s.segmentId,
+				startTime: s.startTime,
+				endTime: s.endTime,
+				mimeType: s.mimeType,
+				sizeBytes: s.sizeBytes,
+				contentHash: (s as { contentHash?: string }).contentHash ?? '',
+			})),
+		}));
 		return;
 	}
 

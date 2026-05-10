@@ -5,9 +5,10 @@
   import {
     ensureConnection, requestLiveView, requestCoverageMap,
     requestSegment, requestSegmentById,
+    requestSegmentsAfter, requestSegmentsBefore,
     getViewerSessionInfos, stopViewer, type ViewerSessionInfo
   } from '$lib/webrtc/viewer-peer';
-  import { getSegmentById, getSegmentsInRange, saveSegment, getCoverageMap } from '$lib/db/segments';
+  import { getSegmentById, getSegmentsInRange, getSegmentsAfter, getSegmentsBefore, saveSegment, getCoverageMap } from '$lib/db/segments';
   import { getFootageRef } from '$lib/db/footage';
   import { dbg } from '$lib/store/debug';
   import DevSection from './DevSection.svelte';
@@ -112,6 +113,100 @@
     }
   });
 
+  // ── Adjacent boundary navigation ─────────────────────────────────────────
+  let navStatus = $state('');
+  let navLoading = $state(false);
+  let navStatusTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function setNavStatus(msg: string, autoClearMs = 0) {
+    if (navStatusTimer) { clearTimeout(navStatusTimer); navStatusTimer = null; }
+    navStatus = msg;
+    if (autoClearMs > 0) {
+      navStatusTimer = setTimeout(() => { navStatus = ''; navStatusTimer = null; }, autoClearMs);
+    }
+  }
+
+  const ADJACENT_COUNT = 3;
+
+  async function fetchAdjacent(dir: 'after' | 'before') {
+    if (navLoading || fetchedSegs.length === 0) return;
+    navLoading = true;
+
+    const refTime = dir === 'after'
+      ? fetchedSegs[fetchedSegs.length - 1].endTime
+      : fetchedSegs[0].startTime;
+
+    setNavStatus(dir === 'after' ? 'Looking for more footage…' : 'Looking for earlier footage…');
+
+    let added = 0;
+    // Remember where we were before pushing so we can compute the right target index.
+    const idxBefore = currentIdx;
+
+    try {
+      const effectivePubkey = selectedMonitorPubkey ?? $identity?.pubkey;
+
+      // Check local IDB first.
+      if (effectivePubkey) {
+        const metas = dir === 'after'
+          ? await getSegmentsAfter(refTime, ADJACENT_COUNT, effectivePubkey)
+          : await getSegmentsBefore(refTime, ADJACENT_COUNT, effectivePubkey);
+
+        const filtered = metas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
+        for (const meta of filtered) {
+          const key = `idb-${meta.segmentId}`;
+          if (fetchedSegs.some(s => s.key === key)) continue;
+          const withBlob = await getSegmentById(meta.segmentId);
+          if (!withBlob) continue;
+          const blob = await materializeBlob(withBlob.blob);
+          pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
+          added++;
+        }
+      }
+
+      // Try remote if nothing found locally.
+      if (added === 0 && $identity && selectedMonitorPubkey) {
+        setNavStatus(dir === 'after' ? 'Requesting from monitor…' : 'Requesting earlier from monitor…');
+        try {
+          const remoteMetas = dir === 'after'
+            ? await requestSegmentsAfter(refTime, ADJACENT_COUNT, $identity.privkey, $identity.pubkey, selectedMonitorPubkey)
+            : await requestSegmentsBefore(refTime, ADJACENT_COUNT, $identity.privkey, $identity.pubkey, selectedMonitorPubkey);
+
+          const filtered = remoteMetas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
+          for (const meta of filtered) {
+            const key = `rtc-adj-${meta.segmentId}`;
+            if (fetchedSegs.some(s => s.key === key || s.segmentId === meta.segmentId)) continue;
+            try {
+              const res = await requestSegmentById(meta.segmentId, $identity.privkey, $identity.pubkey, selectedMonitorPubkey);
+              pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined });
+              added++;
+            } catch { continue; }
+          }
+        } catch { /* monitor offline or timeout — fall through */ }
+      }
+
+      if (added > 0) {
+        // After pushSeg, currentIdx has been updated to keep the same segment in view.
+        // For 'after': new segs land at the end → idxBefore + 1 is the first new one.
+        // For 'before': new segs land at the start → currentIdx shifted right by `added`,
+        //   so currentIdx - 1 is the segment immediately older than the original first.
+        if (dir === 'after') showSeg(idxBefore + 1);
+        else showSeg(currentIdx - 1);
+        setNavStatus('');
+      } else {
+        setNavStatus(
+          dir === 'after'
+            ? 'No more footage — end of available recordings'
+            : 'No earlier footage — start of available recordings',
+          7000
+        );
+      }
+    } catch {
+      setNavStatus(`Could not load ${dir === 'after' ? 'next' : 'earlier'} footage`, 4000);
+    } finally {
+      navLoading = false;
+    }
+  }
+
   function startPhotoCountdown() {
     clearAutoPlayTimer();
     autoPlayCountdown = 3;
@@ -135,7 +230,11 @@
   }
 
   function advanceToNext() {
-    if (currentIdx + 1 < fetchedSegs.length) showSeg(currentIdx + 1);
+    if (currentIdx + 1 < fetchedSegs.length) {
+      showSeg(currentIdx + 1);
+    } else {
+      fetchAdjacent('after');
+    }
   }
 
   function showSeg(idx: number) {
@@ -144,8 +243,23 @@
     currentIdx = idx;
   }
 
-  function prevSeg() { showSeg(currentIdx - 1); }
-  function nextSeg() { showSeg(currentIdx + 1); }
+  async function prevSeg() {
+    if (currentIdx > 0) {
+      showSeg(currentIdx - 1);
+      setNavStatus('');
+    } else {
+      await fetchAdjacent('before');
+    }
+  }
+
+  async function nextSeg() {
+    if (currentIdx + 1 < fetchedSegs.length) {
+      showSeg(currentIdx + 1);
+      setNavStatus('');
+    } else {
+      await fetchAdjacent('after');
+    }
+  }
 
   function pushSeg(seg: FetchedSeg) {
     if (fetchedSegs.some(s => s.key === seg.key)) return;
@@ -503,7 +617,11 @@
 
   function clearSegments() { fetchedSegs = []; currentIdx = -1; currentViewerUrl = null; clearAutoPlayTimer(); savedKeys = new Set(); savingKeys = new Set(); }
 
-  onDestroy(() => { clearInterval(sessionTick); clearAutoPlayTimer(); });
+  onDestroy(() => {
+    clearInterval(sessionTick);
+    clearAutoPlayTimer();
+    if (navStatusTimer) clearTimeout(navStatusTimer);
+  });
 </script>
 
 <DevSection title="Content Viewer">
@@ -558,7 +676,7 @@
 
   <!-- Playback controls -->
   <div class="playback-bar">
-    <button class="nav-btn" onclick={prevSeg} disabled={currentIdx <= 0}>←</button>
+    <button class="nav-btn" onclick={prevSeg} disabled={navLoading}>←</button>
     <span class="seg-counter">
       {#if fetchedSegs.length > 0}
         {currentIdx + 1} / {fetchedSegs.length}
@@ -570,7 +688,7 @@
         No segments
       {/if}
     </span>
-    <button class="nav-btn" onclick={nextSeg} disabled={currentIdx >= fetchedSegs.length - 1}>→</button>
+    <button class="nav-btn" onclick={nextSeg} disabled={navLoading}>→</button>
     <span class="sep"></span>
     <label class="toggle-label">
       <input type="checkbox" bind:checked={autoPlayNext} />
@@ -583,6 +701,9 @@
       <button class="act-btn small-danger" onclick={clearSegments}>Clear</button>
     {/if}
   </div>
+  {#if navStatus}
+    <div class="nav-status" class:nav-warn={navStatus.startsWith('No ')} class:nav-err={navStatus.startsWith('Could')}>{navStatus}</div>
+  {/if}
 
   <!-- ── Time Range + Coverage + Fetch ────────────────────────────────────── -->
   <div class="subsec-title" style="margin-top:10px">Time Range</div>
@@ -778,6 +899,9 @@
   .countdown { font-size: 11px; color: var(--color-warning); font-family: ui-monospace, monospace; }
   .act-btn.small-danger { font-size: 9px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--color-danger); background: none; color: var(--color-danger); cursor: pointer; }
   .act-btn.small-danger:hover { background: var(--color-danger); color: white; }
+  .nav-status { font-size: 10px; color: var(--color-muted); padding: 2px 0; font-family: ui-monospace, monospace; }
+  .nav-status.nav-warn { color: var(--color-warning, #f59e0b); }
+  .nav-status.nav-err { color: var(--color-danger); }
 
   /* Time range */
   .range-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
