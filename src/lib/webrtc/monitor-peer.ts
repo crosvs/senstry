@@ -2,6 +2,7 @@ import { createPeer, onIceStateChange, waitForIceGathering } from './peer';
 import { sendOffer, sendHangup } from './signaling';
 import { getCoverageMap, getSegmentsInRange, getSegmentById, type SegmentWithBlob } from '$lib/db/segments';
 import type { SignalMessage } from './signaling';
+import type { ChannelConfig } from '$lib/store/pipeline';
 
 interface MonitorSession {
 	pc: RTCPeerConnection;
@@ -18,12 +19,20 @@ let globalGeneration = 0;
 
 // Streams provided when the monitor is armed — one per open source, keyed by sourceId.
 const activeStreams = new Map<string, MediaStream>();
+// Channel configs — keyed by channelId.
+const activeChannels = new Map<string, ChannelConfig>();
 let idleTimeoutMs = 120_000;
 
 // Pass all open source streams so any source can be served to viewers.
 export function setMonitorStreams(streams: Map<string, MediaStream>): void {
 	activeStreams.clear();
 	for (const [id, stream] of streams) activeStreams.set(id, stream);
+}
+
+// Register channel configs so viewers can request video+audio from named channels.
+export function setMonitorChannels(channels: ChannelConfig[]): void {
+	activeChannels.clear();
+	for (const ch of channels) activeChannels.set(ch.id, ch);
 }
 
 // Compat shim — used by stopMonitor to clear, and for single-stream callers.
@@ -88,16 +97,32 @@ export async function handleOfferRequest(
 	// Data-mode connections (segment/coverage fetch) skip this to avoid
 	// unintended live stream side-effects and unnecessary bandwidth.
 	if (activeStreams.size > 0 && msg.mode === 'live') {
-		const requestedSource = msg.sourceId as string | undefined;
-		const streamsToAdd = requestedSource && activeStreams.has(requestedSource)
-			? [activeStreams.get(requestedSource)!]
-			: Array.from(activeStreams.values());
-		// Combine all selected source tracks into a single composite MediaStream.
+		const requestedChannel = msg.channelId as string | undefined;
+		const requestedSource  = msg.sourceId  as string | undefined;
+		// Combine selected tracks into a single composite MediaStream.
 		// Using separate per-source streams causes the viewer's ontrack events to fire
 		// once per source, each overwriting remoteStream — last one wins, dropping prior tracks.
 		const composite = new MediaStream();
-		for (const stream of streamsToAdd) {
-			for (const track of stream.getTracks()) composite.addTrack(track);
+		if (requestedChannel && activeChannels.has(requestedChannel)) {
+			// Channel-based compositing: video from videoSourceId, audio from audioSourceId.
+			// This is the correct way to get both camera video and mic audio simultaneously.
+			const ch = activeChannels.get(requestedChannel)!;
+			if (ch.videoSourceId) {
+				const vStream = activeStreams.get(ch.videoSourceId);
+				if (vStream) for (const t of vStream.getVideoTracks()) composite.addTrack(t);
+			}
+			if (ch.audioSourceId) {
+				const aStream = activeStreams.get(ch.audioSourceId);
+				if (aStream) for (const t of aStream.getAudioTracks()) composite.addTrack(t);
+			}
+		} else if (requestedSource && activeStreams.has(requestedSource)) {
+			// Legacy sourceId path — all tracks from one source.
+			for (const t of activeStreams.get(requestedSource)!.getTracks()) composite.addTrack(t);
+		} else {
+			// No filter — composite all open sources.
+			for (const stream of activeStreams.values()) {
+				for (const t of stream.getTracks()) composite.addTrack(t);
+			}
 		}
 		for (const track of composite.getTracks()) pc.addTrack(track, composite);
 	}

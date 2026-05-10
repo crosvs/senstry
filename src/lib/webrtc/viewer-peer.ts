@@ -120,7 +120,8 @@ export async function ensureConnection(
 	viewerPubkey: string,
 	monitorPubkey: string,
 	mode: 'live' | 'data' = 'data',
-	sourceId?: string
+	sourceId?: string,
+	channelId?: string
 ): Promise<void> {
 	const existing = sessions.get(monitorPubkey);
 	// Reuse any open data channel. If upgrading to live, requestLiveView closes first.
@@ -185,7 +186,7 @@ export async function ensureConnection(
 			}
 		});
 
-		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId, mode, sourceId);
+		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId, mode, sourceId, channelId);
 	});
 
 	connectPromises.set(monitorPubkey, promise);
@@ -196,11 +197,12 @@ export async function requestLiveView(
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string,
-	sourceId?: string
+	sourceId?: string,
+	channelId?: string
 ): Promise<void> {
 	closeSession(monitorPubkey);
 	lastConnectAttempts.delete(monitorPubkey);
-	return ensureConnection(privkey, viewerPubkey, monitorPubkey, 'live', sourceId);
+	return ensureConnection(privkey, viewerPubkey, monitorPubkey, 'live', sourceId, channelId);
 }
 
 export async function requestSourceList(

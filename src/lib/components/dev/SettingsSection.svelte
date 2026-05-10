@@ -1,12 +1,13 @@
 <script lang="ts">
   import { settings, saveSettings, loadSettings } from '$lib/store/settings';
   import {
-    sources, sensors, captures, nostrActions, links, loadPipeline, savePipeline,
+    sources, sensors, captures, nostrActions, channels, links, loadPipeline, savePipeline,
     storageCleanup, loadStorageCleanup, saveStorageCleanup,
-    newSource, newSensor, newCapture, newNostrAction, newLink,
-    DEFAULT_SOURCES, DEFAULT_SENSORS, DEFAULT_CAPTURES, DEFAULT_NOSTR_ACTIONS, DEFAULT_LINKS,
+    newSource, newSensor, newCapture, newNostrAction, newChannel, newLink,
+    DEFAULT_SOURCES, DEFAULT_SENSORS, DEFAULT_CAPTURES, DEFAULT_NOSTR_ACTIONS, DEFAULT_CHANNELS, DEFAULT_LINKS,
     DEFAULT_STORAGE_CLEANUP,
-    type SourceConfig, type SensorConfig, type CaptureMethod, type NostrAction, type Link,
+    autoNameSensor, autoNameCapture, autoNameNostrAction, autoNameChannel, autoNameLink,
+    type SourceConfig, type SensorConfig, type CaptureMethod, type NostrAction, type ChannelConfig, type Link,
     type SensorState, type LinkActivationState, type StorageCleanupConfig, type ThinningRule,
   } from '$lib/store/pipeline';
   import type { AlertSession } from './SentrySection.svelte';
@@ -30,6 +31,7 @@
   let localSensors      = $state<SensorConfig[]>([]);
   let localCaptures     = $state<CaptureMethod[]>([]);
   let localNostrActions = $state<NostrAction[]>([]);
+  let localChannels     = $state<ChannelConfig[]>([]);
   let localLinks        = $state<Link[]>([]);
 
   // General settings local state
@@ -92,6 +94,7 @@
     localSensors      = get(sensors).map(s => ({ ...s }));
     localCaptures     = get(captures).map(c => ({ ...c }));
     localNostrActions = get(nostrActions).map(n => ({ ...n }));
+    localChannels     = get(channels).map(c => ({ ...c }));
     localLinks        = get(links).map(l => ({ ...l }));
     const s = get(settings);
     localRelayUrl        = s.relayUrl;
@@ -119,6 +122,7 @@
         })),
         captures:     localCaptures.map(c => ({ ...c })),
         nostrActions: localNostrActions.map(n => ({ ...n })),
+        channels:     localChannels.map(c => ({ ...c })),
         links:        localLinks.map(l => ({ ...l })),
       });
       await saveSettings({
@@ -148,6 +152,7 @@
     localSensors      = DEFAULT_SENSORS.map(s => ({ ...s }));
     localCaptures     = DEFAULT_CAPTURES.map(c => ({ ...c }));
     localNostrActions = DEFAULT_NOSTR_ACTIONS.map(n => ({ ...n }));
+    localChannels     = DEFAULT_CHANNELS.map(c => ({ ...c }));
     localLinks        = DEFAULT_LINKS.map(l => ({ ...l }));
     const { DEFAULT_RELAY } = await import('$lib/store/settings');
     localRelayUrl        = DEFAULT_RELAY;
@@ -171,11 +176,10 @@
         ? c.sourceId
         : (compatSources[0]?.id ?? c.sourceId);
       const base = { id: c.id, name: c.name, sourceId };
-      const pri  = 'priority' in c ? c.priority : 10;
       if (type === 'video')
-        return { ...base, type, priority: pri, videoWidth: 0, videoHeight: 0, videoBitsPerSec: 0, audioBitsPerSec: 64_000, videoCodec: '' } as CaptureMethod;
+        return { ...base, type, videoWidth: 0, videoHeight: 0, videoBitsPerSec: 0, audioBitsPerSec: 64_000, videoCodec: '' } as CaptureMethod;
       if (type === 'audio')
-        return { ...base, type, priority: pri, audioBitsPerSec: 64_000, mimeType: '' } as CaptureMethod;
+        return { ...base, type, audioBitsPerSec: 64_000, mimeType: '' } as CaptureMethod;
       return { ...base, type, imageWidth: 640, imageHeight: 0, imageQuality: 0.85, imageFormat: 'image/jpeg' } as CaptureMethod;
     });
   }
@@ -277,6 +281,16 @@
     return compat.find(s => s.id === cap.sourceId) ? cap.sourceId : (compat[0]?.id ?? cap.sourceId);
   }
 
+  // ── Auto-name wrappers ───────────────────────────────────────────────────────
+  // Pass local pipeline state to the shared auto-name functions from pipeline.ts.
+  const _an = {
+    sensor:      (s: SensorConfig)   => autoNameSensor(s, localSources),
+    capture:     (c: CaptureMethod)  => autoNameCapture(c, localSources),
+    nostrAction: (a: NostrAction)    => autoNameNostrAction(a),
+    channel:     (c: ChannelConfig)  => autoNameChannel(c, localSources),
+    link:        (l: Link)           => autoNameLink(l, localSensors, localCaptures, localNostrActions, localSources, localChannels),
+  };
+
   // ── Availability grid (time-window sensor) ─────────────────────────────────
   const GRID_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   let gridDrag: { sensorId: string; turnOn: boolean } | null = null;
@@ -368,7 +382,7 @@
   {/if}
 
   {#if showRaw}
-    <pre class="raw">{JSON.stringify({ settings: $settings, sources: localSources, sensors: localSensors, captures: localCaptures, nostrActions: localNostrActions, links: localLinks, storageCleanup: localStorageCleanup }, null, 2)}</pre>
+    <pre class="raw">{JSON.stringify({ settings: $settings, sources: localSources, sensors: localSensors, captures: localCaptures, nostrActions: localNostrActions, channels: localChannels, links: localLinks, storageCleanup: localStorageCleanup }, null, 2)}</pre>
   {/if}
 
   <!-- ── Sources ──────────────────────────────────────────────────────────── -->
@@ -464,7 +478,7 @@
     <div class="pipeline-card">
       <div class="card-header">
         <span class="type-badge {typeBadgeClass}">{typeBadgeLabel}</span>
-        <input class="name-input" bind:value={sen.name} placeholder="Sensor name" />
+        <input class="name-input" bind:value={sen.name} placeholder={_an.sensor(sen)} />
         <span class="state-badge {sb.kind}">{sb.label}</span>
         <button class="toggle-pill" style="background:{sen.enabled ? 'var(--color-success)' : 'var(--color-border)'}"
           onclick={() => { sen.enabled = !sen.enabled; }}>
@@ -489,7 +503,7 @@
             <span class="field-lbl">Source</span>
             <select class="field-select" value={sen.sourceId}
               onchange={(e) => { sen.sourceId = (e.target as HTMLSelectElement).value; }}>
-              {#each localSources.filter(s => s.type === 'microphone') as src}
+              {#each localSources.filter(s => s.type === 'microphone' || s.type === 'screen') as src}
                 <option value={src.id}>{sourceOptionLabel(src)}</option>
               {/each}
             </select>
@@ -605,7 +619,7 @@
     <div class="pipeline-card">
       <div class="card-header">
         <span class="type-badge {cap.type}">{cap.type.toUpperCase()}</span>
-        <input class="name-input" bind:value={cap.name} placeholder="Capture name" />
+        <input class="name-input" bind:value={cap.name} placeholder={_an.capture(cap)} />
         <button class="rm-btn" onclick={() => localCaptures = localCaptures.filter(c => c.id !== cap.id)}>✕</button>
       </div>
       <div class="card-body">
@@ -628,11 +642,6 @@
           </select>
         </label>
         {#if cap.type === 'video'}
-          <label class="field-row">
-            <span class="field-lbl">Priority</span>
-            <input class="num-input" type="number" min="1" step="1" value={cap.priority}
-              oninput={(e) => patchCapture(cap.id, { priority: +(e.target as HTMLInputElement).value })} />
-          </label>
           <label class="field-row">
             <span class="field-lbl">Audio source</span>
             <select class="field-select" value={cap.audioSourceId ?? ''}
@@ -678,11 +687,6 @@
               oninput={(e) => patchCapture(cap.id, { audioBitsPerSec: (+(e.target as HTMLInputElement).value || 0) * 1000 })} />
           </label>
         {:else if cap.type === 'audio'}
-          <label class="field-row">
-            <span class="field-lbl">Priority</span>
-            <input class="num-input" type="number" min="1" step="1" value={cap.priority}
-              oninput={(e) => patchCapture(cap.id, { priority: +(e.target as HTMLInputElement).value })} />
-          </label>
           <label class="field-row">
             <span class="field-lbl">Audio kbps</span>
             <input class="num-input" type="number" min="0" step="8"
@@ -738,7 +742,7 @@
     <div class="pipeline-card">
       <div class="card-header">
         <span class="type-badge nostr">NOSTR</span>
-        <input class="name-input" bind:value={na.name} placeholder="Action name" />
+        <input class="name-input" bind:value={na.name} placeholder={_an.nostrAction(na)} />
         <button class="rm-btn" onclick={() => localNostrActions = localNostrActions.filter(a => a.id !== na.id)}>✕</button>
       </div>
       <div class="card-body">
@@ -766,6 +770,46 @@
     <div class="empty">No Nostr actions.</div>
   {/each}
 
+  <!-- ── Channels ──────────────────────────────────────────────────────────── -->
+  <div class="subsec-header">
+    <span class="subsec-title">Channels</span>
+    <button class="add-btn" onclick={() => localChannels = [...localChannels, newChannel()]}>+ Add</button>
+  </div>
+  <div class="field-hint full-row" style="margin-bottom:4px">A channel bundles a video and audio source for Live RTC and footage tagging. Viewers select a channel to receive.</div>
+  {#each localChannels as ch (ch.id)}
+    <div class="pipeline-card">
+      <div class="card-header">
+        <span class="type-badge channel">CH</span>
+        <input class="name-input" bind:value={ch.name} placeholder={_an.channel(ch)} />
+        <button class="rm-btn" onclick={() => localChannels = localChannels.filter(c => c.id !== ch.id)}>✕</button>
+      </div>
+      <div class="card-body">
+        <label class="field-row">
+          <span class="field-lbl">Video source</span>
+          <select class="field-select" value={ch.videoSourceId ?? ''}
+            onchange={(e) => { ch.videoSourceId = (e.target as HTMLSelectElement).value || null; }}>
+            <option value="">None</option>
+            {#each localSources.filter(s => s.type === 'camera' || s.type === 'screen') as src}
+              <option value={src.id}>{sourceOptionLabel(src)}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="field-row">
+          <span class="field-lbl">Audio source</span>
+          <select class="field-select" value={ch.audioSourceId ?? ''}
+            onchange={(e) => { ch.audioSourceId = (e.target as HTMLSelectElement).value || null; }}>
+            <option value="">None</option>
+            {#each localSources.filter(s => s.type === 'microphone' || s.type === 'screen') as src}
+              <option value={src.id}>{sourceOptionLabel(src)}</option>
+            {/each}
+          </select>
+        </label>
+      </div>
+    </div>
+  {:else}
+    <div class="empty">No channels. Add one to enable channel-based Live RTC.</div>
+  {/each}
+
   <!-- ── Links ────────────────────────────────────────────────────────────── -->
   <div class="subsec-header">
     <span class="subsec-title">Links</span>
@@ -777,7 +821,7 @@
     <div class="pipeline-card" class:noop-card={isNoop(lnk)}>
       <div class="card-header">
         <span class="type-badge link">LINK</span>
-        <input class="name-input" bind:value={lnk.name} placeholder="Link name" />
+        <input class="name-input" bind:value={lnk.name} placeholder={_an.link(lnk)} />
         <span class="state-badge {lb.kind}">{lb.label}</span>
         <button class="toggle-pill" style="background:{lnk.enabled ? 'var(--color-success)' : 'var(--color-border)'}"
           onclick={() => { lnk.enabled = !lnk.enabled; }}>
@@ -791,7 +835,7 @@
           <select class="field-select" value={lnk.sensorId}
             onchange={(e) => { lnk.sensorId = (e.target as HTMLSelectElement).value; }}>
             {#each localSensors as sen}
-              <option value={sen.id}>{sen.name}</option>
+              <option value={sen.id}>{sen.name || _an.sensor(sen)}</option>
             {/each}
           </select>
         </label>
@@ -814,7 +858,7 @@
             onchange={(e) => { lnk.captureId = (e.target as HTMLSelectElement).value || null; }}>
             <option value="">None</option>
             {#each localCaptures as cap}
-              <option value={cap.id}>{cap.name} ({cap.type})</option>
+              <option value={cap.id}>{cap.name || _an.capture(cap)} ({cap.type})</option>
             {/each}
           </select>
         </label>
@@ -824,9 +868,24 @@
             onchange={(e) => { lnk.nostrActionId = (e.target as HTMLSelectElement).value || null; }}>
             <option value="">None</option>
             {#each localNostrActions as na}
-              <option value={na.id}>{na.name}</option>
+              <option value={na.id}>{na.name || _an.nostrAction(na)}</option>
             {/each}
           </select>
+        </label>
+        <label class="field-row">
+          <span class="field-lbl">Channel</span>
+          <select class="field-select" value={lnk.channelId ?? ''}
+            onchange={(e) => { lnk.channelId = (e.target as HTMLSelectElement).value || null; }}>
+            <option value="">None</option>
+            {#each localChannels as ch}
+              <option value={ch.id}>{ch.name || _an.channel(ch)}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="field-row">
+          <span class="field-lbl">Priority</span>
+          <input class="num-input" type="number" min="1" step="1" value={lnk.priority}
+            oninput={(e) => { lnk.priority = +(e.target as HTMLInputElement).value; }} />
         </label>
         {#if capType === 'photo'}
           <!-- Photo links: fire-and-forget, no pre/post-roll concept -->
@@ -861,7 +920,21 @@
               <span class="unit">s</span>
             </div>
           </label>
-          <div class="field-hint full-row">Recording runs in {10}-second segments. Pre/post-roll pin segments in that window around the trigger. Set both to 0 to pin only the detection itself.</div>
+          <label class="field-row">
+            <span class="field-lbl">Rolling buffer</span>
+            {#if lnk.rollingBufferSec === null}
+              <span class="inf-text">∞ infinite</span>
+              <button class="link-btn" onclick={() => { lnk.rollingBufferSec = Math.max(lnk.preRollSec || 30, 30); }}>Limit</button>
+            {:else}
+              <div class="num-with-unit">
+                <input class="num-input" type="number" min="0" step="5" value={lnk.rollingBufferSec}
+                  oninput={(e) => { lnk.rollingBufferSec = +(e.target as HTMLInputElement).value; }} />
+                <span class="unit">s</span>
+              </div>
+              <button class="link-btn" onclick={() => { lnk.rollingBufferSec = null; }}>∞</button>
+            {/if}
+          </label>
+          <div class="field-hint full-row">Recording runs in {10}-second segments. Pre/post-roll pin segments in that window around the trigger. Set rolling buffer to ≥ pre-roll, or ∞ to let storage cleanup manage deletion.</div>
           <label class="field-row">
             <span class="field-lbl">Retrigger</span>
             <select class="field-select" value={lnk.onRetrigger}
@@ -1052,8 +1125,9 @@
   .type-badge.sched  { background: #0891b2; color: white; }
   .type-badge.video { background: #7c3aed; color: white; }
   .type-badge.photo { background: #059669; color: white; }
-  .type-badge.nostr { background: #9333ea; color: white; }
-  .type-badge.link  { background: #d97706; color: white; }
+  .type-badge.nostr    { background: #9333ea; color: white; }
+  .type-badge.link     { background: #d97706; color: white; }
+  .type-badge.channel  { background: #0f766e; color: white; }
 
   .state-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--color-border); color: var(--color-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .state-badge.idle     { background: var(--color-border); color: var(--color-muted); }
@@ -1124,4 +1198,5 @@
   .avail-footer { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
   .link-btn { font-size: 9px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--color-border); background: none; color: var(--color-muted); cursor: pointer; font-family: inherit; }
   .link-btn:hover { color: var(--color-text); border-color: var(--color-text); }
+  .inf-text { font-size: 11px; color: var(--color-muted); font-style: italic; flex: 1; }
 </style>

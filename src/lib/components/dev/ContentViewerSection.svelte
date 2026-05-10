@@ -1,8 +1,9 @@
 <script lang="ts">
   import { identity, pairedDevices } from '$lib/store/identity';
   import { remoteStream } from '$lib/store/stream';
+  import { channels } from '$lib/store/pipeline';
   import {
-    ensureConnection, requestLiveView, requestSourceList, requestCoverageMap,
+    ensureConnection, requestLiveView, requestCoverageMap,
     requestSegment, requestSegmentById,
     getViewerSessionInfos, stopViewer, type ViewerSessionInfo
   } from '$lib/webrtc/viewer-peer';
@@ -23,10 +24,8 @@
   let liveStatus = $state('');
   let liveLoading = $state(false);
   let sessions = $state<ViewerSessionInfo[]>([]);
-  // Source selection — '' = all sources (composite), populated after querying monitor
-  let liveSourceId = $state('');
-  let liveSourceOptions = $state<string[]>([]);
-  let fetchingSourceList = $state(false);
+  // Channel selection — '' = all sources composite (no channel filter)
+  let liveChannelId = $state('');
 
   const sessionTick = setInterval(() => { sessions = getViewerSessionInfos(); }, 2000);
 
@@ -38,7 +37,7 @@
     if (!$identity || !selectedMonitorPubkey) { liveStatus = 'Select a monitor device first'; return; }
     liveLoading = true; liveStatus = 'Connecting…';
     try {
-      await requestLiveView($identity.privkey, $identity.pubkey, selectedMonitorPubkey, liveSourceId || undefined);
+      await requestLiveView($identity.privkey, $identity.pubkey, selectedMonitorPubkey, undefined, liveChannelId || undefined);
       liveStatus = '✓ Connected';
     } catch (e) {
       liveStatus = `✗ ${e instanceof Error ? e.message : 'Failed'}`;
@@ -50,16 +49,8 @@
     liveStatus = 'Disconnected'; sessions = [];
   }
 
-  async function fetchSources() {
-    if (!$identity || !selectedMonitorPubkey) return;
-    fetchingSourceList = true;
-    try {
-      liveSourceOptions = await requestSourceList($identity.privkey, $identity.pubkey, selectedMonitorPubkey);
-    } catch {
-      liveSourceOptions = [];
-    } finally {
-      fetchingSourceList = false;
-    }
+  function enterFullscreen() {
+    liveVideoEl?.requestFullscreen?.().catch(() => {});
   }
 
   // ── Recorded Viewer ──────────────────────────────────────────────────────
@@ -519,20 +510,19 @@
 
   <!-- ── Live View ───────────────────────────────────────────────────────── -->
   <div class="subsec-title">Live View</div>
-  <video bind:this={liveVideoEl} autoplay muted playsinline class="live-video"></video>
+  <div class="live-video-wrap">
+    <video bind:this={liveVideoEl} autoplay playsinline controls class="live-video"></video>
+    <button class="fs-btn" onclick={enterFullscreen} title="Fullscreen">⛶</button>
+  </div>
   <div class="row">
     <button class="act-btn accent" onclick={fetchLive} disabled={liveLoading || !selectedMonitorPubkey}>
       {liveLoading ? 'Connecting…' : 'Connect Live'}
     </button>
     <button class="act-btn" onclick={disconnect} disabled={sessions.length === 0}>Disconnect</button>
-    <button class="act-btn" onclick={fetchSources} disabled={fetchingSourceList || !selectedMonitorPubkey}
-      title="Query the monitor for its available source IDs">
-      {fetchingSourceList ? '…' : 'Sources ↓'}
-    </button>
-    <select class="source-select" bind:value={liveSourceId} title="Select a source to receive, or leave as 'All' for a composite of all sources">
+    <select class="source-select" bind:value={liveChannelId} title="Select a channel to receive, or leave as 'All' for a full composite">
       <option value="">All sources</option>
-      {#each liveSourceOptions as srcId}
-        <option value={srcId}>{srcId}</option>
+      {#each $channels as ch (ch.id)}
+        <option value={ch.id}>{ch.name || ch.id.slice(0, 8)}</option>
       {/each}
     </select>
     {#if liveStatus}
@@ -764,7 +754,10 @@
   .seg-raw pre { margin: 0; font-size: 9px; font-family: ui-monospace, monospace; color: var(--color-muted); white-space: pre-wrap; word-break: break-all; line-height: 1.4; }
 
   /* Live */
-  .live-video { width: 100%; border-radius: 6px; background: #000; max-height: 180px; display: block; }
+  .live-video-wrap { position: relative; width: 100%; margin-bottom: 4px; }
+  .live-video { width: 100%; border-radius: 6px; background: #000; max-height: 260px; display: block; }
+  .fs-btn { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.55); border: none; color: white; font-size: 14px; padding: 2px 6px; border-radius: 4px; cursor: pointer; line-height: 1; }
+  .fs-btn:hover { background: rgba(0,0,0,0.8); }
   .sess-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
   .sess-badge { font-size: 9px; padding: 2px 6px; border-radius: 4px; background: var(--color-surface); color: var(--color-muted); border: 1px solid var(--color-border); font-family: ui-monospace, monospace; }
 

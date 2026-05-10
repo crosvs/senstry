@@ -11,6 +11,7 @@ export interface SignalMessage {
 	sdp?: string;
 	mode?: 'live' | 'data'; // live = viewer wants stream tracks; data = segment/coverage only
 	sourceId?: string;      // live mode only — which source stream to receive (omit = all sources)
+	channelId?: string;     // live mode only — which channel to receive (video+audio composite)
 }
 
 export type SignalHandler = (msg: SignalMessage, fromPubkey: string) => void | Promise<void>;
@@ -82,11 +83,13 @@ export async function sendOfferRequest(
 	toPubkey: string,
 	sessionId: string,
 	mode: 'live' | 'data' = 'data',
-	sourceId?: string
+	sourceId?: string,
+	channelId?: string
 ): Promise<void> {
 	return sendSignal(privkey, fromPubkey, toPubkey, {
 		type: 'offer-request', sessionId, mode,
 		...(sourceId && { sourceId }),
+		...(channelId && { channelId }),
 	});
 }
 

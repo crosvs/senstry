@@ -25,7 +25,10 @@ export interface Segment {
 	mimeType: string;
 	sizeBytes: number;
 	pinned: boolean;
-	// null = no expiry (manual pin or legacy record); 0 = pinned forever; unix sec = expires at
+	// null = never been pinned (rolling buffer candidate, evicted to maintain buffer size)
+	// -1   = was pinned but pin expired (not a rolling buffer candidate; left for thinning rules)
+	// 0    = pinned forever
+	// N>0  = pinned until unix timestamp N
 	pinnedUntil: number | null;
 	originMonitor: string;
 	sourceId: string;   // which input device produced this segment; legacy records default to 'default-mic'
@@ -125,6 +128,20 @@ async function deleteSegmentBlob(segmentId: string): Promise<void> {
 
 // ── Rolling buffer ────────────────────────────────────────────────────────────
 
+// Effective rolling buffer set by SentrySection when the monitor starts.
+// null = infinite (skip rolling eviction; rely on thinning + quota for cleanup).
+// Computed as max(all enabled links' rollingBufferSec); any null → null.
+let _maxRollingBufferSec: number | null = null;
+
+export function setMonitorRollingBuffer(sec: number | null): void {
+	_maxRollingBufferSec = sec;
+}
+
+// Segments accumulated before hard cap when rolling buffer is infinite.
+// Acts as safety net for sessions without thinning rules configured.
+// 360 segments ≈ 1 hour of 10-second rolling footage per monitor.
+const INFINITE_HARD_CAP_SEGMENTS = 360;
+
 function _isActivePinned(s: Segment): boolean {
 	if (!s.pinned) return false;
 	const until = s.pinnedUntil;
@@ -134,29 +151,40 @@ function _isActivePinned(s: Segment): boolean {
 }
 
 async function enforceRollingBuffer(originMonitor: string): Promise<void> {
+	const rollingBufferSec = _maxRollingBufferSec;
 	const db = await openDB();
+
 	const all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
 		.filter(s => s.originMonitor === originMonitor)
 		.sort((a, b) => a.startTime - b.startTime);
 
-	// Step 1: rolling buffer — evict oldest unpinned segments to keep the rolling window trim.
-	const unpinned = all.filter(s => !s.pinned);
+	// Step 1: rolling buffer — evict oldest never-pinned segments to stay within the buffer size.
+	// Segments with pinnedUntil === -1 had their pin expire; they are excluded here so they
+	// survive until thinning rules clean them up.
+	// Skipped entirely when rollingBufferSec is null (infinite): cleanup manages deletion instead.
 	const evicted = new Set<string>();
-	const excessUnpinned = unpinned.length - (MAX_ROLLING_SEGMENTS - 1);
-	for (let i = 0; i < excessUnpinned; i++) {
-		const s = unpinned[i];
-		dbg('info', 'idb', `rolling-buf evict: ${s.segmentId.slice(0, 8)} [${_fmtTs(s.startTime)}–${_fmtTs(s.endTime)}] ${s.mimeType}`);
-		await deleteSegmentBlob(s.segmentId);
-		await db.delete('segments', s.segmentId);
-		evicted.add(s.segmentId);
+	if (rollingBufferSec !== null) {
+		const maxRollingSegments = Math.max(1, Math.ceil(rollingBufferSec / SEGMENT_DURATION_S));
+		const rollingUnpinned = all.filter(s => !s.pinned && s.pinnedUntil === null);
+		const excessRolling = rollingUnpinned.length - (maxRollingSegments - 1);
+		for (let i = 0; i < excessRolling; i++) {
+			const s = rollingUnpinned[i];
+			dbg('info', 'idb', `rolling-buf evict: ${s.segmentId.slice(0, 8)} [${_fmtTs(s.startTime)}–${_fmtTs(s.endTime)}] ${s.mimeType}`);
+			await deleteSegmentBlob(s.segmentId);
+			await db.delete('segments', s.segmentId);
+			evicted.add(s.segmentId);
+		}
 	}
 
-	// Step 2: hard cap — evict oldest non-pinned segments if still over limit.
-	// Actively-pinned segments are exempt; they are bounded only by the storage quota
-	// (enforced separately in evictUnpinned when QuotaExceededError is thrown).
+	// Step 2: hard cap — evict oldest non-pinned-active segments if still over limit.
+	// Uses generous cap when rolling buffer is infinite so thinning + quota manage cleanup,
+	// but an absolute floor still prevents runaway accumulation with no cleanup configured.
+	const hardCapSegments = rollingBufferSec !== null
+		? Math.max(1, Math.ceil(rollingBufferSec / SEGMENT_DURATION_S)) * 3
+		: INFINITE_HARD_CAP_SEGMENTS;
 	const remaining = all.filter(s => !evicted.has(s.segmentId));
 	const unpinnedRemaining = remaining.filter(s => !_isActivePinned(s));
-	const excessTotal = unpinnedRemaining.length - (HARD_CAP_SEGMENTS - 1);
+	const excessTotal = unpinnedRemaining.length - (hardCapSegments - 1);
 	for (let i = 0; i < excessTotal; i++) {
 		const s = unpinnedRemaining[i];
 		dbg('warn', 'idb', `hard-cap evict: ${s.segmentId.slice(0, 8)} [${_fmtTs(s.startTime)}–${_fmtTs(s.endTime)}] ${s.mimeType}`);
@@ -217,10 +245,11 @@ export async function saveSegment(
 
 // Returns the longer-surviving pinnedUntil. 0 = forever (always wins).
 // Never reduces an existing expiry to a shorter one.
+// -1 (expired sentinel) is treated as unset — the new pin timestamp always wins.
 function mergePinnedUntil(existing: number | null | undefined, next: number): number {
 	if (existing === 0) return 0;
 	if (next === 0) return 0;
-	if (existing == null || existing === undefined) return next;
+	if (existing == null || existing === undefined || existing === -1) return next;
 	return Math.max(existing, next);
 }
 
@@ -329,23 +358,13 @@ export async function setQuota(bytes: number): Promise<void> {
 export async function evictUnpinned(ownMonitor?: string): Promise<void> {
 	const db = await openDB();
 	const quota = await getQuota();
-	const now = Math.floor(Date.now() / 1000);
-	const maxUnpinnedAge = PRE_ROLL_S * 2;
+
+	// Note: age-based deletion has been removed. Segments are evicted by:
+	// - enforceRollingBuffer() — keeps the rolling window trimmed on every saveSegment()
+	// - thinSegments() — runs on a schedule to thin out older footage per configured rules
+	// - quota-based eviction below — frees space when OPFS quota is exceeded
 
 	let all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
-		.sort((a, b) => a.startTime - b.startTime);
-
-	for (const seg of all) {
-		if (!seg.pinned && seg.backupOf == null && now - seg.endTime > maxUnpinnedAge) {
-			if (ownMonitor == null || seg.originMonitor === ownMonitor) {
-				dbg('info', 'idb', `age-evict unpinned: ${seg.segmentId.slice(0, 8)} [${_fmtTs(seg.startTime)}] ${seg.mimeType}`);
-				await deleteSegmentBlob(seg.segmentId);
-				await db.delete('segments', seg.segmentId);
-			}
-		}
-	}
-
-	all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
 		.sort((a, b) => a.startTime - b.startTime);
 	let total = all.reduce((s, c) => s + c.sizeBytes, 0);
 	if (total <= quota) return;
@@ -484,8 +503,9 @@ export async function unpinSegment(segmentId: string): Promise<void> {
 }
 
 // Checks each segment's own pinnedUntil and unpins those past their expiry.
-// pinnedUntil=null (no expiry tracking) and pinnedUntil=0 (forever) are never expired.
-// Unpinned segments become eligible for rolling-buffer eviction on the next saveSegment.
+// pinnedUntil=null (never pinned) and pinnedUntil=0 (forever) are never expired.
+// Sets pinnedUntil to -1 (expired sentinel) so the rolling buffer knows NOT to evict
+// these segments immediately — they survive until thinning rules clean them up.
 export async function expirePinnedSegments(): Promise<number> {
 	const db = await openDB();
 	const all = await db.getAll('segments') as Segment[];
@@ -493,8 +513,10 @@ export async function expirePinnedSegments(): Promise<number> {
 	let count = 0;
 	for (const seg of all) {
 		const until = seg.pinnedUntil;
-		if (seg.pinned && until != null && until !== 0 && now > until) {
-			await db.put('segments', { ...seg, pinned: false, pinnedUntil: null });
+		if (seg.pinned && until != null && until !== 0 && until !== -1 && now > until) {
+			// Use -1 as "expired" sentinel rather than null ("never pinned"), so rolling
+			// buffer eviction skips these and lets thinning rules handle them.
+			await db.put('segments', { ...seg, pinned: false, pinnedUntil: -1 });
 			count++;
 		}
 	}

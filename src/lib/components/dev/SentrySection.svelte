@@ -4,8 +4,9 @@
   import { identity, pairedDevices } from '$lib/store/identity';
   import { settings } from '$lib/store/settings';
   import {
-    sources, sensors, captures, nostrActions, links, loadPipeline,
+    sources, sensors, captures, nostrActions, channels, links, loadPipeline,
     storageCleanup, loadStorageCleanup,
+    autoNameSensor, autoNameLink,
     type SensorState, type LinkActivationState, type CaptureMethod,
   } from '$lib/store/pipeline';
   import { AudioDetector } from '$lib/detectors/audio';
@@ -14,13 +15,13 @@
   import { DateRangeDetector } from '$lib/detectors/daterange';
   import type { DetectionEvent } from '$lib/detectors/types';
   import { capturePhotosOnTrigger } from '$lib/detectors/photo';
-  import { saveSegment, pinRange, thinSegments, evictUnpinned, expirePinnedSegments, SEGMENT_DURATION_S } from '$lib/db/segments';
+  import { saveSegment, pinRange, thinSegments, evictUnpinned, expirePinnedSegments, setMonitorRollingBuffer, SEGMENT_DURATION_S } from '$lib/db/segments';
   import { createFootageRef, updateFootageRef } from '$lib/db/footage';
   import { buildTriggerEvent, buildFootageRefEvent } from '$lib/nostr/events';
   import { publish, getRelays } from '$lib/nostr/client';
   import { enqueue } from '$lib/db/outbox';
   import {
-    setMonitorStream, setMonitorStreams, setIdleTimeout, handleOfferRequest,
+    setMonitorStream, setMonitorStreams, setMonitorChannels, setIdleTimeout, handleOfferRequest,
     handleAnswer, handleHangup, stopAllMonitorSessions,
     getMonitorSessionInfos, type MonitorSessionInfo
   } from '$lib/webrtc/monitor-peer';
@@ -185,6 +186,14 @@
     await navigator.storage?.persist().catch(() => {});
 
     try {
+      // Compute effective rolling buffer: max across all enabled links.
+      // Any null (infinite) makes the whole result null (infinite wins).
+      const effectiveRollingBuffer = $links.filter(l => l.enabled).reduce<number | null>(
+        (acc, l) => (acc === null || (l.rollingBufferSec ?? null) === null) ? null : Math.max(acc, l.rollingBufferSec!),
+        0
+      );
+      setMonitorRollingBuffer(effectiveRollingBuffer === 0 ? null : effectiveRollingBuffer);
+
       // Determine which sources are needed:
       // - sensor sources (for detection)
       // - non-screen capture sources for enabled links (so they're ready for WebRTC before any trigger fires)
@@ -208,6 +217,8 @@
 
       // Pass all open source streams so viewers can receive any source.
       setMonitorStreams(new Map(openStreams));
+      // Register channels so viewers can request channel-based composites.
+      setMonitorChannels(get(channels));
       // Preview: prefer camera or screen source, fall back to mic
       const videoEntry = [...openStreams.entries()].find(([id]) =>
         $sources.find(s => s.id === id && (s.type === 'camera' || s.type === 'screen'))
@@ -341,14 +352,14 @@
     meterCtx = null;
     meterAnalysers.clear();
 
-    const micEntries = [...openStreams.entries()].filter(([id, s]) => {
+    const audioEntries = [...openStreams.entries()].filter(([id, s]) => {
       const src = get(sources).find(sc => sc.id === id);
-      return src?.type === 'microphone' && s.getAudioTracks().length > 0;
+      return (src?.type === 'microphone' || src?.type === 'screen') && s.getAudioTracks().length > 0;
     });
-    if (!micEntries.length) return;
+    if (!audioEntries.length) return;
 
     meterCtx = new AudioContext();
-    for (const [id, stream] of micEntries) {
+    for (const [id, stream] of audioEntries) {
       const analyser = meterCtx.createAnalyser();
       analyser.fftSize = 1024;
       const buf = new Float32Array(analyser.fftSize);
@@ -484,16 +495,14 @@
   // ── Per-source recorder priority stack ────────────────────────────────────
 
   function _bestCaptureForSource(sourceId: string): CaptureMethod | null {
-    const allLinks = $links.filter(l => l.enabled && l.captureId && firingLinks.has(l.id));
-    const caps = allLinks
-      .map(l => $captures.find(c => c.id === l.captureId))
-      .filter((c): c is CaptureMethod => c != null && c.sourceId === sourceId && c.type !== 'photo');
-    if (!caps.length) return null;
-    return caps.sort((a, b) => {
-      const pa = 'priority' in a ? a.priority : 0;
-      const pb = 'priority' in b ? b.priority : 0;
-      return pb - pa;
-    })[0];
+    const activePairs = $links
+      .filter(l => l.enabled && l.captureId && firingLinks.has(l.id))
+      .map(l => ({ link: l, cap: $captures.find(c => c.id === l.captureId) }))
+      .filter((e): e is { link: typeof e.link; cap: CaptureMethod } =>
+        e.cap != null && e.cap.sourceId === sourceId && e.cap.type !== 'photo'
+      );
+    if (!activePairs.length) return null;
+    return activePairs.sort((a, b) => b.link.priority - a.link.priority)[0].cap;
   }
 
   async function _updateRecorder(sourceId: string) {
@@ -696,7 +705,7 @@
     evt: { type: string; timestamp: number; data: Record<string, unknown> },
     sourceId: string,
     mimeType: string,
-    link: { preRollSec: number; postRollSec: number; onRetrigger: string; pinLifetimeSec: number | null }
+    link: { preRollSec: number; postRollSec: number; onRetrigger: string; pinLifetimeSec: number | null; channelId: string | null }
   ) {
     if (!$identity) return;
     const durationMs = typeof evt.data.durationMs === 'number' ? evt.data.durationMs : 0;
@@ -715,6 +724,7 @@
     if (!session) {
       const ref = await createFootageRef({
         originMonitor: $identity.pubkey, triggerType: evt.type, sourceId,
+        channelId: link.channelId ?? null,
         startTime: from, endTime: to, triggerTime: evt.timestamp,
       });
       session = { refId: ref.refId, startTime: from, endTime: to, mimeType, timer: null };
@@ -797,6 +807,7 @@
     for (const stream of openStreams.values()) stream.getTracks().forEach(t => t.stop());
     openStreams.clear();
     pendingStreams.clear();
+    setMonitorRollingBuffer(null); // reset to infinite (no eviction outside monitor lifecycle)
     setMonitorStream(null);
     stopAllMonitorSessions();
     sensorStates = {};
@@ -911,7 +922,7 @@
   {/if}
 
   <!-- Video preview (camera / screen sources) -->
-  <video bind:this={videoEl} autoplay muted playsinline class="camera-preview"
+  <video bind:this={videoEl} autoplay muted playsinline controls class="camera-preview"
     class:hidden={!isActive || !$sources.some(s => openSourceIds.has(s.id) && (s.type === 'camera' || s.type === 'screen'))}></video>
 
   <!-- Pipeline status — Sources / Sensors / Links (while running) -->
@@ -925,7 +936,7 @@
             {src.type === 'microphone' ? 'MIC' : src.type === 'camera' ? 'CAM' : 'SCRN'}
           </span>
           <span class="ps-name">{src.name}</span>
-          {#if src.type === 'microphone'}
+          {#if sourceDb.has(src.id)}
             {@const db = sourceDb.get(src.id) ?? -Infinity}
             {@const pct = dbToPct(db)}
             {@const thresh = $sensors.find(s => s.enabled && s.sourceId === src.id && s.type === 'audio')?.thresholdDb}
@@ -950,7 +961,7 @@
         {@const st = sensorStates[sensor.id]}
         <div class="ps-row">
           <span class="ps-badge {sensor.type === 'schedule' || sensor.type === 'timewindow' || sensor.type === 'daterange' ? 'sched' : 'audio'}">{sensor.type === 'schedule' ? 'SCHED' : sensor.type === 'timewindow' ? 'TIME' : sensor.type === 'daterange' ? 'DATE' : 'AUDIO'}</span>
-          <span class="ps-name">{sensor.name}</span>
+          <span class="ps-name">{sensor.name || autoNameSensor(sensor, $sources)}</span>
           <span class="ps-state {st?.status ?? 'inactive'}">{sensorBadgeText(st)}</span>
         </div>
       {/each}
@@ -965,7 +976,7 @@
         {@const cap = link.captureId ? $captures.find(c => c.id === link.captureId) : null}
         <div class="ps-row">
           <span class="ps-badge link">LINK</span>
-          <span class="ps-name">{link.name}</span>
+          <span class="ps-name">{link.name || autoNameLink(link, $sensors, $captures, $nostrActions, $sources, $channels)}</span>
           <span class="ps-state {ls?.status ?? 'inactive'}">{linkBadgeText(ls)}</span>
           {#if session}
             <span class="ps-session">{cap?.type === 'photo' ? '[photo]' : '[rec]'} {fmtDur(Math.floor(Date.now() / 1000) - session.startTime)}</span>

@@ -6,6 +6,7 @@ export interface FootageRef {
 	originMonitor: string;
 	triggerType: string;
 	sourceId: string;        // which input source produced this footage; legacy records default to 'default-mic'
+	channelId?: string | null; // which channel this footage is tagged to; null/undefined = untagged
 	startTime: number;       // unix seconds — pre-roll window start
 	endTime: number;         // unix seconds — post-roll window end
 	triggerTime: number;     // unix seconds — when the trigger actually fired

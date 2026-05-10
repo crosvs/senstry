@@ -3,7 +3,8 @@ import { IDBFactory } from 'fake-indexeddb';
 import {
 	saveSegment, pinRange, getSegmentById, getSegmentsInRange,
 	getCoverageMap, clearForMonitor, getStorageUsed,
-	MAX_ROLLING_SEGMENTS, _setTestBlobStore, _resetOpfsDirForTest,
+	MAX_ROLLING_SEGMENTS, SEGMENT_DURATION_S, setMonitorRollingBuffer,
+	_setTestBlobStore, _resetOpfsDirForTest,
 } from './segments';
 import { _resetDbForTest } from './idb';
 
@@ -15,6 +16,9 @@ beforeEach(() => {
 	_resetDbForTest();
 	_resetOpfsDirForTest();
 	_setTestBlobStore(new Map<string, Blob>());
+	// Tests that exercise rolling buffer eviction need a finite buffer.
+	// Use the same size as MAX_ROLLING_SEGMENTS so assertions stay consistent.
+	setMonitorRollingBuffer(MAX_ROLLING_SEGMENTS * SEGMENT_DURATION_S);
 });
 
 function blob(content = 'x') {
