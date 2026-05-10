@@ -12,6 +12,7 @@
   import SentrySection from '$lib/components/dev/SentrySection.svelte';
   import ContentViewerSection from '$lib/components/dev/ContentViewerSection.svelte';
   import SegmentStorageSection from '$lib/components/dev/SegmentStorageSection.svelte';
+  import AlertsSection from '$lib/components/dev/AlertsSection.svelte';
   import type { SignalMessage } from '$lib/webrtc/signaling';
   import type { SensorState, LinkActivationState } from '$lib/store/pipeline';
   import type { AlertSession } from '$lib/components/dev/SentrySection.svelte';
@@ -96,6 +97,8 @@
         {/each}
       </div>
     {/if}
+
+    <AlertsSection />
 
     <!-- Device-scoped sections divider -->
     <div class="scope-divider" title="All sections below are scoped to the device selected here. Identity, relay, pairing, settings, and sentry above apply globally.">
