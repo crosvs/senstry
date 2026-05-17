@@ -4,24 +4,29 @@
   import { identity, pairedDevices } from '$lib/store/identity';
   import { settings } from '$lib/store/settings';
   import {
-    sources, sensors, captures, nostrActions, channels, links, loadPipeline,
+    sources, sensors, captures, actions, channels, links, loadPipeline,
     storageCleanup, loadStorageCleanup,
-    autoNameSensor, autoNameLink,
-    type SensorState, type LinkActivationState, type CaptureMethod,
+    autoNameSensor, autoNameAction, autoNameLink,
+    type SensorState, type ActionState, type Action, type RecordAction, type ClipAction,
+    type SnapshotAction, type NotifyAction, type CaptureMethod, type ChannelConfig,
   } from '$lib/store/pipeline';
   import { AudioDetector } from '$lib/detectors/audio';
   import { ScheduleDetector } from '$lib/detectors/schedule';
   import { TimeWindowDetector } from '$lib/detectors/timewindow';
   import { DateRangeDetector } from '$lib/detectors/daterange';
+  import { NostrTriggerDetector } from '$lib/detectors/nostr-trigger';
   import type { DetectionEvent } from '$lib/detectors/types';
   import { capturePhotosOnTrigger } from '$lib/detectors/photo';
   import { saveSegment, pinRange, thinSegments, evictUnpinned, expirePinnedSegments, setMonitorRollingBuffer, SEGMENT_DURATION_S } from '$lib/db/segments';
   import { createFootageRef, updateFootageRef } from '$lib/db/footage';
-  import { buildTriggerEvent, buildFootageRefEvent } from '$lib/nostr/events';
-  import { publish, getRelays } from '$lib/nostr/client';
+  import { getPhotosInRange, pinPhoto } from '$lib/db/photos';
+  import { buildTriggerEvent, buildFootageRefEvent, KIND_TRIGGER } from '$lib/nostr/events';
+  import { publish, getRelays, subscribe } from '$lib/nostr/client';
+  import { decrypt } from '$lib/nostr/crypto';
   import { enqueue } from '$lib/db/outbox';
   import {
-    setMonitorStream, setMonitorStreams, setMonitorChannels, setIdleTimeout, handleOfferRequest,
+    setMonitorStream, setMonitorStreams, setMonitorChannels, setChannelActiveSources,
+    setIdleTimeout, handleOfferRequest,
     handleAnswer, handleHangup, stopAllMonitorSessions,
     getMonitorSessionInfos, type MonitorSessionInfo
   } from '$lib/webrtc/monitor-peer';
@@ -36,9 +41,9 @@
   // ── Types ─────────────────────────────────────────────────────────────────
 
   export type AlertSession = {
-    linkId: string;
-    linkName: string;
-    sourceId: string;
+    actionId: string;
+    actionName: string;
+    channelId: string;
     startTime: number;
     endTime: number;
     mimeType: string;
@@ -50,7 +55,7 @@
     signalRouterActive?: boolean;
     autoAccept?: boolean;
     sensorStates?: Record<string, SensorState>;
-    linkStates?: Record<string, LinkActivationState>;
+    actionStates?: Record<string, ActionState>;
     activeAlerts?: AlertSession[];
     onPendingOffer?: (fromPubkey: string, msg: SignalMessage) => void;
     acceptOffer?: { fromPubkey: string; msg: SignalMessage } | null;
@@ -59,7 +64,7 @@
     signalRouterActive = $bindable(false),
     autoAccept = $bindable(true),
     sensorStates = $bindable<Record<string, SensorState>>({}),
-    linkStates = $bindable<Record<string, LinkActivationState>>({}),
+    actionStates = $bindable<Record<string, ActionState>>({}),
     activeAlerts = $bindable<AlertSession[]>([]),
     onPendingOffer,
     acceptOffer = null,
@@ -75,9 +80,7 @@
   let signalSub: { close: () => void } | null = null;
   let sessionTick: ReturnType<typeof setInterval>;
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
-  // Reactive set of open source IDs — updated whenever streams are opened/closed
   let openSourceIds = $state(new Set<string>());
-  // Per-source dB level for display meters (mic sources only)
   let sourceDb = $state(new Map<string, number>());
   let meterRaf: number | null = null;
   let meterCtx: AudioContext | null = null;
@@ -86,51 +89,56 @@
 
   // ── Multi-source execution state ──────────────────────────────────────────
 
-  // One MediaStream per open source
   const openStreams = new Map<string, MediaStream>();
-  // In-flight open promises — prevents duplicate getUserMedia/getDisplayMedia calls when
-  // _ensureStream is called concurrently for the same source (e.g., rapid sensor state changes).
   const pendingStreams = new Map<string, Promise<MediaStream | null>>();
-  // One detector per sensor (AudioDetector or ScheduleDetector)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
   interface SensorDetector {
-    start(stream?: MediaStream): void;
+    start?(stream?: MediaStream): void;
     stop(): void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onDetection: ((event: DetectionEvent<any>) => void) | null;
     onStateChange: ((state: SensorState) => void) | null;
   }
   const activeDetectors = new Map<string, SensorDetector>();
-  // Per-source recorder state: current MediaRecorder + which capture method it's running
-  interface RecorderSlot {
+  const nostrTriggerSubs = new Map<string, { close: () => void }>();
+
+  // Channel recorder slots keyed by `${channelId}::${captureType}`
+  interface ChannelRecorderSlot {
     recorder: MediaRecorder | null;
     captureId: string | null;
     segmentStart: number;
     chunks: Blob[];
   }
-  const recorderSlots = new Map<string, RecorderSlot>();
-  // Per-link active state tracking (for minStateDurationMs timers)
-  const linkActivationTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Set of link IDs currently firing
-  const firingLinks = new Set<string>();
+  const channelRecorders = new Map<string, ChannelRecorderSlot>();
+  const _recKey = (channelId: string, captureType: 'video' | 'audio') => `${channelId}::${captureType}`;
 
-  // Footage session accumulator per link (for FootageRef window management)
+  // Per-action deactivation timers (post-roll)
+  const actionDeactivationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // NotifyAction cooldown tracking: key → cooldown expiry (unix ms)
+  const notifyCooldowns = new Map<string, number>();
+
+  // Interval handles for infinite snapshot bursts (snapshotCount === 0)
+  const snapshotIntervals = new Map<string, ReturnType<typeof setInterval>>();
+
+  // Footage session accumulator per ClipAction
   interface FootageSession {
     refId: string;
     startTime: number;
     endTime: number;
     mimeType: string;
+    triggerType: string;
+    channelId: string;
     timer: ReturnType<typeof setTimeout> | null;
   }
   const footageSessions = new Map<string, FootageSession>();
 
   function syncAlerts() {
-    activeAlerts = [...footageSessions.entries()].map(([linkId, s]) => {
-      const link = get(links).find(l => l.id === linkId);
-      const capture = link?.captureId ? get(captures).find(c => c.id === link.captureId) : null;
+    activeAlerts = [...footageSessions.entries()].map(([actionId, s]) => {
+      const action = get(actions).find(a => a.id === actionId);
       return {
-        linkId, linkName: link?.name ?? linkId,
-        sourceId: capture?.sourceId ?? 'default-mic',
+        actionId, actionName: action?.name ?? actionId,
+        channelId: s.channelId,
         startTime: s.startTime, endTime: s.endTime, mimeType: s.mimeType,
       };
     });
@@ -181,45 +189,48 @@
     await loadPipeline();
     monitorSnapshot = { settings: { ...$settings }, pipeline: {
       sources: $sources, sensors: $sensors, captures: $captures,
-      nostrActions: $nostrActions, links: $links,
+      actions: $actions, channels: $channels, links: $links,
     }};
     await navigator.storage?.persist().catch(() => {});
 
     try {
-      // Compute effective rolling buffer: max across all enabled links.
-      // Any null (infinite) makes the whole result null (infinite wins).
-      const effectiveRollingBuffer = $links.filter(l => l.enabled).reduce<number | null>(
-        (acc, l) => (acc === null || (l.rollingBufferSec ?? null) === null) ? null : Math.max(acc, l.rollingBufferSec!),
+      // Enabled RecordActions: those with at least one enabled link
+      const enabledRecordActions = ($actions.filter((a): a is RecordAction => a.type === 'record'))
+        .filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id)));
+
+      // Rolling buffer: max across enabled RecordActions (null = infinite wins)
+      const effectiveRollingBuffer = enabledRecordActions.reduce<number | null>(
+        (acc, a) => (acc === null || a.rollingBufferSec === null) ? null : Math.max(acc, a.rollingBufferSec),
         0
       );
       setMonitorRollingBuffer(effectiveRollingBuffer === 0 ? null : effectiveRollingBuffer);
 
-      // Determine which sources are needed:
-      // - sensor sources (for detection)
-      // - non-screen capture sources for enabled links (so they're ready for WebRTC before any trigger fires)
+      // Collect needed source IDs
       const neededSourceIds = new Set<string>();
       for (const sensor of $sensors.filter(s => s.enabled && s.type === 'audio')) {
         neededSourceIds.add(sensor.sourceId);
       }
-      for (const link of $links.filter(l => l.enabled && l.captureId)) {
-        const cap = $captures.find(c => c.id === link.captureId);
-        if (!cap) continue;
-        // All capture sources — including photo (camera) and screen — must be opened here
-        // during the Start Monitor button click (a user gesture). Lazy opening from a sensor
-        // callback is not a user gesture and will be silently skipped or cause repeated prompts.
-        neededSourceIds.add(cap.sourceId);
+      for (const action of enabledRecordActions) {
+        const ch = $channels.find(c => c.id === action.channelId);
+        if (!ch) continue;
+        if (ch.videoSourceId) neededSourceIds.add(ch.videoSourceId);
+        if (ch.audioSourceId) neededSourceIds.add(ch.audioSourceId);
+      }
+      const enabledSnapActions = ($actions.filter((a): a is SnapshotAction => a.type === 'snapshot'))
+        .filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id)));
+      for (const action of enabledSnapActions) {
+        if (action.captureId) {
+          const cap = $captures.find(c => c.id === action.captureId);
+          if (cap?.sourceId) neededSourceIds.add(cap.sourceId);
+        }
       }
 
-      // Open streams for all needed sources (exclude sentinel 'none' used by schedule/time sensors)
       for (const sourceId of neededSourceIds) {
         if (sourceId && sourceId !== 'none') await _ensureStream(sourceId);
       }
 
-      // Pass all open source streams so viewers can receive any source.
       setMonitorStreams(new Map(openStreams));
-      // Register channels so viewers can request channel-based composites.
       setMonitorChannels(get(channels));
-      // Preview: prefer camera or screen source, fall back to mic
       const videoEntry = [...openStreams.entries()].find(([id]) =>
         $sources.find(s => s.id === id && (s.type === 'camera' || s.type === 'screen'))
       );
@@ -228,6 +239,19 @@
       setIdleTimeout($settings.rtcIdleTimeoutMs);
 
       _startMeters();
+
+      // Start always-on recording for each (channelId, captureType) pair from enabled RecordActions
+      const channelCapturePairs = new Set<string>();
+      for (const action of enabledRecordActions) {
+        for (const capId of action.captureIds) {
+          const cap = $captures.find(c => c.id === capId);
+          if (cap && cap.type !== 'photo') channelCapturePairs.add(_recKey(action.channelId, cap.type as 'video' | 'audio'));
+        }
+      }
+      for (const key of channelCapturePairs) {
+        const [channelId, captureType] = key.split('::') as [string, 'video' | 'audio'];
+        _updateChannelRecorder(channelId, captureType);
+      }
 
       // Start sensors
       for (const sensor of $sensors.filter(s => s.enabled)) {
@@ -238,7 +262,52 @@
           det = new TimeWindowDetector({ activeSlots: sensor.activeSlots ?? [] });
         } else if (sensor.type === 'daterange') {
           det = new DateRangeDetector({ startIso: sensor.startIso, endIso: sensor.endIso });
+        } else if (sensor.type === 'nostr-trigger') {
+          if (!sensor.monitorPubkey) continue;
+          const ntDet = new NostrTriggerDetector({
+            minDurationMs: sensor.minDurationMs,
+            settlingMs: sensor.settlingMs,
+          });
+          const capturedSensor = sensor;
+          const ntSub = subscribe(
+            {
+              kinds: [KIND_TRIGGER],
+              '#p': [$identity.pubkey],
+              since: Math.floor(Date.now() / 1000) - 30,
+            },
+            (event) => {
+              if (event.pubkey !== capturedSensor.monitorPubkey) return;
+              const id = get(identity);
+              if (!id) return;
+              let payload: Record<string, unknown>;
+              try {
+                const plain = decrypt(id.privkey, event.pubkey, event.content);
+                payload = JSON.parse(plain);
+              } catch { return; }
+
+              const remoteState = payload.sensorState as 'sensing' | 'active' | 'idle';
+              if (!remoteState) return;
+              if (capturedSensor.nostrChannelId && payload.channelId !== capturedSensor.nostrChannelId) return;
+              if (capturedSensor.detectionTypes?.length) {
+                if (!capturedSensor.detectionTypes.includes(payload.type as string)) return;
+              }
+
+              const timing = (payload.sensorTiming as { minDurationMs: number; settlingMs: number }) ?? { minDurationMs: 0, settlingMs: 0 };
+              ntDet.handleRemoteState(
+                remoteState,
+                {
+                  monitorPubkey: event.pubkey,
+                  channelId: (payload.channelId as string | null) ?? null,
+                  detectionType: (payload.type as string) || 'nostr-trigger',
+                },
+                timing
+              );
+            }
+          );
+          nostrTriggerSubs.set(sensor.id, ntSub);
+          det = ntDet;
         } else {
+          // audio
           const stream = openStreams.get(sensor.sourceId);
           if (!stream) continue;
           const aDet = new AudioDetector({
@@ -250,20 +319,22 @@
           aDet.start(stream);
           det = aDet;
         }
+
+        const capturedSensor = sensor;
         det.onStateChange = (state: SensorState) => {
-          sensorStates = { ...sensorStates, [sensor.id]: state };
+          sensorStates = { ...sensorStates, [capturedSensor.id]: state };
           _evaluateLinks();
+          _handleSensorStateForNotify(capturedSensor.id, state);
         };
         det.onDetection = (evt) => {
-          handleDetectionFired(sensor.id, evt);
+          handleDetectionFired(capturedSensor.id, evt);
         };
-        if (sensor.type !== 'audio') det.start();
+        if (sensor.type !== 'audio' && sensor.type !== 'nostr-trigger') det.start?.();
         activeDetectors.set(sensor.id, det);
       }
 
       transitionMonitor('active');
 
-      // Start periodic auto-cleanup
       await loadStorageCleanup();
       const cfg = get(storageCleanup);
       if (cfg.autoCleanupEnabled) {
@@ -285,8 +356,6 @@
 
   async function _ensureStream(sourceId: string): Promise<MediaStream | null> {
     if (openStreams.has(sourceId)) return openStreams.get(sourceId)!;
-    // If a concurrent call is already opening this source, return the same promise.
-    // Without this, rapid sensor state changes can spawn multiple getDisplayMedia dialogs.
     if (pendingStreams.has(sourceId)) return pendingStreams.get(sourceId)!;
 
     const src = $sources.find(s => s.id === sourceId);
@@ -308,7 +377,6 @@
             video: src.frameRate ? { frameRate: { ideal: src.frameRate } } : true,
             audio: true,
           });
-          // When the user stops sharing via the browser toolbar, clean up automatically
           for (const track of stream.getTracks()) {
             track.onended = () => {
               if (openStreams.get(sourceId) === stream) {
@@ -383,178 +451,341 @@
   // ── Link evaluation ───────────────────────────────────────────────────────
 
   function _evaluateLinks() {
+    // Build map: actionId -> whether any enabled link has its condition met
+    const actionShouldFire = new Map<string, boolean>();
+    for (const link of $links.filter(l => l.enabled)) {
+      const condMet = _linkConditionMet(link);
+      for (const actionId of link.actionIds) {
+        if (condMet) {
+          actionShouldFire.set(actionId, true);
+        } else if (!actionShouldFire.has(actionId)) {
+          actionShouldFire.set(actionId, false);
+        }
+      }
+    }
+
+    for (const [actionId, shouldFire] of actionShouldFire) {
+      const action = $actions.find(a => a.id === actionId);
+      if (!action || action.type === 'notify') continue;
+
+      const isActive = actionStates[actionId]?.status === 'active';
+      const pendingDeact = actionDeactivationTimers.has(actionId);
+
+      if (shouldFire) {
+        _cancelActionDeactivation(actionId);
+        if (!isActive) {
+          _activateAction(action);
+        } else if ((action as RecordAction | ClipAction).onRetrigger === 'restart') {
+          _deactivateActionNow(action);
+          _activateAction(action);
+        }
+        // 'extend': deactivation cancelled above, nothing more
+        // 'ignore': already active, do nothing
+      } else if (isActive && !pendingDeact) {
+        _scheduleActionDeactivation(action);
+      }
+    }
+
+    // Update channel recorders for all RecordActions with enabled links
+    const channelCaptureKeys = new Set<string>();
+    for (const action of $actions.filter((a): a is RecordAction =>
+      a.type === 'record' && $links.some(l => l.enabled && l.actionIds.includes(a.id))
+    )) {
+      for (const capId of action.captureIds) {
+        const cap = $captures.find(c => c.id === capId);
+        if (cap && cap.type !== 'photo') channelCaptureKeys.add(_recKey(action.channelId, cap.type as 'video' | 'audio'));
+      }
+    }
+    for (const key of channelCaptureKeys) {
+      const [channelId, captureType] = key.split('::') as [string, 'video' | 'audio'];
+      _updateChannelRecorder(channelId, captureType);
+    }
+  }
+
+  function _linkConditionMet(link: import('$lib/store/pipeline').Link): boolean {
+    const results = link.sensorIds.map(id => {
+      const s = sensorStates[id];
+      if (!s) return false;
+      return link.onState === 'sensing'
+        ? s.status === 'sensing' || s.status === 'active'
+        : s.status === 'active';
+    });
+    return link.condition === 'all' ? results.every(Boolean) : results.some(Boolean);
+  }
+
+  function _activateAction(action: Action) {
     const now = Date.now();
-    const currentSensorStates = sensorStates;
-    const allLinks = $links.filter(l => l.enabled);
-
-    for (const link of allLinks) {
-      const sState = currentSensorStates[link.sensorId];
-      const sensorInTargetState = sState &&
-        (link.onState === 'sensing'
-          ? (sState.status === 'sensing' || sState.status === 'active')
-          : sState.status === 'active');
-
-      if (!sensorInTargetState) {
-        // Sensor left the target state — schedule link deactivation after postRollSec
-        if (firingLinks.has(link.id) || linkActivationTimers.has(link.id)) {
-          _scheduleLinkDeactivation(link.id, link.postRollSec * 1000);
-        }
-        continue;
+    actionStates = { ...actionStates, [action.id]: { status: 'active', startedAt: now } };
+    dbg('info', 'detector', `action activated: ${action.name || action.type} (${action.id.slice(0, 8)})`);
+    if (action.type === 'record') {
+      for (const capId of action.captureIds) {
+        const cap = $captures.find(c => c.id === capId);
+        if (cap && cap.type !== 'photo') _updateChannelRecorder(action.channelId, cap.type as 'video' | 'audio');
       }
-
-      // Sensor is in target state
-      if (firingLinks.has(link.id)) {
-        // Already firing — cancel any pending deactivation (sensor came back while in post-roll)
-        _cancelLinkDeactivation(link.id);
-        continue;
-      }
-
-      if (link.minStateDurationMs <= 0) {
-        // Activate immediately
-        _cancelLinkDeactivation(link.id);
-        _activateLink(link.id, now);
-      } else {
-        // Check if we already have a waiting timer
-        if (!linkActivationTimers.has(link.id)) {
-          const startedAt = now;
-          const timer = setTimeout(() => {
-            linkActivationTimers.delete(link.id);
-            if (firingLinks.has(link.id)) return;
-            _activateLink(link.id, startedAt);
-          }, link.minStateDurationMs);
-          linkActivationTimers.set(link.id, timer);
-          linkStates = { ...linkStates, [link.id]: { status: 'waiting', startedAt, minMs: link.minStateDurationMs } };
-        }
-      }
+      _updateChannelActiveSources();
     }
-
-    // Update recorder priority stacks
-    const affectedSources = new Set<string>();
-    for (const link of allLinks) {
-      if (link.captureId) {
-        const cap = $captures.find(c => c.id === link.captureId);
-        if (cap) affectedSources.add(cap.sourceId);
-      }
-    }
-    for (const sourceId of affectedSources) _updateRecorder(sourceId);
-  }
-
-  function _activateLink(linkId: string, startedAt: number) {
-    const link = $links.find(l => l.id === linkId);
-    if (!link) return;
-    firingLinks.add(linkId);
-    linkStates = { ...linkStates, [linkId]: { status: 'active', startedAt } };
-    dbg('info', 'detector', `link activated: ${link.name}`);
-    if (link.captureId) {
-      const cap = $captures.find(c => c.id === link.captureId);
-      if (cap) _updateRecorder(cap.sourceId);
+    if (action.type === 'snapshot' && action.snapshotCount === 0) {
+      _startInfiniteSnapshotInterval(action);
     }
   }
 
-  function _deactivateLink(linkId: string) {
-    if (!firingLinks.has(linkId)) return;
-    firingLinks.delete(linkId);
-    linkStates = { ...linkStates, [linkId]: { status: 'inactive' } };
-    const link = $links.find(l => l.id === linkId);
-    dbg('info', 'detector', `link deactivated: ${link?.name ?? linkId}`);
-    if (link?.captureId) {
-      const cap = $captures.find(c => c.id === link.captureId);
-      if (cap) _updateRecorder(cap.sourceId);
+  function _deactivateActionNow(action: Action) {
+    _cancelActionDeactivation(action.id);
+    actionStates = { ...actionStates, [action.id]: { status: 'idle' } };
+    dbg('info', 'detector', `action deactivated: ${action.name || action.type}`);
+    if (action.type === 'record') {
+      for (const capId of action.captureIds) {
+        const cap = $captures.find(c => c.id === capId);
+        if (cap && cap.type !== 'photo') _updateChannelRecorder(action.channelId, cap.type as 'video' | 'audio');
+      }
+      _updateChannelActiveSources();
     }
-    // Close footage session for this link
-    const session = footageSessions.get(linkId);
-    if (session) {
-      if (session.timer) clearTimeout(session.timer);
-      footageSessions.delete(linkId);
-      syncAlerts();
-      _closeFootageSession(session, linkId);
+    if (action.type === 'snapshot') {
+      _stopSnapshotInterval(action.id);
+    }
+    if (action.type === 'clip') {
+      const session = footageSessions.get(action.id);
+      if (session) {
+        if (session.timer) clearTimeout(session.timer);
+        footageSessions.delete(action.id);
+        syncAlerts();
+        _closeFootageSession(session, action.id, action);
+      }
     }
   }
 
-  function _scheduleLinkDeactivation(linkId: string, delayMs: number) {
-    _cancelLinkDeactivation(linkId);
-    if (delayMs <= 0) {
-      _deactivateLink(linkId);
+  function _scheduleActionDeactivation(action: Action) {
+    _cancelActionDeactivation(action.id);
+    const postRollMs = (action.type === 'record' || action.type === 'clip') ? action.postRollSec * 1000 : 0;
+    if (postRollMs <= 0) {
+      _deactivateActionNow(action);
       return;
     }
     const timer = setTimeout(() => {
-      linkActivationTimers.delete(linkId);
-      _deactivateLink(linkId);
-    }, delayMs);
-    linkActivationTimers.set(linkId, timer);
+      actionDeactivationTimers.delete(action.id);
+      _deactivateActionNow(action);
+    }, postRollMs);
+    actionDeactivationTimers.set(action.id, timer);
   }
 
-  function _cancelLinkDeactivation(linkId: string) {
-    const existing = linkActivationTimers.get(linkId);
-    if (existing) {
-      clearTimeout(existing);
-      linkActivationTimers.delete(linkId);
+  function _cancelActionDeactivation(actionId: string) {
+    const existing = actionDeactivationTimers.get(actionId);
+    if (existing) { clearTimeout(existing); actionDeactivationTimers.delete(actionId); }
+  }
+
+  // ── Infinite snapshot interval ────────────────────────────────────────────
+
+  function _startInfiniteSnapshotInterval(action: SnapshotAction) {
+    _stopSnapshotInterval(action.id);
+    const cap = $captures.find(c => c.id === action.captureId);
+    if (cap?.type !== 'photo') return;
+
+    const fireSnapshot = () => {
+      const stream = openStreams.get(cap.sourceId);
+      const id = get(identity);
+      if (!stream || !id) return;
+      capturePhotosOnTrigger(stream, {
+        snapshotCount: 1, intervalSec: 0,
+        imageWidth: cap.imageWidth, imageHeight: cap.imageHeight,
+        imageQuality: cap.imageQuality, imageFormat: cap.imageFormat,
+      }, id.pubkey, Math.floor(Date.now() / 1000), action.channelId)
+        .then(async ids => {
+          if (!ids.length || action.pinLifetimeSec == null) return;
+          const now = Math.floor(Date.now() / 1000);
+          const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
+          await pinRange(now - 2, now + 2, until, 'image/', action.channelId);
+        })
+        .catch(err => dbg('warn', 'detector', `snapshot error: ${err instanceof Error ? err.message : err}`));
+    };
+
+    fireSnapshot(); // immediate first shot
+    const interval = setInterval(fireSnapshot, Math.max(500, action.intervalSec * 1000));
+    snapshotIntervals.set(action.id, interval);
+  }
+
+  function _stopSnapshotInterval(actionId: string) {
+    const iv = snapshotIntervals.get(actionId);
+    if (iv !== undefined) { clearInterval(iv); snapshotIntervals.delete(actionId); }
+  }
+
+  // ── NotifyAction: publish on sensor state transitions ─────────────────────
+
+  async function _handleSensorStateForNotify(sensorId: string, state: SensorState) {
+    const id = get(identity);
+    if (!id || !isPublishing(get(monitorState)) || get(settings).pauseNostr) return;
+
+    const sensorState: 'sensing' | 'active' | 'idle' =
+      state.status === 'sensing' ? 'sensing'
+      : state.status === 'active' ? 'active'
+      : 'idle';
+
+    const sensor = get(sensors).find(s => s.id === sensorId);
+    const notifyActions = $links
+      .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+      .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+      .filter((a): a is NotifyAction => a?.type === 'notify');
+
+    if (!notifyActions.length) return;
+
+    const sensorTiming = { minDurationMs: sensor?.minDurationMs ?? 0, settlingMs: sensor?.settlingMs ?? 0 };
+    const detectionType = sensor?.type === 'audio' ? 'audio'
+      : sensor?.type === 'schedule' ? 'schedule'
+      : sensor?.type === 'timewindow' ? 'timewindow'
+      : sensor?.type === 'daterange' ? 'daterange'
+      : 'nostr-trigger';
+
+    // Find a channelId from any linked RecordAction or ClipAction on the same sensor
+    const channelId: string | null = (() => {
+      const linked = $links
+        .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+        .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+        .find((a): a is RecordAction | ClipAction => a?.type === 'record' || a?.type === 'clip');
+      return linked?.channelId ?? null;
+    })();
+
+    for (const action of notifyActions) {
+      if (!action.publishStates.includes(sensorState)) continue;
+
+      // Attach footageRefId from any active ClipAction session on same sensor
+      let footageRefId: string | null = null;
+      if (sensorState === 'active') {
+        const clipActions = $links
+          .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+          .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+          .filter((a): a is ClipAction => a?.type === 'clip');
+        for (const ca of clipActions) {
+          const s = footageSessions.get(ca.id);
+          if (s) { footageRefId = s.refId; break; }
+        }
+      }
+
+      const relays = getRelays();
+      const allDevices = get(pairedDevices);
+      const targets = action.viewerPubkey
+        ? allDevices.filter(d => d.pubkey === action.viewerPubkey)
+        : allDevices;
+
+      for (const device of targets) {
+        const cdKey = `${action.id}:${device.pubkey}`;
+        const cdEndsAt = notifyCooldowns.get(cdKey) ?? 0;
+        const inCooldown = Date.now() < cdEndsAt;
+
+        if (action.onRetrigger === 'ignore' && inCooldown) continue;
+        if (action.onRetrigger === 'extend') {
+          // Push cooldown window forward; only send if we weren't already in cooldown
+          notifyCooldowns.set(cdKey, Date.now() + action.cooldownMs);
+          if (inCooldown) continue;
+        } else {
+          // 'ignore' (not in cooldown) or 'restart': always send, reset cooldown
+          notifyCooldowns.set(cdKey, Date.now() + action.cooldownMs);
+        }
+
+        const ev = buildTriggerEvent(
+          id.privkey, id.pubkey, device.pubkey,
+          detectionType, sensorState,
+          get(settings).selfLabel,
+          {}, footageRefId, channelId, sensorTiming,
+          action.messageTemplate, false,
+        );
+        try {
+          await publish(ev);
+        } catch (e) {
+          await enqueue(ev, relays);
+        }
+      }
     }
   }
 
-  // ── Per-source recorder priority stack ────────────────────────────────────
+  // ── Channel active source tracking (for live RTC) ────────────────────────
 
-  function _bestCaptureForSource(sourceId: string): CaptureMethod | null {
-    const activePairs = $links
-      .filter(l => l.enabled && l.captureId && firingLinks.has(l.id))
-      .map(l => ({ link: l, cap: $captures.find(c => c.id === l.captureId) }))
-      .filter((e): e is { link: typeof e.link; cap: CaptureMethod } =>
-        e.cap != null && e.cap.sourceId === sourceId && e.cap.type !== 'photo'
-      );
-    if (!activePairs.length) return null;
-    return activePairs.sort((a, b) => b.link.priority - a.link.priority)[0].cap;
+  function _updateChannelActiveSources() {
+    const overrides = new Map<string, { videoSourceId?: string | null; audioSourceId?: string | null }>();
+    for (const ch of $channels) {
+      const best = ($actions.filter((a): a is RecordAction => a.type === 'record' && a.channelId === ch.id))
+        .filter(a => actionStates[a.id]?.status === 'active')
+        .sort((a, b) => b.priority - a.priority)[0];
+      if (best) {
+        let videoSourceId: string | null = null;
+        let audioSourceId: string | null = null;
+        for (const capId of best.captureIds) {
+          const cap = $captures.find(c => c.id === capId);
+          if (!cap) continue;
+          if (cap.type === 'video' && !videoSourceId) videoSourceId = cap.sourceId;
+          if (cap.type === 'audio' && !audioSourceId) audioSourceId = cap.sourceId;
+        }
+        overrides.set(ch.id, { videoSourceId, audioSourceId });
+      }
+    }
+    setChannelActiveSources(overrides);
   }
 
-  async function _updateRecorder(sourceId: string) {
-    const best = _bestCaptureForSource(sourceId);
-    const slot = recorderSlots.get(sourceId);
+  // ── Channel recorder priority stack ──────────────────────────────────────
+
+  function _bestCaptureForChannel(channelId: string, captureType: 'video' | 'audio'): CaptureMethod | null {
+    const eligible = ($actions.filter((a): a is RecordAction => a.type === 'record' && a.channelId === channelId))
+      .filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id)))
+      .flatMap(a => a.captureIds.map(capId => ({ action: a, cap: $captures.find(c => c.id === capId) })))
+      .filter((e): e is { action: RecordAction; cap: CaptureMethod } =>
+        e.cap != null && e.cap.type === captureType
+      );
+
+    if (!eligible.length) return null;
+
+    const active = eligible.filter(e => actionStates[e.action.id]?.status === 'active');
+    if (active.length) return active.sort((a, b) => b.action.priority - a.action.priority)[0].cap;
+    return eligible.sort((a, b) => a.action.priority - b.action.priority)[0].cap;
+  }
+
+  async function _updateChannelRecorder(channelId: string, captureType: 'video' | 'audio') {
+    const key = _recKey(channelId, captureType);
+    const best = _bestCaptureForChannel(channelId, captureType);
+    const slot = channelRecorders.get(key);
     const currentId = slot?.captureId ?? null;
     const newId = best?.id ?? null;
 
-    if (currentId === newId) return; // no change
+    if (currentId === newId) return;
 
-    // Stop current recorder (will chain to start new one in onstop)
     if (slot?.recorder && slot.recorder.state === 'recording') {
+      slot.captureId = newId; // claim new target before stop; re-entrant calls hit currentId === newId guard
       slot.recorder.stop();
-      // onstop will call _startRecorderForSource with the new best
     } else if (best) {
-      await _startRecorderForSource(sourceId, best);
+      await _startRecorderForChannel(channelId, captureType, best);
     } else {
-      // No active captures — clear slot
-      recorderSlots.delete(sourceId);
-      dbg('info', 'idb', `recording stopped for source:${sourceId}`);
+      channelRecorders.delete(key);
+      dbg('info', 'idb', `recording stopped for channel:${channelId} type:${captureType}`);
     }
   }
 
-  async function _startRecorderForSource(sourceId: string, cap: CaptureMethod) {
-    const stream = await _ensureStream(sourceId);
-    if (!stream) return;
-    if (cap.type === 'photo') return;
+  async function _startRecorderForChannel(channelId: string, captureType: 'video' | 'audio', cap: CaptureMethod) {
+    const ch = get(channels).find(c => c.id === channelId);
+    if (!ch || cap.type === 'photo') return;
 
     const mimeType = _selectMimeType(cap);
-    const videoBps = cap.type === 'video' ? (cap.videoBitsPerSec > 0 ? cap.videoBitsPerSec : 500_000) : undefined;
+    const videoBps = captureType === 'video' ? ((cap as { videoBitsPerSec?: number }).videoBitsPerSec ?? 0) || 500_000 : undefined;
     const audioBps = 'audioBitsPerSec' in cap && cap.audioBitsPerSec > 0 ? cap.audioBitsPerSec : 64_000;
 
-    // For video captures: build a mixed stream — video from the primary source, audio from
-    // audioSourceId (if set) or fall back to whatever audio the primary source has.
     let recordStream: MediaStream;
-    if (cap.type === 'video') {
-      const videoTracks = stream.getVideoTracks();
-      const audioSource = (cap.audioSourceId && openStreams.get(cap.audioSourceId)) ?? null;
-      const audioTracks = audioSource
-        ? audioSource.getAudioTracks()
-        : stream.getAudioTracks();
-      recordStream = new MediaStream([...videoTracks, ...audioTracks]);
+    if (captureType === 'video') {
+      const videoStream = ch.videoSourceId ? openStreams.get(ch.videoSourceId) : null;
+      if (!videoStream) return;
+      const tracks = videoStream.getVideoTracks();
+      if (!tracks.length) return;
+      recordStream = new MediaStream(tracks);
     } else {
-      recordStream = new MediaStream(stream.getAudioTracks());
+      const audioStream = ch.audioSourceId ? openStreams.get(ch.audioSourceId) : null;
+      if (!audioStream) return;
+      const tracks = audioStream.getAudioTracks();
+      if (!tracks.length) return;
+      recordStream = new MediaStream(tracks);
     }
-    const segStart = Math.floor(Date.now() / 1000);
 
-    const slot: RecorderSlot = { recorder: null, captureId: cap.id, segmentStart: segStart, chunks: [] };
-    recorderSlots.set(sourceId, slot);
+    const key = _recKey(channelId, captureType);
+    const segStart = Math.floor(Date.now() / 1000);
+    const slot: ChannelRecorderSlot = { recorder: null, captureId: cap.id, segmentStart: segStart, chunks: [] };
+    channelRecorders.set(key, slot);
 
     function recordSegment() {
-      const currentSlot = recorderSlots.get(sourceId);
+      const currentSlot = channelRecorders.get(key);
       if (!currentSlot || currentSlot.captureId !== cap.id) return;
       const segBegin = currentSlot.segmentStart;
       const chunks: Blob[] = [];
@@ -569,29 +800,28 @@
         const segEnd = currentSlot.segmentStart;
         if (blob.size > 0 && $identity) {
           try {
-            await saveSegment(blob, mimeType, segBegin, segEnd, $identity.pubkey, sourceId);
-            dbg('info', 'idb', `segment saved src:${sourceId} [${segBegin}–${segEnd}] ${blob.size}B`);
+            await saveSegment(blob, mimeType, segBegin, segEnd, $identity.pubkey, channelId);
+            dbg('info', 'idb', `segment saved ch:${channelId}/${captureType} [${segBegin}–${segEnd}] ${blob.size}B`);
           } catch (err) {
             dbg('warn', 'idb', `segment save failed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        // Re-evaluate: should we continue with same capture or switch?
-        const newBest = _bestCaptureForSource(sourceId);
+        const newBest = _bestCaptureForChannel(channelId, captureType);
         if (newBest && get(monitorState) === 'active') {
           if (newBest.id !== cap.id) {
-            _startRecorderForSource(sourceId, newBest);
+            _startRecorderForChannel(channelId, captureType, newBest);
           } else {
             recordSegment();
           }
         } else {
-          recorderSlots.delete(sourceId);
+          channelRecorders.delete(key);
         }
       };
       rec.onerror = (e) => dbg('warn', 'idb', `recorder error: ${(e as ErrorEvent).message ?? e}`);
       currentSlot.recorder = rec;
       currentSlot.segmentStart = Math.floor(Date.now() / 1000);
       rec.start();
-      dbg('info', 'idb', `recording started src:${sourceId} cap:${cap.name} ${mimeType}`);
+      dbg('info', 'idb', `recording started ch:${channelId}/${captureType} cap:${cap.name} ${mimeType}`);
       setTimeout(() => {
         if (rec.state === 'recording') {
           currentSlot.segmentStart = Math.floor(Date.now() / 1000);
@@ -611,127 +841,111 @@
       if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) return 'video/webm;codecs=vp9,opus';
       return 'video/webm';
     }
-    // audio
     const userMime = 'mimeType' in cap ? cap.mimeType : '';
     if (userMime && MediaRecorder.isTypeSupported(userMime)) return userMime;
     if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
     return 'audio/webm';
   }
 
-  // ── Detection handler ─────────────────────────────────────────────────────
+  // ── Detection handler (ClipActions + SnapshotActions) ────────────────────
 
-  // Called when onDetection fires (sensor confirmed active, event summarized)
   async function handleDetectionFired(
     sensorId: string,
     evt: { type: string; data: Record<string, unknown>; timestamp: number }
   ) {
     if (!$identity) return;
 
-    const sensor = $sensors.find(s => s.id === sensorId);
-    const firingLinkList = $links.filter(l => l.enabled && l.sensorId === sensorId && firingLinks.has(l.id));
+    // ClipActions: find enabled links targeting this sensor whose action is active
+    const clipActions = $links
+      .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+      .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+      .filter((a): a is ClipAction => a?.type === 'clip' && actionStates[a.id]?.status === 'active');
 
-    for (const link of firingLinkList) {
-      const capture = link.captureId ? $captures.find(c => c.id === link.captureId) : null;
-      const nostrAction = link.nostrActionId ? $nostrActions.find(a => a.id === link.nostrActionId) : null;
-      const sourceId = capture?.sourceId ?? sensor?.sourceId ?? 'default-mic';
-      const mimeType = capture ? _mimeForCapture(capture) : 'audio/webm';
-
-      // Manage footage session (FootageRef window)
-      if (isStoring(get(monitorState)) && capture && capture.type !== 'photo') {
-        await _handleFootageSession(link.id, evt, sourceId, mimeType, link);
+    for (const action of clipActions) {
+      if (isStoring(get(monitorState))) {
+        await _handleClipSession(action, evt);
       }
+    }
 
-      // Photo capture
-      if (capture?.type === 'photo') {
-        const stream = openStreams.get(capture.sourceId);
-        if (stream) {
-          const photoLink = link;
-          capturePhotosOnTrigger(stream, {
-            snapshotCount: link.snapshotCount,
-            intervalSec: link.intervalSec,
-            imageWidth: capture.imageWidth,
-            imageHeight: capture.imageHeight,
-            imageQuality: capture.imageQuality,
-            imageFormat: capture.imageFormat,
-          }, $identity.pubkey, evt.timestamp, capture.sourceId)
-            .then(async ids => {
-              if (!ids.length) return;
-              dbg('info', 'detector', `${ids.length} photo(s) stored for link ${photoLink.name}`);
-              if (photoLink.pinLifetimeSec != null) {
-                const now = Math.floor(Date.now() / 1000);
-                const until = photoLink.pinLifetimeSec === 0 ? 0 : now + photoLink.pinLifetimeSec;
-                const spanEnd = evt.timestamp + (photoLink.snapshotCount - 1) * Math.max(photoLink.intervalSec, 1) + 2;
-                await pinRange(evt.timestamp, spanEnd, until, 'image/', capture.sourceId);
-              }
-            })
-            .catch(err => dbg('warn', 'detector', `photo error: ${err instanceof Error ? err.message : err}`));
-        }
-      }
+    // SnapshotActions with finite count: fire burst on each detection while active
+    const snapActions = $links
+      .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+      .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+      .filter((a): a is SnapshotAction =>
+        a?.type === 'snapshot' && a.snapshotCount > 0 && actionStates[a.id]?.status === 'active'
+      );
 
-      // Nostr notification
-      if (nostrAction && isPublishing(get(monitorState)) && !$settings.pauseNostr) {
-        const session = footageSessions.get(link.id);
-        const relays = getRelays();
-        for (const device of $pairedDevices) {
-          const ev = buildTriggerEvent(
-            $identity.privkey, $identity.pubkey, device.pubkey,
-            evt.type, $settings.selfLabel,
-            nostrAction.includeData ? { ...evt.data, sensorName: sensor?.name } : {},
-            session?.refId ?? null,
-            sourceId,
-            nostrAction.messageTemplate,
-            nostrAction.includeData,
-          );
-          const cooldownKey = `trigger:${link.id}:${device.pubkey}`;
-          try {
-            await publish(ev, { cooldownKey, cooldownMs: nostrAction.cooldownMs });
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : '';
-            if (msg !== 'cooldown') await enqueue(ev, relays);
+    for (const action of snapActions) {
+      if (!action.captureId) continue;
+      const cap = $captures.find(c => c.id === action.captureId);
+      if (cap?.type !== 'photo') continue;
+      const stream = openStreams.get(cap.sourceId);
+      if (!stream) continue;
+      capturePhotosOnTrigger(stream, {
+        snapshotCount: action.snapshotCount,
+        intervalSec: action.intervalSec,
+        imageWidth: cap.imageWidth,
+        imageHeight: cap.imageHeight,
+        imageQuality: cap.imageQuality,
+        imageFormat: cap.imageFormat,
+      }, $identity.pubkey, evt.timestamp, action.channelId)
+        .then(async ids => {
+          if (!ids.length) return;
+          dbg('info', 'detector', `${ids.length} snapshot(s) stored for action ${action.name || action.id}`);
+          if (action.pinLifetimeSec != null) {
+            const now = Math.floor(Date.now() / 1000);
+            const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
+            const spanEnd = evt.timestamp + (action.snapshotCount - 1) * Math.max(action.intervalSec, 1) + 2;
+            await pinRange(evt.timestamp, spanEnd, until, 'image/', action.channelId);
           }
-        }
-      }
+        })
+        .catch(err => dbg('warn', 'detector', `snapshot error: ${err instanceof Error ? err.message : err}`));
     }
   }
 
-  function _mimeForCapture(cap: CaptureMethod): string {
-    if (cap.type === 'photo') return 'image/jpeg';
-    if (cap.type === 'video') return 'video/webm';
-    return 'audio/webm';
-  }
-
-  async function _handleFootageSession(
-    linkId: string,
+  async function _handleClipSession(
+    action: ClipAction,
     evt: { type: string; timestamp: number; data: Record<string, unknown> },
-    sourceId: string,
-    mimeType: string,
-    link: { preRollSec: number; postRollSec: number; onRetrigger: string; pinLifetimeSec: number | null; channelId: string | null }
   ) {
     if (!$identity) return;
     const durationMs = typeof evt.data.durationMs === 'number' ? evt.data.durationMs : 0;
     const eventEnd = evt.timestamp + Math.ceil(durationMs / 1000);
-    const from = evt.timestamp - link.preRollSec;
-    const to = eventEnd + link.postRollSec;
-    let session = footageSessions.get(linkId);
+    const from = evt.timestamp - action.preRollSec;
+    const to = eventEnd + action.postRollSec;
+    let session = footageSessions.get(action.id);
 
     if (session && from > session.endTime) {
       if (session.timer) clearTimeout(session.timer);
-      await _closeFootageSession(session, linkId);
+      await _closeFootageSession(session, action.id, action);
       session = undefined;
-      footageSessions.delete(linkId);
+      footageSessions.delete(action.id);
     }
 
     if (!session) {
       const ref = await createFootageRef({
-        originMonitor: $identity.pubkey, triggerType: evt.type, sourceId,
-        channelId: link.channelId ?? null,
+        originMonitor: $identity.pubkey, triggerType: evt.type,
+        channelId: action.channelId,
         startTime: from, endTime: to, triggerTime: evt.timestamp,
       });
-      session = { refId: ref.refId, startTime: from, endTime: to, mimeType, timer: null };
-      footageSessions.set(linkId, session);
+      session = { refId: ref.refId, startTime: from, endTime: to, mimeType: 'audio/webm', triggerType: evt.type, channelId: action.channelId, timer: null };
+      footageSessions.set(action.id, session);
       syncAlerts();
-      dbg('info', 'idb', `footage session created: ${ref.refId.slice(0, 8)}…`);
-    } else if (link.onRetrigger !== 'ignore') {
+      dbg('info', 'idb', `clip session created: ${ref.refId.slice(0, 8)}…`);
+    } else if (action.onRetrigger === 'restart') {
+      // Close current session immediately and open a new one from this event
+      if (session.timer) clearTimeout(session.timer);
+      await _closeFootageSession(session, action.id, action);
+      footageSessions.delete(action.id);
+      const ref = await createFootageRef({
+        originMonitor: $identity.pubkey, triggerType: evt.type,
+        channelId: action.channelId,
+        startTime: from, endTime: to, triggerTime: evt.timestamp,
+      });
+      session = { refId: ref.refId, startTime: from, endTime: to, mimeType: 'audio/webm', triggerType: evt.type, channelId: action.channelId, timer: null };
+      footageSessions.set(action.id, session);
+      syncAlerts();
+      dbg('info', 'idb', `clip session restarted: ${ref.refId.slice(0, 8)}…`);
+    } else if (action.onRetrigger === 'extend') {
       const newEnd = Math.max(session.endTime, to);
       if (newEnd > session.endTime) {
         await updateFootageRef(session.refId, { endTime: newEnd });
@@ -739,42 +953,52 @@
         syncAlerts();
       }
     }
+    // 'ignore': leave session as-is
 
     if (session.timer) clearTimeout(session.timer);
     const msUntilClose = Math.max(2000, (session.endTime * 1000 - Date.now()) + 2000);
     const capturedRefId = session.refId;
+    const capturedActionId = action.id;
     session.timer = setTimeout(async () => {
-      const s = footageSessions.get(linkId);
+      const s = footageSessions.get(capturedActionId);
       if (!s || s.refId !== capturedRefId) return;
-      footageSessions.delete(linkId);
+      footageSessions.delete(capturedActionId);
       syncAlerts();
-      await _closeFootageSession(s, linkId);
+      await _closeFootageSession(s, capturedActionId, action);
     }, msUntilClose);
   }
 
   async function _closeFootageSession(
-    s: { refId: string; startTime: number; endTime: number; mimeType: string },
-    linkId: string
+    s: { refId: string; startTime: number; endTime: number; mimeType: string; triggerType: string; channelId: string },
+    actionId: string,
+    action?: Action,
   ) {
     const cfg = get(settings);
     const now = Math.floor(Date.now() / 1000);
-    const link = get(links).find(l => l.id === linkId);
-    if (link?.pinLifetimeSec != null) {
-      const until = link.pinLifetimeSec === 0 ? 0 : now + link.pinLifetimeSec;
-      await pinRange(s.startTime, s.endTime, until);
+    if (action?.type === 'clip' && action.pinLifetimeSec != null) {
+      const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
+      const monPubkey = get(identity)?.pubkey;
+      // Pin audio/video segments in the time window
+      if (action.captureTypes.some(t => t === 'audio' || t === 'video')) {
+        await pinRange(s.startTime, s.endTime, until, undefined, s.channelId);
+      }
+      // Pin photos taken during the window by this monitor
+      if (action.captureTypes.includes('photo') && monPubkey) {
+        const photos = await getPhotosInRange(s.startTime, s.endTime, monPubkey);
+        await Promise.all(photos.map(p => pinPhoto(p.photoId, true)));
+      }
     }
-    dbg('info', 'idb', `footage session closed: ${s.refId.slice(0, 8)}… [${s.startTime}–${s.endTime}]`);
+    dbg('info', 'idb', `clip session closed: ${s.refId.slice(0, 8)}… [${s.startTime}–${s.endTime}]`);
     const id = get(identity);
     if (!id || !isPublishing(get(monitorState)) || cfg.pauseNostr) return;
-    const source = get(links).find(l => l.id === linkId);
-    const cap = source?.captureId ? get(captures).find(c => c.id === source.captureId) : null;
-    const sourceId = cap?.sourceId ?? 'default-mic';
     const relays = getRelays();
+    const preRoll = action?.type === 'clip' ? action.preRollSec : 30;
     for (const device of get(pairedDevices)) {
       const fev = buildFootageRefEvent(
         id.privkey, id.pubkey, device.pubkey,
-        s.refId, 'audio', s.startTime, s.endTime, s.startTime + (link?.preRollSec ?? 30),
-        sourceId
+        s.refId, s.triggerType, s.startTime, s.endTime,
+        s.startTime + preRoll,
+        s.channelId,
       );
       try { await publish(fev); } catch { await enqueue(fev, relays); }
     }
@@ -785,15 +1009,16 @@
   async function stopMonitor() {
     transitionMonitor('stopping');
     if (cleanupTimer !== null) { clearInterval(cleanupTimer); cleanupTimer = null; }
-    // Pin and close any open footage sessions before clearing
-    for (const [linkId, s] of footageSessions) {
+    for (const [actionId, s] of footageSessions) {
       if (s.timer) clearTimeout(s.timer);
-      await _closeFootageSession(s, linkId);
+      const action = get(actions).find(a => a.id === actionId);
+      await _closeFootageSession(s, actionId, action);
     }
     footageSessions.clear();
-    for (const timer of linkActivationTimers.values()) clearTimeout(timer);
-    linkActivationTimers.clear();
-    firingLinks.clear();
+    for (const timer of actionDeactivationTimers.values()) clearTimeout(timer);
+    actionDeactivationTimers.clear();
+    for (const iv of snapshotIntervals.values()) clearInterval(iv);
+    snapshotIntervals.clear();
     if (meterRaf !== null) { cancelAnimationFrame(meterRaf); meterRaf = null; }
     meterCtx?.close();
     meterCtx = null;
@@ -802,16 +1027,21 @@
     openSourceIds = new Set();
     for (const det of activeDetectors.values()) det.stop();
     activeDetectors.clear();
-    for (const slot of recorderSlots.values()) { if (slot.recorder?.state === 'recording') slot.recorder.stop(); }
-    recorderSlots.clear();
+    for (const sub of nostrTriggerSubs.values()) sub.close();
+    nostrTriggerSubs.clear();
+    for (const slot of channelRecorders.values()) {
+      if (slot.recorder?.state === 'recording') slot.recorder.stop();
+    }
+    channelRecorders.clear();
     for (const stream of openStreams.values()) stream.getTracks().forEach(t => t.stop());
     openStreams.clear();
     pendingStreams.clear();
-    setMonitorRollingBuffer(null); // reset to infinite (no eviction outside monitor lifecycle)
+    setMonitorRollingBuffer(null);
     setMonitorStream(null);
     stopAllMonitorSessions();
     sensorStates = {};
-    linkStates = {};
+    actionStates = {};
+    notifyCooldowns.clear();
     activeAlerts = [];
     monitorSnapshot = null;
     transitionMonitor('idle');
@@ -845,7 +1075,7 @@
     return h ? `${d}d ${h}h` : `${d}d`;
   }
 
-  function sensorBadgeText(st: import('$lib/store/pipeline').SensorState | undefined): string {
+  function sensorBadgeText(st: SensorState | undefined): string {
     if (!st) return 'INACTIVE';
     if (st.status === 'inactive') return 'INACTIVE';
     if (st.status === 'idle') {
@@ -867,35 +1097,40 @@
     return '—';
   }
 
-  function linkBadgeText(ls: import('$lib/store/pipeline').LinkActivationState | undefined): string {
-    if (!ls || ls.status === 'inactive') return 'INACTIVE';
-    if (ls.status === 'waiting') {
-      const elapsed = ((Date.now() - ls.startedAt) / 1000).toFixed(1);
-      const total = (ls.minMs / 1000).toFixed(1);
-      return `WAIT ${elapsed}/${total}s`;
+  function actionBadgeText(st: ActionState | undefined): string {
+    if (!st || st.status === 'idle') return 'IDLE';
+    if (st.status === 'active') {
+      const elapsed = ((Date.now() - st.startedAt) / 1000).toFixed(1);
+      return `ACTIVE ${elapsed}s`;
     }
-    return 'ACTIVE';
+    if (st.status === 'cooldown') {
+      const rem = Math.max(0, Math.ceil((st.endsAt - Date.now()) / 1000));
+      return `COOLDOWN ${rem}s`;
+    }
+    return '—';
   }
 
   const statusBadge = $derived(
-    $monitorState === 'starting'  ? { label: 'STARTING',        color: 'var(--color-warning)' }
-    : $monitorState === 'stopping'? { label: 'STOPPING',        color: 'var(--color-warning)' }
-    : isActive                    ? { label: 'RUNNING',         color: 'var(--color-success)' }
+    $monitorState === 'starting'  ? { label: 'STARTING',         color: 'var(--color-warning)' }
+    : $monitorState === 'stopping'? { label: 'STOPPING',         color: 'var(--color-warning)' }
+    : isActive                    ? { label: 'RUNNING',          color: 'var(--color-success)' }
     : sessions.some(s => s.iceState === 'connected' || s.iceState === 'completed')
-                                  ? { label: 'CONNECTED',       color: 'var(--color-accent)'  }
+                                  ? { label: 'CONNECTED',        color: 'var(--color-accent)'  }
     : signalRouterActive && autoAccept
-                                  ? { label: 'LISTENING · AUTO',color: 'var(--color-warning)' }
-    : signalRouterActive          ? { label: 'LISTENING',       color: 'var(--color-warning)' }
-                                  : { label: 'IDLE',            color: 'var(--color-border)'  }
+                                  ? { label: 'LISTENING · AUTO', color: 'var(--color-warning)' }
+    : signalRouterActive          ? { label: 'LISTENING',        color: 'var(--color-warning)' }
+                                  : { label: 'IDLE',             color: 'var(--color-border)'  }
   );
 
-  // Wire up detection callbacks after detectors start
   function _wireDetection() {
     for (const [sensorId, det] of activeDetectors.entries()) {
       det.onDetection = (evt: DetectionEvent<Record<string, unknown>>) => handleDetectionFired(sensorId, evt);
     }
   }
   $effect(() => { if (isActive) _wireDetection(); });
+
+  // Alias to avoid shadowing by {#snippet actions()} in the template
+  const actionsData = $derived($actions);
 </script>
 
 <DevSection title="Sentry" badge={statusBadge.label} badgeColor={statusBadge.color}>
@@ -918,14 +1153,14 @@
   {/if}
 
   {#if showRaw}
-    <pre class="raw">{JSON.stringify(monitorSnapshot ?? { settings: $settings, sources: $sources, sensors: $sensors, captures: $captures, links: $links }, null, 2)}</pre>
+    <pre class="raw">{JSON.stringify(monitorSnapshot ?? { settings: $settings, sources: $sources, sensors: $sensors, captures: $captures, actions: actionsData, links: $links }, null, 2)}</pre>
   {/if}
 
-  <!-- Video preview (camera / screen sources) -->
+  <!-- Video preview -->
   <video bind:this={videoEl} autoplay muted playsinline controls class="camera-preview"
     class:hidden={!isActive || !$sources.some(s => openSourceIds.has(s.id) && (s.type === 'camera' || s.type === 'screen'))}></video>
 
-  <!-- Pipeline status — Sources / Sensors / Links (while running) -->
+  <!-- Pipeline status — Sources / Sensors / Actions / Links (while running) -->
   {#if isActive}
     <div class="pipeline-status">
 
@@ -960,7 +1195,9 @@
       {#each $sensors.filter(s => s.enabled) as sensor (sensor.id)}
         {@const st = sensorStates[sensor.id]}
         <div class="ps-row">
-          <span class="ps-badge {sensor.type === 'schedule' || sensor.type === 'timewindow' || sensor.type === 'daterange' ? 'sched' : 'audio'}">{sensor.type === 'schedule' ? 'SCHED' : sensor.type === 'timewindow' ? 'TIME' : sensor.type === 'daterange' ? 'DATE' : 'AUDIO'}</span>
+          <span class="ps-badge {sensor.type === 'nostr-trigger' ? 'nostr' : sensor.type === 'schedule' || sensor.type === 'timewindow' || sensor.type === 'daterange' ? 'sched' : 'audio'}">
+            {sensor.type === 'schedule' ? 'TIMER' : sensor.type === 'timewindow' ? 'TIME' : sensor.type === 'daterange' ? 'DATE' : sensor.type === 'nostr-trigger' ? 'NOSTR' : 'AUDIO'}
+          </span>
           <span class="ps-name">{sensor.name || autoNameSensor(sensor, $sources)}</span>
           <span class="ps-state {st?.status ?? 'inactive'}">{sensorBadgeText(st)}</span>
         </div>
@@ -969,18 +1206,33 @@
         <div class="ps-empty">No enabled sensors</div>
       {/if}
 
+      <div class="ps-header">Actions</div>
+      {#each actionsData.filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id))) as action (action.id)}
+        {@const st = actionStates[action.id]}
+        {@const session = action.type === 'clip' ? activeAlerts.find(a => a.actionId === action.id) : null}
+        <div class="ps-row">
+          <span class="ps-badge {action.type === 'record' ? 'link-actv' : action.type === 'clip' ? 'link-pin' : action.type === 'snapshot' ? 'link-photo' : 'link-act'}">
+            {action.type === 'record' ? 'REC' : action.type === 'clip' ? 'CLIP' : action.type === 'snapshot' ? 'SNAP' : 'NTFY'}
+          </span>
+          <span class="ps-name">{action.name || autoNameAction(action, $captures, $channels, $sources)}</span>
+          {#if action.type !== 'notify'}
+            <span class="ps-state {st?.status ?? 'idle'}">{actionBadgeText(st)}</span>
+          {/if}
+          {#if session}
+            <span class="ps-session">[clip] {fmtDur(Math.floor(Date.now() / 1000) - session.startTime)}</span>
+          {/if}
+        </div>
+      {/each}
+      {#if actionsData.filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id))).length === 0}
+        <div class="ps-empty">No enabled actions</div>
+      {/if}
+
       <div class="ps-header">Links</div>
       {#each $links.filter(l => l.enabled) as link (link.id)}
-        {@const ls = linkStates[link.id]}
-        {@const session = activeAlerts.find(a => a.linkId === link.id)}
-        {@const cap = link.captureId ? $captures.find(c => c.id === link.captureId) : null}
         <div class="ps-row">
-          <span class="ps-badge link">LINK</span>
-          <span class="ps-name">{link.name || autoNameLink(link, $sensors, $captures, $nostrActions, $sources, $channels)}</span>
-          <span class="ps-state {ls?.status ?? 'inactive'}">{linkBadgeText(ls)}</span>
-          {#if session}
-            <span class="ps-session">{cap?.type === 'photo' ? '[photo]' : '[rec]'} {fmtDur(Math.floor(Date.now() / 1000) - session.startTime)}</span>
-          {/if}
+          <span class="ps-badge link-lnk">LNK</span>
+          <span class="ps-name">{link.name || autoNameLink(link, $sensors, actionsData, $sources)}</span>
+          <span class="ps-link-actions">{link.actionIds.length} action{link.actionIds.length !== 1 ? 's' : ''}</span>
         </div>
       {/each}
       {#if $links.filter(l => l.enabled).length === 0}
@@ -1049,13 +1301,11 @@
 </DevSection>
 
 <style>
-  /* ── Shared small action button ─────────────────────────────────────────── */
   .act-btn { font-size: 10px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-muted); cursor: pointer; font-family: inherit; white-space: nowrap; }
   .act-btn:hover:not(:disabled) { color: var(--color-text); }
   .act-btn:disabled { opacity: 0.4; cursor: default; }
   .act-btn.danger { color: var(--color-danger); border-color: var(--color-danger); }
 
-  /* ── Monitor start/stop ─────────────────────────────────────────────────── */
   .monitor-btn { width: 100%; padding: 8px 0; border-radius: 6px; border: none; font-size: 13px; font-weight: 700; font-family: inherit; cursor: pointer; letter-spacing: 0.03em; transition: opacity 0.15s; }
   .monitor-btn:disabled { opacity: 0.5; cursor: default; }
   .monitor-btn.start { background: var(--color-success); color: white; }
@@ -1067,18 +1317,22 @@
   .camera-preview { width: 100%; border-radius: 8px; background: #000; max-height: 220px; }
   .camera-preview.hidden { display: none; }
 
-  /* Pipeline status panel */
   .pipeline-status { display: flex; flex-direction: column; gap: 3px; }
   .ps-header { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-muted); margin-top: 6px; }
   .ps-row { display: flex; align-items: center; gap: 6px; min-height: 22px; }
   .ps-empty { font-size: 10px; color: var(--color-muted); font-style: italic; padding-left: 2px; }
   .ps-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; text-transform: uppercase; flex-shrink: 0; color: white; }
-  .ps-badge.mic    { background: #2563eb; }
-  .ps-badge.cam    { background: #7c3aed; }
-  .ps-badge.screen { background: #0e7490; }
-  .ps-badge.audio  { background: #2563eb; }
-  .ps-badge.sched  { background: #0891b2; }
-  .ps-badge.link   { background: #d97706; }
+  .ps-badge.mic      { background: #2563eb; }
+  .ps-badge.cam      { background: #7c3aed; }
+  .ps-badge.screen   { background: #0e7490; }
+  .ps-badge.audio    { background: #2563eb; }
+  .ps-badge.sched    { background: #0891b2; }
+  .ps-badge.nostr    { background: #7c3aed; }
+  .ps-badge.link-actv  { background: #d97706; }
+  .ps-badge.link-pin   { background: #0f766e; }
+  .ps-badge.link-photo { background: #059669; }
+  .ps-badge.link-act   { background: #6d28d9; }
+  .ps-badge.link-lnk   { background: #475569; }
   .ps-name { font-size: 11px; color: var(--color-text); min-width: 80px; flex-shrink: 0; }
   .ps-meter-track { flex: 1; height: 8px; border-radius: 4px; background: var(--color-surface); overflow: visible; position: relative; }
   .ps-meter-fill { height: 100%; border-radius: 4px; transition: width 0.075s; }
@@ -1091,10 +1345,9 @@
   .ps-state.sensing  { background: #1d4ed8; color: white; }
   .ps-state.active   { background: var(--color-success); color: white; }
   .ps-state.settling { background: var(--color-warning); color: #1a1a1a; }
-  .ps-state.waiting  { background: #92400e; color: #fcd34d; }
+  .ps-state.cooldown { background: #7c3aed; color: white; }
   .ps-session { font-size: 10px; color: var(--color-danger); font-family: ui-monospace, monospace; font-weight: 600; }
 
-  /* ── Remote Viewing section ─────────────────────────────────────────────── */
   .rtc-section { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
   .rtc-section-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--color-muted); margin-bottom: 4px; }
 

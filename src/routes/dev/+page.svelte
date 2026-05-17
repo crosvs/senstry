@@ -10,11 +10,12 @@
   import DevicesSection from '$lib/components/dev/DevicesSection.svelte';
   import SettingsSection from '$lib/components/dev/SettingsSection.svelte';
   import SentrySection from '$lib/components/dev/SentrySection.svelte';
+  import LiveViewSection from '$lib/components/dev/LiveViewSection.svelte';
   import ContentViewerSection from '$lib/components/dev/ContentViewerSection.svelte';
   import SegmentStorageSection from '$lib/components/dev/SegmentStorageSection.svelte';
   import AlertsSection from '$lib/components/dev/AlertsSection.svelte';
   import type { SignalMessage } from '$lib/webrtc/signaling';
-  import type { SensorState, LinkActivationState } from '$lib/store/pipeline';
+  import type { SensorState, ActionState } from '$lib/store/pipeline';
   import type { AlertSession } from '$lib/components/dev/SentrySection.svelte';
 
   // ── Shared page-level state ───────────────────────────────────────────────
@@ -22,7 +23,7 @@
   let signalRouterActive = $state(false);
   let autoAccept = $state(true);
   let sensorStates = $state<Record<string, SensorState>>({});
-  let linkStates = $state<Record<string, LinkActivationState>>({});
+  let actionStates = $state<Record<string, ActionState>>({});
   let activeAlerts = $state<AlertSession[]>([]);
 
   interface PendingOffer { fromPubkey: string; msg: SignalMessage; }
@@ -68,13 +69,14 @@
     <IdentitySection />
     <RelaySection />
     <PairingSection />
-    <SettingsSection {sensorStates} {linkStates} {activeAlerts} />
+
+    <AlertsSection />
 
     <SentrySection
       bind:signalRouterActive
       bind:autoAccept
       bind:sensorStates
-      bind:linkStates
+      bind:actionStates
       bind:activeAlerts
       onPendingOffer={handlePendingOffer}
       acceptOffer={acceptingOffer}
@@ -98,7 +100,7 @@
       </div>
     {/if}
 
-    <AlertsSection />
+    <SettingsSection {sensorStates} {actionStates} {activeAlerts} />
 
     <!-- Device-scoped sections divider -->
     <div class="scope-divider" title="All sections below are scoped to the device selected here. Identity, relay, pairing, settings, and sentry above apply globally.">
@@ -108,6 +110,7 @@
     </div>
 
     <DevicesSection bind:selectedMonitorPubkey />
+    <LiveViewSection {selectedMonitorPubkey} />
     <ContentViewerSection {selectedMonitorPubkey} />
     <SegmentStorageSection {selectedMonitorPubkey} />
   </div>

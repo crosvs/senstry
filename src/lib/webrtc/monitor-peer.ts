@@ -21,6 +21,9 @@ let globalGeneration = 0;
 const activeStreams = new Map<string, MediaStream>();
 // Channel configs — keyed by channelId.
 const activeChannels = new Map<string, ChannelConfig>();
+// Active source overrides per channel — pushed by SentrySection when RecordActions change state.
+// Takes priority over the channel's default videoSourceId/audioSourceId.
+const channelActiveSources = new Map<string, { videoSourceId?: string | null; audioSourceId?: string | null }>();
 let idleTimeoutMs = 120_000;
 
 // Pass all open source streams so any source can be served to viewers.
@@ -33,6 +36,16 @@ export function setMonitorStreams(streams: Map<string, MediaStream>): void {
 export function setMonitorChannels(channels: ChannelConfig[]): void {
 	activeChannels.clear();
 	for (const ch of channels) activeChannels.set(ch.id, ch);
+}
+
+// Push which sources are actively recording per channel.
+// Called by SentrySection when RecordAction states change.
+// Overrides the channel's default videoSourceId/audioSourceId for live RTC.
+export function setChannelActiveSources(
+	overrides: Map<string, { videoSourceId?: string | null; audioSourceId?: string | null }>
+): void {
+	channelActiveSources.clear();
+	for (const [k, v] of overrides) channelActiveSources.set(k, v);
 }
 
 // Compat shim — used by stopMonitor to clear, and for single-stream callers.
@@ -104,15 +117,19 @@ export async function handleOfferRequest(
 		// once per source, each overwriting remoteStream — last one wins, dropping prior tracks.
 		const composite = new MediaStream();
 		if (requestedChannel && activeChannels.has(requestedChannel)) {
-			// Channel-based compositing: video from videoSourceId, audio from audioSourceId.
-			// This is the correct way to get both camera video and mic audio simultaneously.
+			// Channel-based compositing.
+			// Active RecordAction sources (pushed by SentrySection) take priority over
+			// the channel's default videoSourceId/audioSourceId fallbacks.
 			const ch = activeChannels.get(requestedChannel)!;
-			if (ch.videoSourceId) {
-				const vStream = activeStreams.get(ch.videoSourceId);
+			const override = channelActiveSources.get(requestedChannel);
+			const videoSrcId = override?.videoSourceId !== undefined ? override.videoSourceId : ch.videoSourceId;
+			const audioSrcId = override?.audioSourceId !== undefined ? override.audioSourceId : ch.audioSourceId;
+			if (videoSrcId) {
+				const vStream = activeStreams.get(videoSrcId);
 				if (vStream) for (const t of vStream.getVideoTracks()) composite.addTrack(t);
 			}
-			if (ch.audioSourceId) {
-				const aStream = activeStreams.get(ch.audioSourceId);
+			if (audioSrcId) {
+				const aStream = activeStreams.get(audioSrcId);
 				if (aStream) for (const t of aStream.getAudioTracks()) composite.addTrack(t);
 			}
 		} else if (requestedSource && activeStreams.has(requestedSource)) {

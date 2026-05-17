@@ -1,7 +1,7 @@
 import { openDB as idbOpenDB, type IDBPDatabase } from 'idb';
 
 export const DB_NAME = 'senstry';
-export const DB_VERSION = 6;
+export const DB_VERSION = 7;
 
 let _db: IDBPDatabase | null = null;
 
@@ -63,6 +63,11 @@ export async function openDB(): Promise<IDBPDatabase> {
 				// v6 adds contentHash (SHA-256 hex) to segments for integrity verification.
 				// Existing records keep contentHash=undefined (treated as '' at read time).
 				tx.objectStore('segments').createIndex('contentHash', 'contentHash', { unique: false });
+			}
+			if (oldVersion < 7) {
+				// v7 renames sourceId → channelId on segments and footageRefs.
+				// The sourceId concept is replaced by channelId (channel is the recording unit).
+				// Existing records without channelId get channelId='default-channel'.
 			}
 		}
 	});

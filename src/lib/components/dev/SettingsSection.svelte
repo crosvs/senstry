@@ -1,38 +1,41 @@
 <script lang="ts">
   import { settings, saveSettings, loadSettings } from '$lib/store/settings';
   import {
-    sources, sensors, captures, nostrActions, channels, links, loadPipeline, savePipeline,
+    sources, sensors, captures, actions, channels, links, loadPipeline, savePipeline,
     storageCleanup, loadStorageCleanup, saveStorageCleanup,
-    newSource, newSensor, newCapture, newNostrAction, newChannel, newLink,
-    DEFAULT_SOURCES, DEFAULT_SENSORS, DEFAULT_CAPTURES, DEFAULT_NOSTR_ACTIONS, DEFAULT_CHANNELS, DEFAULT_LINKS,
+    newSource, newSensor, newCapture, newChannel,
+    newLink, newRecordAction, newClipAction, newSnapshotAction, newNotifyAction,
+    DEFAULT_SOURCES, DEFAULT_SENSORS, DEFAULT_CAPTURES, DEFAULT_CHANNELS, DEFAULT_ACTIONS, DEFAULT_LINKS,
     DEFAULT_STORAGE_CLEANUP,
-    autoNameSensor, autoNameCapture, autoNameNostrAction, autoNameChannel, autoNameLink,
-    type SourceConfig, type SensorConfig, type CaptureMethod, type NostrAction, type ChannelConfig, type Link,
-    type SensorState, type LinkActivationState, type StorageCleanupConfig, type ThinningRule,
+    autoNameSensor, autoNameCapture, autoNameAction, autoNameChannel, autoNameLink,
+    type SourceConfig, type SensorConfig, type CaptureMethod, type ChannelConfig,
+    type Action, type RecordAction, type ClipAction, type SnapshotAction, type NotifyAction,
+    type Link, type SensorState, type ActionState, type StorageCleanupConfig, type ThinningRule,
   } from '$lib/store/pipeline';
   import type { AlertSession } from './SentrySection.svelte';
+  import { pairedDevices } from '$lib/store/identity';
   import DevSection from './DevSection.svelte';
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
 
   interface Props {
     sensorStates?: Record<string, SensorState>;
-    linkStates?: Record<string, LinkActivationState>;
+    actionStates?: Record<string, ActionState>;
     activeAlerts?: AlertSession[];
   }
-  let { sensorStates = {}, linkStates = {}, activeAlerts = [] }: Props = $props();
+  let { sensorStates = {}, actionStates = {}, activeAlerts = [] }: Props = $props();
 
   let showRaw = $state(false);
   let saveFlash = $state(false);
   let saveError = $state('');
 
   // Pipeline local state
-  let localSources      = $state<SourceConfig[]>([]);
-  let localSensors      = $state<SensorConfig[]>([]);
-  let localCaptures     = $state<CaptureMethod[]>([]);
-  let localNostrActions = $state<NostrAction[]>([]);
-  let localChannels     = $state<ChannelConfig[]>([]);
-  let localLinks        = $state<Link[]>([]);
+  let localSources  = $state<SourceConfig[]>([]);
+  let localSensors  = $state<SensorConfig[]>([]);
+  let localCaptures = $state<CaptureMethod[]>([]);
+  let localChannels = $state<ChannelConfig[]>([]);
+  let localActions  = $state<Action[]>([]);
+  let localLinks    = $state<Link[]>([]);
 
   // General settings local state
   let localRelayUrl        = $state('');
@@ -87,15 +90,33 @@
   // Device picker
   let audioDevices = $state<MediaDeviceInfo[]>([]);
   let videoDevices = $state<MediaDeviceInfo[]>([]);
+  let loadingDevices = $state(false);
+
+  async function loadDevices(mediaType: 'audio' | 'video') {
+    loadingDevices = true;
+    try {
+      // Request permission so enumerateDevices returns real labels
+      const stream = await navigator.mediaDevices.getUserMedia(
+        mediaType === 'audio' ? { audio: true } : { video: true }
+      );
+      stream.getTracks().forEach(t => t.stop());
+    } catch { /* permission denied — still re-enumerate what we can */ }
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      audioDevices = devs.filter(d => d.kind === 'audioinput');
+      videoDevices = devs.filter(d => d.kind === 'videoinput');
+    } catch { /* ignore */ }
+    loadingDevices = false;
+  }
 
   onMount(async () => {
     await Promise.all([loadPipeline(), loadSettings(), loadStorageCleanup()]);
-    localSources      = get(sources).map(s => ({ ...s }));
-    localSensors      = get(sensors).map(s => ({ ...s }));
-    localCaptures     = get(captures).map(c => ({ ...c }));
-    localNostrActions = get(nostrActions).map(n => ({ ...n }));
-    localChannels     = get(channels).map(c => ({ ...c }));
-    localLinks        = get(links).map(l => ({ ...l }));
+    localSources  = get(sources).map(s => ({ ...s }));
+    localSensors  = get(sensors).map(s => ({ ...s }));
+    localCaptures = get(captures).map(c => ({ ...c }));
+    localChannels = get(channels).map(c => ({ ...c }));
+    localActions  = get(actions).map(a => ({ ...a }));
+    localLinks    = get(links).map(l => ({ ...l }));
     const s = get(settings);
     localRelayUrl        = s.relayUrl;
     localSelfLabel       = s.selfLabel;
@@ -114,27 +135,21 @@
     saveError = '';
     try {
       await savePipeline({
-        sources:      localSources.map(s => ({ ...s })),
-        // activeSlots is a Proxy array in $state — must spread to plain array for IDB structured-clone
-        sensors:      localSensors.map(s => ({
-          ...s,
-          ...(s.activeSlots !== undefined && { activeSlots: [...s.activeSlots] }),
-        })),
-        captures:     localCaptures.map(c => ({ ...c })),
-        nostrActions: localNostrActions.map(n => ({ ...n })),
-        channels:     localChannels.map(c => ({ ...c })),
-        links:        localLinks.map(l => ({ ...l })),
+        sources:  $state.snapshot(localSources),
+        sensors:  $state.snapshot(localSensors),
+        captures: $state.snapshot(localCaptures),
+        channels: $state.snapshot(localChannels),
+        actions:  $state.snapshot(localActions),
+        links:    $state.snapshot(localLinks),
       });
       await saveSettings({
         ...get(settings),
-        relayUrl:        localRelayUrl,
-        selfLabel:       localSelfLabel,
-        pauseNostr:      localPauseNostr,
-        nostrRateLimit:  localNostrRateLimit,
+        relayUrl:         localRelayUrl,
+        selfLabel:        localSelfLabel,
+        pauseNostr:       localPauseNostr,
+        nostrRateLimit:   localNostrRateLimit,
         rtcIdleTimeoutMs: localRtcIdleTimeoutS * 1000,
       });
-      // Spread nested array items into plain objects so IDB structured-clone
-      // doesn't trip on Svelte 5 Proxy wrappers around the thinningRules array.
       await saveStorageCleanup({
         ...localStorageCleanup,
         thinningRules: localStorageCleanup.thinningRules.map(r => ({ ...r })),
@@ -148,12 +163,12 @@
 
   async function resetDefault() {
     if (!confirm('Reset pipeline and general settings to defaults?')) return;
-    localSources      = DEFAULT_SOURCES.map(s => ({ ...s }));
-    localSensors      = DEFAULT_SENSORS.map(s => ({ ...s }));
-    localCaptures     = DEFAULT_CAPTURES.map(c => ({ ...c }));
-    localNostrActions = DEFAULT_NOSTR_ACTIONS.map(n => ({ ...n }));
-    localChannels     = DEFAULT_CHANNELS.map(c => ({ ...c }));
-    localLinks        = DEFAULT_LINKS.map(l => ({ ...l }));
+    localSources  = DEFAULT_SOURCES.map(s => ({ ...s }));
+    localSensors  = DEFAULT_SENSORS.map(s => ({ ...s }));
+    localCaptures = DEFAULT_CAPTURES.map(c => ({ ...c }));
+    localChannels = DEFAULT_CHANNELS.map(c => ({ ...c }));
+    localActions  = DEFAULT_ACTIONS.map(a => ({ ...a }));
+    localLinks    = DEFAULT_LINKS.map(l => ({ ...l }));
     const { DEFAULT_RELAY } = await import('$lib/store/settings');
     localRelayUrl        = DEFAULT_RELAY;
     localPauseNostr      = false;
@@ -166,23 +181,18 @@
     await save();
   }
 
-  // Changing capture type rebuilds the object with type-appropriate defaults
-  function changeCaptureType(id: string, type: CaptureMethod['type']) {
-    localCaptures = localCaptures.map(c => {
-      if (c.id !== id || c.type === type) return c;
-      // Pick a default source compatible with the new type
-      const compatSources = compatibleSources(type);
-      const sourceId = compatSources.find(s => s.id === c.sourceId)
-        ? c.sourceId
-        : (compatSources[0]?.id ?? c.sourceId);
-      const base = { id: c.id, name: c.name, sourceId };
-      if (type === 'video')
-        return { ...base, type, videoWidth: 0, videoHeight: 0, videoBitsPerSec: 0, audioBitsPerSec: 64_000, videoCodec: '' } as CaptureMethod;
-      if (type === 'audio')
-        return { ...base, type, audioBitsPerSec: 64_000, mimeType: '' } as CaptureMethod;
-      return { ...base, type, imageWidth: 640, imageHeight: 0, imageQuality: 0.85, imageFormat: 'image/jpeg' } as CaptureMethod;
-    });
-  }
+  const TYPE_COLORS: Record<string, string> = {
+    microphone: '#2563eb', camera: '#7c3aed', screen: '#0e7490',
+    audio: '#2563eb', schedule: '#0891b2', timewindow: '#0891b2', daterange: '#0891b2', 'nostr-trigger': '#9333ea',
+    video: '#7c3aed', photo: '#059669',
+    record: '#d97706', clip: '#0f766e', snapshot: '#059669', notify: '#9333ea',
+  };
+  const TYPE_LABELS: Record<string, string> = {
+    microphone: 'MIC', camera: 'CAM', screen: 'SCRN',
+    audio: 'AUDIO', schedule: 'TIMER', timewindow: 'TIME', daterange: 'DATE', 'nostr-trigger': 'NOSTR',
+    video: 'VIDEO', photo: 'PHOTO',
+    record: 'RECORD', clip: 'CLIP', snapshot: 'SNAP', notify: 'NOTIFY',
+  };
 
   // Live state polling
   let now = $state(Date.now());
@@ -212,20 +222,13 @@
     return { label: `SETTLING ${rem.toFixed(1)}s`, kind: 'settling' };
   }
 
-  function linkBadge(id: string): { label: string; kind: string } {
-    const s = linkStates[id];
-    if (!s || s.status === 'inactive') return { label: 'INACTIVE', kind: 'inactive' };
-    if (s.status === 'waiting') {
-      const el = (now - s.startedAt) / 1000;
-      const mn = s.minMs / 1000;
-      return { label: `WAITING ${el.toFixed(1)}/${mn.toFixed(1)}s`, kind: 'waiting' };
-    }
-    return { label: `ACTIVE ${((now - s.startedAt) / 1000).toFixed(1)}s`, kind: 'active' };
-  }
-
-  function linkCaptureType(captureId: string | null): CaptureMethod['type'] | null {
-    if (!captureId) return null;
-    return localCaptures.find(c => c.id === captureId)?.type ?? null;
+  function actionBadge(id: string): { label: string; kind: string } {
+    const s = actionStates[id];
+    if (!s || s.status === 'idle') return { label: 'IDLE', kind: 'idle' };
+    if (s.status === 'active')
+      return { label: `ACTIVE ${((now - s.startedAt) / 1000).toFixed(1)}s`, kind: 'active' };
+    const rem = Math.max(0, (s.endsAt - now) / 1000);
+    return { label: `COOLDOWN ${rem.toFixed(1)}s`, kind: 'cooldown' };
   }
 
   const PIN_UNITS = [
@@ -238,7 +241,6 @@
   ] as const;
   type PinUnit = typeof PIN_UNITS[number]['label'];
 
-  // Per-link user-selected unit (persists across number edits within a session)
   let pinUnits = $state<Record<string, PinUnit>>({});
 
   function bestPinUnit(sec: number): PinUnit {
@@ -248,16 +250,12 @@
     return 'minutes';
   }
 
-  function pinUnit(linkId: string, sec: number | null): PinUnit {
-    return pinUnits[linkId] ?? (sec != null && sec > 0 ? bestPinUnit(sec) : 'days');
+  function pinUnit(id: string, sec: number | null): PinUnit {
+    return pinUnits[id] ?? (sec != null && sec > 0 ? bestPinUnit(sec) : 'days');
   }
 
-  function pinUnitSec(linkId: string, sec: number | null): number {
-    return PIN_UNITS.find(u => u.label === pinUnit(linkId, sec))?.s ?? 86400;
-  }
-
-  function isNoop(link: Link): boolean {
-    return link.captureId === null && link.nostrActionId === null;
+  function pinUnitSec(id: string, sec: number | null): number {
+    return PIN_UNITS.find(u => u.label === pinUnit(id, sec))?.s ?? 86400;
   }
 
   function patchCapture(id: string, patch: Record<string, unknown>) {
@@ -274,21 +272,17 @@
     return `[${tag}] ${src.name}`;
   }
 
-  // Returns the effective sourceId for a capture — auto-corrects to first compatible source
-  // if the stored id no longer points to a compatible source (e.g. source type was changed).
   function captureSourceId(cap: CaptureMethod): string {
     const compat = compatibleSources(cap.type);
     return compat.find(s => s.id === cap.sourceId) ? cap.sourceId : (compat[0]?.id ?? cap.sourceId);
   }
 
-  // ── Auto-name wrappers ───────────────────────────────────────────────────────
-  // Pass local pipeline state to the shared auto-name functions from pipeline.ts.
   const _an = {
-    sensor:      (s: SensorConfig)   => autoNameSensor(s, localSources),
-    capture:     (c: CaptureMethod)  => autoNameCapture(c, localSources),
-    nostrAction: (a: NostrAction)    => autoNameNostrAction(a),
-    channel:     (c: ChannelConfig)  => autoNameChannel(c, localSources),
-    link:        (l: Link)           => autoNameLink(l, localSensors, localCaptures, localNostrActions, localSources, localChannels),
+    sensor:  (s: SensorConfig)  => autoNameSensor(s, localSources),
+    capture: (c: CaptureMethod) => autoNameCapture(c, localSources),
+    action:  (a: Action)        => autoNameAction(a, localCaptures, localChannels, localSources),
+    channel: (c: ChannelConfig) => autoNameChannel(c, localSources),
+    link:    (l: Link)          => autoNameLink(l, localSensors, localActions, localSources),
   };
 
   // ── Availability grid (time-window sensor) ─────────────────────────────────
@@ -306,7 +300,6 @@
     sen.activeSlots = on
       ? [...current, slot].sort((a, b) => a - b)
       : current.filter(s => s !== slot);
-    // Touch the array to ensure Svelte 5 fine-grained reactivity picks up the change
     localSensors = localSensors.map(s => s.id === sen.id ? { ...sen, activeSlots: [...(sen.activeSlots ?? [])] } : s);
   }
 
@@ -332,33 +325,6 @@
     sen.activeSlots = [];
     localSensors = localSensors.map(s => s.id === sen.id ? { ...sen, activeSlots: [] } : s);
   }
-
-  function changeSensorType(id: string, type: SensorConfig['type']) {
-    localSensors = localSensors.map(s => {
-      if (s.id !== id || s.type === type) return s;
-      if (type === 'schedule') {
-        return { id: s.id, name: s.name, type: 'schedule', sourceId: 'none',
-          enabled: s.enabled, thresholdDb: 0, minDurationMs: 0, settlingMs: 1000, intervalMs: 60_000 } as SensorConfig;
-      }
-      if (type === 'timewindow') {
-        return { id: s.id, name: s.name, type: 'timewindow', sourceId: 'none',
-          enabled: s.enabled, thresholdDb: 0, minDurationMs: 0, settlingMs: 0,
-          activeSlots: [] } as SensorConfig;
-      }
-      if (type === 'daterange') {
-        const now = new Date();
-        const pad = (n: number) => String(n).padStart(2, '0');
-        const toIso = (d: Date) =>
-          `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-        const end = new Date(now.getTime() + 24 * 3600_000);
-        return { id: s.id, name: s.name, type: 'daterange', sourceId: 'none',
-          enabled: s.enabled, thresholdDb: 0, minDurationMs: 0, settlingMs: 0,
-          startIso: toIso(now), endIso: toIso(end) } as SensorConfig;
-      }
-      return { id: s.id, name: s.name, type: 'audio', sourceId: localSources[0]?.id ?? 'default-mic',
-        enabled: s.enabled, thresholdDb: -45, releaseThresholdDb: -50, minDurationMs: 1500, settlingMs: 500 } as SensorConfig;
-    });
-  }
 </script>
 
 <DevSection title="Settings">
@@ -366,7 +332,7 @@
     {#if Object.values(sensorStates).some(s => s.status === 'active')}
       ACTIVE · {Object.values(sensorStates).filter(s => s.status === 'active').length} sensor{Object.values(sensorStates).filter(s => s.status === 'active').length === 1 ? '' : 's'}
     {:else if activeAlerts.length > 0}
-      ALERT · {activeAlerts.length} active
+      CLIP · {activeAlerts.length} active
     {:else}
       {localSensors.length} sensor{localSensors.length === 1 ? '' : 's'} · {localLinks.length} link{localLinks.length === 1 ? '' : 's'}
     {/if}
@@ -382,33 +348,28 @@
   {/if}
 
   {#if showRaw}
-    <pre class="raw">{JSON.stringify({ settings: $settings, sources: localSources, sensors: localSensors, captures: localCaptures, nostrActions: localNostrActions, channels: localChannels, links: localLinks, storageCleanup: localStorageCleanup }, null, 2)}</pre>
+    <pre class="raw">{JSON.stringify({ settings: $settings, sources: localSources, sensors: localSensors, captures: localCaptures, actions: localActions, channels: localChannels, links: localLinks, storageCleanup: localStorageCleanup }, null, 2)}</pre>
   {/if}
 
   <!-- ── Sources ──────────────────────────────────────────────────────────── -->
   <div class="subsec-header">
     <span class="subsec-title">Sources</span>
-    <button class="add-btn" onclick={() => localSources = [...localSources, newSource()]}>+ Add</button>
+    <div class="add-btn-group">
+      <button class="add-btn" onclick={() => localSources = [...localSources, newSource('microphone')]}>+ Microphone</button>
+      <button class="add-btn" onclick={() => localSources = [...localSources, newSource('camera')]}>+ Camera</button>
+      <button class="add-btn" onclick={() => localSources = [...localSources, newSource('screen')]}>+ Screen</button>
+    </div>
   </div>
   {#each localSources as src (src.id)}
     <div class="pipeline-card">
       <div class="card-header">
-        <span class="type-badge {src.type === 'camera' ? 'cam' : src.type === 'screen' ? 'screen' : 'mic'}">{src.type === 'camera' ? 'CAM' : src.type === 'screen' ? 'SCRN' : 'MIC'}</span>
+        <span class="type-badge" style="background:{TYPE_COLORS[src.type] ?? '#64748b'}">{TYPE_LABELS[src.type] ?? src.type}</span>
         <input class="name-input" bind:value={src.name} placeholder="Source name" />
         <button class="rm-btn" onclick={() => localSources = localSources.filter(s => s.id !== src.id)}>✕</button>
       </div>
       <div class="card-body">
-        <label class="field-row">
-          <span class="field-lbl">Type</span>
-          <select class="field-select" value={src.type}
-            onchange={(e) => { src.type = (e.target as HTMLSelectElement).value as SourceConfig['type']; }}>
-            <option value="microphone">Microphone</option>
-            <option value="camera">Camera</option>
-            <option value="screen">Screen Share</option>
-          </select>
-        </label>
         {#if src.type !== 'screen'}
-          <label class="field-row">
+          <div class="field-row">
             <span class="field-lbl">Device</span>
             <select class="field-select" value={src.deviceId}
               onchange={(e) => { src.deviceId = (e.target as HTMLSelectElement).value; }}>
@@ -417,7 +378,13 @@
                 <option value={dev.deviceId}>{dev.label || dev.deviceId.slice(0, 14) + '…'}</option>
               {/each}
             </select>
-          </label>
+            <button
+              class="load-devs-btn"
+              onclick={() => loadDevices(src.type === 'camera' ? 'video' : 'audio')}
+              disabled={loadingDevices}
+              title="Enumerate available devices (grants permission if needed)"
+            >{loadingDevices ? '…' : '⟳'}</button>
+          </div>
         {/if}
         {#if src.type === 'camera'}
           <label class="field-row">
@@ -458,7 +425,7 @@
               value={src.frameRate ?? ''}
               oninput={(e) => { src.frameRate = +(e.target as HTMLInputElement).value || undefined; }} />
           </label>
-          <div class="field-hint">Browser picks screen/window/tab at capture time. Audio captured if browser supports it.</div>
+          <div class="field-hint full-row">Browser picks screen/window/tab at capture time. Audio captured if browser supports it.</div>
         {/if}
       </div>
     </div>
@@ -469,15 +436,19 @@
   <!-- ── Sensors ──────────────────────────────────────────────────────────── -->
   <div class="subsec-header">
     <span class="subsec-title">Sensors</span>
-    <button class="add-btn" onclick={() => localSensors = [...localSensors, newSensor(localSources[0]?.id ?? 'default-mic')]}>+ Add</button>
+    <div class="add-btn-group">
+      <button class="add-btn" onclick={() => localSensors = [...localSensors, newSensor(localSources[0]?.id ?? 'default-mic', 'audio')]}>+ Audio</button>
+      <button class="add-btn" onclick={() => localSensors = [...localSensors, newSensor('none', 'schedule')]}>+ Timer</button>
+      <button class="add-btn" onclick={() => localSensors = [...localSensors, newSensor('none', 'timewindow')]}>+ Time Window</button>
+      <button class="add-btn" onclick={() => localSensors = [...localSensors, newSensor('none', 'daterange')]}>+ Date Range</button>
+      <button class="add-btn" onclick={() => localSensors = [...localSensors, newSensor('none', 'nostr-trigger')]}>+ Nostr</button>
+    </div>
   </div>
   {#each localSensors as sen (sen.id)}
     {@const sb = sensorBadge(sen.id)}
-    {@const typeBadgeClass = sen.type === 'audio' ? 'audio' : 'sched'}
-    {@const typeBadgeLabel = sen.type === 'audio' ? 'AUDIO' : sen.type === 'schedule' ? 'SCHED' : sen.type === 'timewindow' ? 'TIME' : 'DATE'}
     <div class="pipeline-card">
       <div class="card-header">
-        <span class="type-badge {typeBadgeClass}">{typeBadgeLabel}</span>
+        <span class="type-badge" style="background:{TYPE_COLORS[sen.type] ?? '#64748b'}">{TYPE_LABELS[sen.type] ?? sen.type}</span>
         <input class="name-input" bind:value={sen.name} placeholder={_an.sensor(sen)} />
         <span class="state-badge {sb.kind}">{sb.label}</span>
         <button class="toggle-pill" style="background:{sen.enabled ? 'var(--color-success)' : 'var(--color-border)'}"
@@ -487,17 +458,6 @@
         <button class="rm-btn" onclick={() => localSensors = localSensors.filter(s => s.id !== sen.id)}>✕</button>
       </div>
       <div class="card-body">
-        <label class="field-row">
-          <span class="field-lbl">Type</span>
-          <select class="field-select" value={sen.type}
-            onchange={(e) => changeSensorType(sen.id, (e.target as HTMLSelectElement).value as SensorConfig['type'])}>
-            <option value="audio">Audio</option>
-            <option value="schedule">Schedule (interval)</option>
-            <option value="timewindow">Time Window</option>
-            <option value="daterange">Date Range</option>
-          </select>
-        </label>
-
         {#if sen.type === 'audio'}
           <label class="field-row">
             <span class="field-lbl">Source</span>
@@ -546,7 +506,6 @@
           </label>
 
         {:else if sen.type === 'timewindow'}
-          <!-- Availability grid: drag to paint active hours. Hours = columns, days = rows. -->
           <div class="avail-wrap full-row">
             <div class="avail-header-row">
               <div class="avail-day-stub"></div>
@@ -580,7 +539,7 @@
               }}>Weekdays</button>
               <button class="link-btn" onclick={() => {
                 const nights = [0,1,2,3,4,5,6]; const s: number[] = [];
-                for (const d of nights) for (let h of [22,23,0,1,2,3,4,5]) {
+                for (const d of nights) for (const h of [22,23,0,1,2,3,4,5]) {
                   const effectiveD = h < 6 ? (d + 1) % 7 : d;
                   s.push(effectiveD * 24 + h);
                 }
@@ -603,6 +562,53 @@
               onchange={(e) => { sen.endIso = (e.target as HTMLInputElement).value; }} />
           </div>
           <div class="field-hint full-row">One-time activation between these datetimes. Becomes permanently inactive after the end.</div>
+
+        {:else if sen.type === 'nostr-trigger'}
+          <label class="field-row full-row">
+            <span class="field-lbl">Listen to</span>
+            <select class="field-select" value={sen.monitorPubkey ?? ''}
+              onchange={(e) => { sen.monitorPubkey = (e.target as HTMLSelectElement).value; }}>
+              <option value="">— select device —</option>
+              {#each $pairedDevices as dev}
+                <option value={dev.pubkey}>{dev.nickname || dev.pubkey.slice(0, 16) + '…'}</option>
+              {/each}
+            </select>
+          </label>
+          {#if sen.monitorPubkey && !$pairedDevices.find(d => d.pubkey === sen.monitorPubkey)}
+            <div class="field-hint full-row warn">Pubkey not in paired devices — enter manually below.</div>
+            <label class="field-row full-row">
+              <span class="field-lbl">Pubkey</span>
+              <input class="name-input flex1" type="text" placeholder="npub or hex pubkey"
+                value={sen.monitorPubkey}
+                oninput={(e) => { sen.monitorPubkey = (e.target as HTMLInputElement).value.trim(); }} />
+            </label>
+          {/if}
+          <label class="field-row full-row">
+            <span class="field-lbl">Channel filter</span>
+            <input class="name-input flex1" type="text" placeholder="Any channel"
+              value={sen.nostrChannelId ?? ''}
+              oninput={(e) => { sen.nostrChannelId = (e.target as HTMLInputElement).value.trim() || null; }} />
+          </label>
+          <label class="field-row full-row">
+            <span class="field-lbl">Detection types</span>
+            <input class="name-input flex1" type="text" placeholder="Any (comma-separated to filter)"
+              value={(sen.detectionTypes ?? []).join(', ')}
+              oninput={(e) => {
+                const v = (e.target as HTMLInputElement).value.trim();
+                sen.detectionTypes = v ? v.split(',').map(s => s.trim()).filter(Boolean) : [];
+              }} />
+          </label>
+          <label class="field-row slider-row">
+            <span class="field-lbl">Hold: {(sen.minDurationMs / 1000).toFixed(1)}s</span>
+            <input type="range" min="0" max="10000" step="100" value={sen.minDurationMs}
+              oninput={(e) => { sen.minDurationMs = +(e.target as HTMLInputElement).value; }} />
+          </label>
+          <label class="field-row slider-row">
+            <span class="field-lbl">Settle: {(sen.settlingMs / 1000).toFixed(1)}s</span>
+            <input type="range" min="0" max="30000" step="500" value={sen.settlingMs}
+              oninput={(e) => { sen.settlingMs = +(e.target as HTMLInputElement).value; }} />
+          </label>
+          <div class="field-hint full-row">Receives Nostr trigger events from the selected device. Hold waits before going active; settle keeps the sensor active after the remote goes idle, preventing flicker.</div>
         {/if}
       </div>
     </div>
@@ -613,25 +619,20 @@
   <!-- ── Capture Methods ──────────────────────────────────────────────────── -->
   <div class="subsec-header">
     <span class="subsec-title">Capture Methods</span>
-    <button class="add-btn" onclick={() => localCaptures = [...localCaptures, newCapture(localSources[0]?.id ?? 'default-mic')]}>+ Add</button>
+    <div class="add-btn-group">
+      <button class="add-btn" onclick={() => localCaptures = [...localCaptures, newCapture(localSources.find(s => s.type === 'microphone')?.id ?? 'default-mic', 'audio')]}>+ Audio</button>
+      <button class="add-btn" onclick={() => localCaptures = [...localCaptures, newCapture(localSources.find(s => s.type === 'camera')?.id ?? 'default-cam', 'video')]}>+ Video</button>
+      <button class="add-btn" onclick={() => localCaptures = [...localCaptures, newCapture(localSources.find(s => s.type === 'camera')?.id ?? 'default-cam', 'photo')]}>+ Photo</button>
+    </div>
   </div>
   {#each localCaptures as cap (cap.id)}
     <div class="pipeline-card">
       <div class="card-header">
-        <span class="type-badge {cap.type}">{cap.type.toUpperCase()}</span>
+        <span class="type-badge" style="background:{TYPE_COLORS[cap.type] ?? '#64748b'}">{TYPE_LABELS[cap.type] ?? cap.type}</span>
         <input class="name-input" bind:value={cap.name} placeholder={_an.capture(cap)} />
         <button class="rm-btn" onclick={() => localCaptures = localCaptures.filter(c => c.id !== cap.id)}>✕</button>
       </div>
       <div class="card-body">
-        <label class="field-row">
-          <span class="field-lbl">Type</span>
-          <select class="field-select" value={cap.type}
-            onchange={(e) => changeCaptureType(cap.id, (e.target as HTMLSelectElement).value as CaptureMethod['type'])}>
-            <option value="audio">Audio</option>
-            <option value="video">Video</option>
-            <option value="photo">Photo</option>
-          </select>
-        </label>
         <label class="field-row">
           <span class="field-lbl">Source</span>
           <select class="field-select" value={captureSourceId(cap)}
@@ -642,16 +643,6 @@
           </select>
         </label>
         {#if cap.type === 'video'}
-          <label class="field-row">
-            <span class="field-lbl">Audio source</span>
-            <select class="field-select" value={cap.audioSourceId ?? ''}
-              onchange={(e) => patchCapture(cap.id, { audioSourceId: (e.target as HTMLSelectElement).value })}>
-              <option value="">From video source</option>
-              {#each localSources.filter(s => s.type === 'microphone') as src}
-                <option value={src.id}>{sourceOptionLabel(src)}</option>
-              {/each}
-            </select>
-          </label>
           <label class="field-row">
             <span class="field-lbl">Codec</span>
             <select class="field-select" value={cap.videoCodec}
@@ -680,12 +671,6 @@
               value={cap.videoBitsPerSec ? Math.round(cap.videoBitsPerSec / 1000) : ''}
               oninput={(e) => patchCapture(cap.id, { videoBitsPerSec: (+(e.target as HTMLInputElement).value || 0) * 1000 })} />
           </label>
-          <label class="field-row">
-            <span class="field-lbl">Audio kbps</span>
-            <input class="num-input" type="number" min="0" step="8" placeholder="auto"
-              value={cap.audioBitsPerSec ? Math.round(cap.audioBitsPerSec / 1000) : ''}
-              oninput={(e) => patchCapture(cap.id, { audioBitsPerSec: (+(e.target as HTMLInputElement).value || 0) * 1000 })} />
-          </label>
         {:else if cap.type === 'audio'}
           <label class="field-row">
             <span class="field-lbl">Audio kbps</span>
@@ -707,10 +692,9 @@
           </label>
           <label class="field-row">
             <span class="field-lbl">Height (px)</span>
-            <input class="num-input" type="number" min="0" step="1" placeholder="auto"
+            <input class="num-input" type="number" min="0" step="1" placeholder="native"
               value={cap.imageHeight || ''}
               oninput={(e) => patchCapture(cap.id, { imageHeight: +(e.target as HTMLInputElement).value })} />
-            <span class="field-hint-inline">0 = proportional</span>
           </label>
           <label class="field-row">
             <span class="field-lbl">Quality</span>
@@ -733,49 +717,12 @@
     <div class="empty">No capture methods.</div>
   {/each}
 
-  <!-- ── Nostr Actions ────────────────────────────────────────────────────── -->
-  <div class="subsec-header">
-    <span class="subsec-title">Nostr Actions</span>
-    <button class="add-btn" onclick={() => localNostrActions = [...localNostrActions, newNostrAction()]}>+ Add</button>
-  </div>
-  {#each localNostrActions as na (na.id)}
-    <div class="pipeline-card">
-      <div class="card-header">
-        <span class="type-badge nostr">NOSTR</span>
-        <input class="name-input" bind:value={na.name} placeholder={_an.nostrAction(na)} />
-        <button class="rm-btn" onclick={() => localNostrActions = localNostrActions.filter(a => a.id !== na.id)}>✕</button>
-      </div>
-      <div class="card-body">
-        <label class="field-row slider-row">
-          <span class="field-lbl">Cooldown: {(na.cooldownMs / 1000).toFixed(0)}s</span>
-          <input type="range" min="0" max="300000" step="5000" value={na.cooldownMs}
-            oninput={(e) => { na.cooldownMs = +(e.target as HTMLInputElement).value; }} />
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Include data</span>
-          <button class="toggle-pill" style="background:{na.includeData ? 'var(--color-success)' : 'var(--color-border)'}"
-            onclick={() => { na.includeData = !na.includeData; }}>
-            <span class="pill-thumb" style="transform:translateX({na.includeData ? '14px' : '2px'})"></span>
-          </button>
-        </label>
-        <label class="field-row full-row">
-          <span class="field-lbl">Message</span>
-          <input class="name-input flex1" type="text" placeholder="Optional message prefix…"
-            value={na.messageTemplate ?? ''}
-            oninput={(e) => { na.messageTemplate = (e.target as HTMLInputElement).value || undefined; }} />
-        </label>
-      </div>
-    </div>
-  {:else}
-    <div class="empty">No Nostr actions.</div>
-  {/each}
-
   <!-- ── Channels ──────────────────────────────────────────────────────────── -->
   <div class="subsec-header">
     <span class="subsec-title">Channels</span>
     <button class="add-btn" onclick={() => localChannels = [...localChannels, newChannel()]}>+ Add</button>
   </div>
-  <div class="field-hint full-row" style="margin-bottom:4px">A channel bundles a video and audio source for Live RTC and footage tagging. Viewers select a channel to receive.</div>
+  <div class="field-hint full-row" style="margin-bottom:4px">A channel groups sources for Live RTC and footage tagging. The default sources below are used as a live fallback when no recording link is active for the channel.</div>
   {#each localChannels as ch (ch.id)}
     <div class="pipeline-card">
       <div class="card-header">
@@ -785,7 +732,7 @@
       </div>
       <div class="card-body">
         <label class="field-row">
-          <span class="field-lbl">Video source</span>
+          <span class="field-lbl">Default video</span>
           <select class="field-select" value={ch.videoSourceId ?? ''}
             onchange={(e) => { ch.videoSourceId = (e.target as HTMLSelectElement).value || null; }}>
             <option value="">None</option>
@@ -795,7 +742,7 @@
           </select>
         </label>
         <label class="field-row">
-          <span class="field-lbl">Audio source</span>
+          <span class="field-lbl">Default audio</span>
           <select class="field-select" value={ch.audioSourceId ?? ''}
             onchange={(e) => { ch.audioSourceId = (e.target as HTMLSelectElement).value || null; }}>
             <option value="">None</option>
@@ -810,19 +757,304 @@
     <div class="empty">No channels. Add one to enable channel-based Live RTC.</div>
   {/each}
 
+  <!-- ── Actions ──────────────────────────────────────────────────────────── -->
+  <div class="subsec-header">
+    <span class="subsec-title">Actions</span>
+    <div class="add-btn-group">
+      <button class="add-btn" onclick={() => localActions = [...localActions, newRecordAction(localChannels[0]?.id ?? 'default-channel')]}>+ Record</button>
+      <button class="add-btn" onclick={() => localActions = [...localActions, newClipAction(localChannels[0]?.id ?? 'default-channel')]}>+ Clip</button>
+      <button class="add-btn" onclick={() => localActions = [...localActions, newSnapshotAction(localChannels[0]?.id ?? 'default-channel')]}>+ Snapshot</button>
+      <button class="add-btn" onclick={() => localActions = [...localActions, newNotifyAction()]}>+ Notify</button>
+    </div>
+  </div>
+  {#each localActions as act (act.id)}
+    {@const ab = actionBadge(act.id)}
+    <div class="pipeline-card">
+      <div class="card-header">
+        <span class="type-badge" style="background:{TYPE_COLORS[act.type] ?? '#64748b'}">{TYPE_LABELS[act.type] ?? act.type}</span>
+        <input class="name-input" bind:value={act.name} placeholder={_an.action(act)} />
+        {#if act.type !== 'notify'}
+          <span class="state-badge {ab.kind}">{ab.label}</span>
+        {/if}
+        <button class="rm-btn" onclick={() => localActions = localActions.filter(a => a.id !== act.id)}>✕</button>
+      </div>
+      <div class="card-body">
+
+        {#if act.type === 'record'}
+          <!-- ── RecordAction ── -->
+          <label class="field-row">
+            <span class="field-lbl">Channel</span>
+            <select class="field-select" value={act.channelId}
+              onchange={(e) => { if (act.type === 'record') act.channelId = (e.target as HTMLSelectElement).value; }}>
+              {#each localChannels as ch}
+                <option value={ch.id}>{ch.name || _an.channel(ch)}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="field-row field-row--captures full-row">
+            <span class="field-lbl">Captures</span>
+            <div class="captures-checks">
+              {#each localCaptures.filter(c => c.type !== 'photo') as cap}
+                {@const checked = act.captureIds.includes(cap.id)}
+                <label class="check-label">
+                  <input type="checkbox" {checked}
+                    onchange={() => {
+                      if (act.type === 'record') act.captureIds = checked
+                        ? act.captureIds.filter(id => id !== cap.id)
+                        : [...act.captureIds, cap.id];
+                    }} />
+                  <span class="check-type-badge" style="background:{TYPE_COLORS[cap.type]}">{TYPE_LABELS[cap.type]}</span>
+                  {cap.name || _an.capture(cap)}
+                </label>
+              {/each}
+              {#if localCaptures.filter(c => c.type !== 'photo').length === 0}
+                <span class="muted-hint">No audio/video captures defined</span>
+              {/if}
+            </div>
+          </div>
+          <label class="field-row">
+            <span class="field-lbl">Priority</span>
+            <input class="num-input" type="number" min="1" step="1" value={act.priority}
+              oninput={(e) => { if (act.type === 'record') act.priority = +(e.target as HTMLInputElement).value; }} />
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Post-roll</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="5" value={act.postRollSec}
+                oninput={(e) => { if (act.type === 'record') act.postRollSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Rolling buffer</span>
+            {#if act.rollingBufferSec === null}
+              <span class="inf-text">∞ infinite</span>
+              <button class="link-btn" onclick={() => { if (act.type === 'record') act.rollingBufferSec = Math.max(act.postRollSec || 30, 30); }}>Limit</button>
+            {:else}
+              <div class="num-with-unit">
+                <input class="num-input" type="number" min="0" step="5" value={act.rollingBufferSec}
+                  oninput={(e) => { if (act.type === 'record') act.rollingBufferSec = +(e.target as HTMLInputElement).value; }} />
+                <span class="unit">s</span>
+              </div>
+              <button class="link-btn" onclick={() => { if (act.type === 'record') act.rollingBufferSec = null; }}>∞</button>
+            {/if}
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Retrigger</span>
+            <select class="field-select" value={act.onRetrigger}
+              onchange={(e) => { if (act.type === 'record') act.onRetrigger = (e.target as HTMLSelectElement).value as 'extend' | 'ignore' | 'restart'; }}>
+              <option value="extend">Extend window</option>
+              <option value="ignore">Ignore</option>
+              <option value="restart">Restart</option>
+            </select>
+          </label>
+
+        {:else if act.type === 'clip'}
+          <!-- ── ClipAction ── -->
+          <label class="field-row">
+            <span class="field-lbl">Channel</span>
+            <select class="field-select" value={act.channelId}
+              onchange={(e) => { if (act.type === 'clip') act.channelId = (e.target as HTMLSelectElement).value; }}>
+              {#each localChannels as ch}
+                <option value={ch.id}>{ch.name || _an.channel(ch)}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="field-row field-row--captures">
+            <span class="field-lbl">Types</span>
+            <div class="captures-checks">
+              {#each ['video', 'audio', 'photo'] as captureType}
+                {@const checked = act.captureTypes.includes(captureType as 'video' | 'audio' | 'photo')}
+                <label class="check-label">
+                  <input type="checkbox" {checked}
+                    onchange={() => {
+                      if (act.type === 'clip') act.captureTypes = checked
+                        ? act.captureTypes.filter(t => t !== captureType)
+                        : [...act.captureTypes, captureType as 'video' | 'audio' | 'photo'];
+                    }} />
+                  <span class="check-type-badge" style="background:{TYPE_COLORS[captureType] ?? '#64748b'}">{TYPE_LABELS[captureType] ?? captureType}</span>
+                </label>
+              {/each}
+            </div>
+          </div>
+          <label class="field-row">
+            <span class="field-lbl">Pre-roll</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="5" value={act.preRollSec}
+                oninput={(e) => { if (act.type === 'clip') act.preRollSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Post-roll</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="5" value={act.postRollSec}
+                oninput={(e) => { if (act.type === 'clip') act.postRollSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+          <label class="field-row pin-row full-row">
+            <span class="field-lbl">Keep for</span>
+            <input class="num-input" type="number" min="1" step="1"
+              value={act.pinLifetimeSec === 0 ? '' : Math.round(act.pinLifetimeSec / pinUnitSec(act.id, act.pinLifetimeSec))}
+              placeholder={act.pinLifetimeSec === 0 ? '∞' : ''}
+              disabled={act.pinLifetimeSec === 0}
+              oninput={(e) => {
+                const v = +(e.target as HTMLInputElement).value;
+                if (act.type === 'clip') act.pinLifetimeSec = v > 0 ? v * pinUnitSec(act.id, act.pinLifetimeSec) : 0;
+              }} />
+            <select class="field-select pin-unit-select"
+              value={pinUnit(act.id, act.pinLifetimeSec)}
+              disabled={act.pinLifetimeSec === 0}
+              onchange={(e) => {
+                const newUnit = (e.target as HTMLSelectElement).value as PinUnit;
+                pinUnits = { ...pinUnits, [act.id]: newUnit };
+                const uSec = PIN_UNITS.find(u => u.label === newUnit)!.s;
+                if (act.type === 'clip' && act.pinLifetimeSec && act.pinLifetimeSec > 0) {
+                  const count = Math.max(1, Math.round(act.pinLifetimeSec / uSec));
+                  act.pinLifetimeSec = count * uSec;
+                }
+              }}>
+              {#each PIN_UNITS as u}
+                <option value={u.label}>{u.label}</option>
+              {/each}
+            </select>
+            <label class="forever-label">
+              <input type="checkbox" checked={act.pinLifetimeSec === 0}
+                onchange={(e) => { if (act.type === 'clip') act.pinLifetimeSec = (e.target as HTMLInputElement).checked ? 0 : 7 * 86400; }} />
+              ∞
+            </label>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Retrigger</span>
+            <select class="field-select" value={act.onRetrigger}
+              onchange={(e) => { if (act.type === 'clip') act.onRetrigger = (e.target as HTMLSelectElement).value as 'extend' | 'ignore' | 'restart'; }}>
+              <option value="extend">Extend window</option>
+              <option value="ignore">Ignore</option>
+              <option value="restart">Restart</option>
+            </select>
+          </label>
+
+        {:else if act.type === 'snapshot'}
+          <!-- ── SnapshotAction ── -->
+          <label class="field-row">
+            <span class="field-lbl">Channel</span>
+            <select class="field-select" value={act.channelId}
+              onchange={(e) => { if (act.type === 'snapshot') act.channelId = (e.target as HTMLSelectElement).value; }}>
+              {#each localChannels as ch}
+                <option value={ch.id}>{ch.name || _an.channel(ch)}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Capture</span>
+            <select class="field-select" value={act.captureId ?? ''}
+              onchange={(e) => { if (act.type === 'snapshot') act.captureId = (e.target as HTMLSelectElement).value; }}>
+              <option value="">None</option>
+              {#each localCaptures.filter(c => c.type === 'photo') as cap}
+                <option value={cap.id}>{cap.name || _an.capture(cap)}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Count</span>
+            <input class="num-input" type="number" min="0" step="1" placeholder="0=∞" value={act.snapshotCount}
+              oninput={(e) => { if (act.type === 'snapshot') act.snapshotCount = +(e.target as HTMLInputElement).value; }} />
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Interval</span>
+            <div class="num-with-unit">
+              <input class="num-input" type="number" min="0" step="0.5" value={act.intervalSec}
+                oninput={(e) => { if (act.type === 'snapshot') act.intervalSec = +(e.target as HTMLInputElement).value; }} />
+              <span class="unit">s</span>
+            </div>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Pin forever</span>
+            <button class="toggle-pill" style="background:{act.pinLifetimeSec !== null ? 'var(--color-success)' : 'var(--color-border)'}"
+              onclick={() => { if (act.type === 'snapshot') act.pinLifetimeSec = act.pinLifetimeSec !== null ? null : 0; }}>
+              <span class="pill-thumb" style="transform:translateX({act.pinLifetimeSec !== null ? '14px' : '2px'})"></span>
+            </button>
+          </label>
+
+        {:else if act.type === 'notify'}
+          <!-- ── NotifyAction ── -->
+          <label class="field-row full-row">
+            <span class="field-lbl">Send to</span>
+            <select class="field-select" value={act.viewerPubkey ?? ''}
+              onchange={(e) => { if (act.type === 'notify') act.viewerPubkey = (e.target as HTMLSelectElement).value || null; }}>
+              <option value="">All paired devices</option>
+              {#each $pairedDevices as dev}
+                <option value={dev.pubkey}>{dev.nickname || dev.pubkey.slice(0, 16) + '…'}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="field-row slider-row">
+            <span class="field-lbl">Cooldown: {(act.cooldownMs / 1000).toFixed(0)}s</span>
+            <input type="range" min="0" max="300000" step="5000" value={act.cooldownMs}
+              oninput={(e) => { if (act.type === 'notify') act.cooldownMs = +(e.target as HTMLInputElement).value; }} />
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Retrigger</span>
+            <select class="field-select" value={act.onRetrigger}
+              onchange={(e) => { if (act.type === 'notify') act.onRetrigger = (e.target as HTMLSelectElement).value as 'ignore' | 'extend' | 'restart'; }}>
+              <option value="ignore">Ignore (drop during cooldown)</option>
+              <option value="extend">Extend (push cooldown window)</option>
+              <option value="restart">Restart (send again, reset cooldown)</option>
+            </select>
+          </label>
+          <label class="field-row">
+            <span class="field-lbl">Include data</span>
+            <button class="toggle-pill" style="background:{act.includeData ? 'var(--color-success)' : 'var(--color-border)'}"
+              onclick={() => { if (act.type === 'notify') act.includeData = !act.includeData; }}>
+              <span class="pill-thumb" style="transform:translateX({act.includeData ? '14px' : '2px'})"></span>
+            </button>
+          </label>
+          <label class="field-row full-row">
+            <span class="field-lbl">Message</span>
+            <input class="name-input flex1" type="text" placeholder="Optional message prefix…"
+              value={act.messageTemplate ?? ''}
+              oninput={(e) => { if (act.type === 'notify') act.messageTemplate = (e.target as HTMLInputElement).value || undefined; }} />
+          </label>
+          <div class="field-row full-row">
+            <span class="field-lbl">Publish on</span>
+            <div class="checkbox-group">
+              {#each ['sensing', 'active', 'idle'] as st}
+                <label class="check-label">
+                  <input type="checkbox"
+                    checked={act.publishStates?.includes(st as 'sensing' | 'active' | 'idle')}
+                    onchange={(e) => {
+                      const checked = (e.target as HTMLInputElement).checked;
+                      if (act.type === 'notify') {
+                        const cur = act.publishStates ?? [];
+                        act.publishStates = checked
+                          ? [...cur, st as 'sensing' | 'active' | 'idle']
+                          : cur.filter(s => s !== st);
+                      }
+                    }} />
+                  {st}
+                </label>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+      </div>
+    </div>
+  {:else}
+    <div class="empty">No actions.</div>
+  {/each}
+
   <!-- ── Links ────────────────────────────────────────────────────────────── -->
   <div class="subsec-header">
     <span class="subsec-title">Links</span>
-    <button class="add-btn" onclick={() => localLinks = [...localLinks, newLink(localSensors[0]?.id ?? 'default-audio')]}>+ Add</button>
+    <button class="add-btn" onclick={() => localLinks = [...localLinks, newLink()]}>+ Link</button>
   </div>
   {#each localLinks as lnk (lnk.id)}
-    {@const lb = linkBadge(lnk.id)}
-    {@const capType = linkCaptureType(lnk.captureId)}
-    <div class="pipeline-card" class:noop-card={isNoop(lnk)}>
+    <div class="pipeline-card">
       <div class="card-header">
-        <span class="type-badge link">LINK</span>
+        <span class="type-badge link-type">LNK</span>
         <input class="name-input" bind:value={lnk.name} placeholder={_an.link(lnk)} />
-        <span class="state-badge {lb.kind}">{lb.label}</span>
         <button class="toggle-pill" style="background:{lnk.enabled ? 'var(--color-success)' : 'var(--color-border)'}"
           onclick={() => { lnk.enabled = !lnk.enabled; }}>
           <span class="pill-thumb" style="transform:translateX({lnk.enabled ? '14px' : '2px'})"></span>
@@ -830,15 +1062,37 @@
         <button class="rm-btn" onclick={() => localLinks = localLinks.filter(l => l.id !== lnk.id)}>✕</button>
       </div>
       <div class="card-body">
-        <label class="field-row">
-          <span class="field-lbl">Sensor</span>
-          <select class="field-select" value={lnk.sensorId}
-            onchange={(e) => { lnk.sensorId = (e.target as HTMLSelectElement).value; }}>
+        <!-- Multi-sensor checkboxes -->
+        <div class="field-row field-row--captures full-row">
+          <span class="field-lbl">Sensors</span>
+          <div class="captures-checks">
             {#each localSensors as sen}
-              <option value={sen.id}>{sen.name || _an.sensor(sen)}</option>
+              {@const checked = lnk.sensorIds.includes(sen.id)}
+              <label class="check-label">
+                <input type="checkbox" {checked}
+                  onchange={() => {
+                    lnk.sensorIds = checked
+                      ? lnk.sensorIds.filter(id => id !== sen.id)
+                      : [...lnk.sensorIds, sen.id];
+                  }} />
+                {sen.name || _an.sensor(sen)}
+              </label>
             {/each}
+            {#if localSensors.length === 0}
+              <span class="muted-hint">No sensors defined</span>
+            {/if}
+          </div>
+        </div>
+        <!-- Condition -->
+        <label class="field-row">
+          <span class="field-lbl">Condition</span>
+          <select class="field-select" value={lnk.condition}
+            onchange={(e) => { lnk.condition = (e.target as HTMLSelectElement).value as 'any' | 'all'; }}>
+            <option value="any">Any sensor</option>
+            <option value="all">All sensors</option>
           </select>
         </label>
+        <!-- On state -->
         <label class="field-row">
           <span class="field-lbl">On state</span>
           <select class="field-select" value={lnk.onState}
@@ -847,145 +1101,30 @@
             <option value="active">Active</option>
           </select>
         </label>
-        <label class="field-row">
-          <span class="field-lbl">Min state ms</span>
-          <input class="num-input" type="number" min="0" step="100" value={lnk.minStateDurationMs}
-            oninput={(e) => { lnk.minStateDurationMs = +(e.target as HTMLInputElement).value; }} />
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Capture</span>
-          <select class="field-select" value={lnk.captureId ?? ''}
-            onchange={(e) => { lnk.captureId = (e.target as HTMLSelectElement).value || null; }}>
-            <option value="">None</option>
-            {#each localCaptures as cap}
-              <option value={cap.id}>{cap.name || _an.capture(cap)} ({cap.type})</option>
+        <!-- Actions multi-select -->
+        <div class="field-row field-row--captures full-row">
+          <span class="field-lbl">Actions</span>
+          <div class="captures-checks">
+            {#each localActions as act}
+              {@const checked = lnk.actionIds.includes(act.id)}
+              <label class="check-label">
+                <input type="checkbox" {checked}
+                  onchange={() => {
+                    lnk.actionIds = checked
+                      ? lnk.actionIds.filter(id => id !== act.id)
+                      : [...lnk.actionIds, act.id];
+                  }} />
+                <span class="check-type-badge" style="background:{TYPE_COLORS[act.type] ?? '#64748b'}">
+                  {TYPE_LABELS[act.type] ?? act.type}
+                </span>
+                <span class="check-act-name">{act.name || _an.action(act)}</span>
+              </label>
             {/each}
-          </select>
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Action</span>
-          <select class="field-select" value={lnk.nostrActionId ?? ''}
-            onchange={(e) => { lnk.nostrActionId = (e.target as HTMLSelectElement).value || null; }}>
-            <option value="">None</option>
-            {#each localNostrActions as na}
-              <option value={na.id}>{na.name || _an.nostrAction(na)}</option>
-            {/each}
-          </select>
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Channel</span>
-          <select class="field-select" value={lnk.channelId ?? ''}
-            onchange={(e) => { lnk.channelId = (e.target as HTMLSelectElement).value || null; }}>
-            <option value="">None</option>
-            {#each localChannels as ch}
-              <option value={ch.id}>{ch.name || _an.channel(ch)}</option>
-            {/each}
-          </select>
-        </label>
-        <label class="field-row">
-          <span class="field-lbl">Priority</span>
-          <input class="num-input" type="number" min="1" step="1" value={lnk.priority}
-            oninput={(e) => { lnk.priority = +(e.target as HTMLInputElement).value; }} />
-        </label>
-        {#if capType === 'photo'}
-          <!-- Photo links: fire-and-forget, no pre/post-roll concept -->
-          <label class="field-row">
-            <span class="field-lbl">Snapshots</span>
-            <input class="num-input" type="number" min="1" step="1" value={lnk.snapshotCount}
-              oninput={(e) => { lnk.snapshotCount = +(e.target as HTMLInputElement).value; }} />
-          </label>
-          <label class="field-row">
-            <span class="field-lbl">Interval</span>
-            <div class="num-with-unit">
-              <input class="num-input" type="number" min="0" step="0.5" value={lnk.intervalSec}
-                oninput={(e) => { lnk.intervalSec = +(e.target as HTMLInputElement).value; }} />
-              <span class="unit">s</span>
-            </div>
-          </label>
-        {:else}
-          <!-- Video/audio links: pre/post-roll control which recorded segments get pinned -->
-          <label class="field-row">
-            <span class="field-lbl">Pre-roll</span>
-            <div class="num-with-unit">
-              <input class="num-input" type="number" min="0" step="5" value={lnk.preRollSec}
-                oninput={(e) => { lnk.preRollSec = +(e.target as HTMLInputElement).value; }} />
-              <span class="unit">s</span>
-            </div>
-          </label>
-          <label class="field-row">
-            <span class="field-lbl">Post-roll</span>
-            <div class="num-with-unit">
-              <input class="num-input" type="number" min="0" step="5" value={lnk.postRollSec}
-                oninput={(e) => { lnk.postRollSec = +(e.target as HTMLInputElement).value; }} />
-              <span class="unit">s</span>
-            </div>
-          </label>
-          <label class="field-row">
-            <span class="field-lbl">Rolling buffer</span>
-            {#if lnk.rollingBufferSec === null}
-              <span class="inf-text">∞ infinite</span>
-              <button class="link-btn" onclick={() => { lnk.rollingBufferSec = Math.max(lnk.preRollSec || 30, 30); }}>Limit</button>
-            {:else}
-              <div class="num-with-unit">
-                <input class="num-input" type="number" min="0" step="5" value={lnk.rollingBufferSec}
-                  oninput={(e) => { lnk.rollingBufferSec = +(e.target as HTMLInputElement).value; }} />
-                <span class="unit">s</span>
-              </div>
-              <button class="link-btn" onclick={() => { lnk.rollingBufferSec = null; }}>∞</button>
+            {#if localActions.length === 0}
+              <span class="muted-hint">No actions defined</span>
             {/if}
-          </label>
-          <div class="field-hint full-row">Recording runs in {10}-second segments. Pre/post-roll pin segments in that window around the trigger. Set rolling buffer to ≥ pre-roll, or ∞ to let storage cleanup manage deletion.</div>
-          <label class="field-row">
-            <span class="field-lbl">Retrigger</span>
-            <select class="field-select" value={lnk.onRetrigger}
-              onchange={(e) => { lnk.onRetrigger = (e.target as HTMLSelectElement).value as 'extend' | 'ignore' | 'restart'; }}>
-              <option value="extend">Extend window</option>
-              <option value="ignore">Ignore</option>
-              <option value="restart">Restart</option>
-            </select>
-          </label>
-        {/if}
-        <label class="field-row pin-row full-row">
-          <span class="field-lbl">Keep for</span>
-          <button class="toggle-pill" style="background:{lnk.pinLifetimeSec !== null ? 'var(--color-success)' : 'var(--color-border)'}"
-            onclick={() => { lnk.pinLifetimeSec = lnk.pinLifetimeSec !== null ? null : 7 * 86400; }}>
-            <span class="pill-thumb" style="transform:translateX({lnk.pinLifetimeSec !== null ? '14px' : '2px'})"></span>
-          </button>
-          {#if lnk.pinLifetimeSec !== null}
-            <input class="num-input" type="number" min="1" step="1"
-              value={lnk.pinLifetimeSec === 0 ? '' : Math.round(lnk.pinLifetimeSec / pinUnitSec(lnk.id, lnk.pinLifetimeSec))}
-              placeholder={lnk.pinLifetimeSec === 0 ? '∞' : ''}
-              disabled={lnk.pinLifetimeSec === 0}
-              oninput={(e) => {
-                const v = +(e.target as HTMLInputElement).value;
-                lnk.pinLifetimeSec = v > 0 ? v * pinUnitSec(lnk.id, lnk.pinLifetimeSec) : 0;
-              }} />
-            <select class="field-select pin-unit-select"
-              value={pinUnit(lnk.id, lnk.pinLifetimeSec)}
-              disabled={lnk.pinLifetimeSec === 0}
-              onchange={(e) => {
-                const newUnit = (e.target as HTMLSelectElement).value as PinUnit;
-                pinUnits = { ...pinUnits, [lnk.id]: newUnit };
-                const uSec = PIN_UNITS.find(u => u.label === newUnit)!.s;
-                if (lnk.pinLifetimeSec && lnk.pinLifetimeSec > 0) {
-                  const count = Math.max(1, Math.round(lnk.pinLifetimeSec / uSec));
-                  lnk.pinLifetimeSec = count * uSec;
-                }
-              }}>
-              {#each PIN_UNITS as u}
-                <option value={u.label}>{u.label}</option>
-              {/each}
-            </select>
-            <label class="forever-label">
-              <input type="checkbox" checked={lnk.pinLifetimeSec === 0}
-                onchange={(e) => { lnk.pinLifetimeSec = (e.target as HTMLInputElement).checked ? 0 : 7 * 86400; }} />
-              ∞
-            </label>
-          {/if}
-        </label>
-        {#if isNoop(lnk)}
-          <div class="noop-warn full-row">⚠ No capture or action — this link does nothing.</div>
-        {/if}
+          </div>
+        </div>
       </div>
     </div>
   {:else}
@@ -1061,7 +1200,6 @@
       </label>
       {/if}
 
-      <!-- Thinning rules -->
       <div class="full-row thin-rules-header">
         <span class="field-lbl" style="font-weight:600">Thinning rules</span>
         <button class="add-btn" onclick={addThinningRule}>+ Add rule</button>
@@ -1113,29 +1251,25 @@
   .add-btn:hover { background: var(--color-accent); color: white; }
 
   .pipeline-card { border: 1px solid var(--color-border); border-radius: 6px; overflow: hidden; margin-bottom: 4px; }
-  .noop-card { border-color: var(--color-warning); }
   .card-header { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: var(--color-surface); }
   .card-body { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 12px; padding: 7px 8px; background: var(--color-bg); align-items: start; }
 
-  .type-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; text-transform: uppercase; flex-shrink: 0; }
-  .type-badge.mic    { background: #2563eb; color: white; }
-  .type-badge.cam    { background: #7c3aed; color: white; }
-  .type-badge.screen { background: #0e7490; color: white; }
-  .type-badge.audio  { background: #2563eb; color: white; }
-  .type-badge.sched  { background: #0891b2; color: white; }
-  .type-badge.video { background: #7c3aed; color: white; }
-  .type-badge.photo { background: #059669; color: white; }
-  .type-badge.nostr    { background: #9333ea; color: white; }
-  .type-badge.link     { background: #d97706; color: white; }
-  .type-badge.channel  { background: #0f766e; color: white; }
+  .type-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; text-transform: uppercase; flex-shrink: 0; color: white; }
+  .type-badge.channel  { background: #0f766e; }
+  .type-badge.link-type { background: #475569; }
+  .add-btn-group { display: flex; gap: 4px; }
+  .checkbox-group { display: flex; gap: 10px; align-items: center; }
+  .check-label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--color-text); cursor: pointer; text-transform: capitalize; }
+  .check-act-name { font-size: 10px; color: var(--color-muted); text-transform: none; }
+  .check-type-badge { font-size: 8px; font-weight: 700; padding: 1px 4px; border-radius: 3px; color: white; letter-spacing: 0.04em; }
 
   .state-badge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--color-border); color: var(--color-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .state-badge.idle     { background: var(--color-border); color: var(--color-muted); }
   .state-badge.inactive { background: var(--color-border); color: var(--color-muted); opacity: 0.6; }
   .state-badge.sensing  { background: #1d4ed8; color: white; }
-  .state-badge.waiting  { background: #92400e; color: #fcd34d; }
   .state-badge.active   { background: var(--color-success); color: white; }
   .state-badge.settling { background: var(--color-warning); color: #1a1a1a; }
+  .state-badge.cooldown { background: #7c3aed; color: white; }
 
   .name-input {
     flex: 1; font-size: 12px; font-weight: 600; padding: 2px 6px; border-radius: 4px;
@@ -1145,13 +1279,20 @@
   .name-input.flex1 { min-width: 0; }
 
   .field-row { display: flex; align-items: center; gap: 4px; }
+  .field-row--captures { align-items: flex-start; }
+  .captures-checks { display: flex; flex-direction: column; gap: 4px; }
+  .muted-hint { font-size: 10px; color: var(--color-muted); font-style: italic; }
   .field-lbl { font-size: 10px; color: var(--color-muted); white-space: nowrap; min-width: 68px; }
   .slider-row { flex-direction: column; align-items: stretch; gap: 2px; grid-column: 1 / -1; }
   .slider-row input[type="range"] { width: 100%; }
   .full-row { grid-column: 1 / -1; }
   .pin-row { flex-wrap: wrap; gap: 4px; grid-column: 1 / -1; }
+  .flex1 { flex: 1; min-width: 0; }
 
   .field-select { font-size: 11px; padding: 2px 4px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: inherit; max-width: 160px; }
+  .load-devs-btn { font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-muted); cursor: pointer; font-family: inherit; flex-shrink: 0; }
+  .load-devs-btn:hover:not(:disabled) { color: var(--color-text); border-color: var(--color-accent); }
+  .load-devs-btn:disabled { opacity: 0.4; cursor: default; }
   .num-input { font-size: 11px; padding: 2px 5px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: inherit; width: 55px; }
   .num-with-unit { display: flex; align-items: center; gap: 2px; }
   .unit { font-size: 10px; color: var(--color-muted); }
@@ -1163,8 +1304,6 @@
   .rm-btn { font-size: 11px; padding: 0 4px; border: none; background: none; color: var(--color-muted); cursor: pointer; flex-shrink: 0; }
   .rm-btn:hover { color: var(--color-danger); }
 
-  .noop-warn { grid-column: 1 / -1; font-size: 10px; color: var(--color-warning); padding: 2px 0; }
-
   .act-btn { font-size: 10px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-muted); cursor: pointer; font-family: inherit; }
   .act-btn:hover { color: var(--color-text); }
   .act-btn.accent { background: var(--color-accent); color: white; border-color: var(--color-accent); }
@@ -1174,6 +1313,7 @@
   .empty { font-size: 11px; color: var(--color-muted); padding: 4px 0; }
   .field-hint { font-size: 10px; color: var(--color-muted); font-style: italic; padding: 2px 0; grid-column: 1 / -1; }
   .field-hint-inline { font-size: 10px; color: var(--color-muted); font-style: italic; }
+  .field-hint.warn { color: var(--color-warning); }
 
   .thin-rules-header { display: flex; align-items: center; justify-content: space-between; }
   .thin-rule-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
@@ -1182,10 +1322,8 @@
   .remove-btn { font-size: 11px; padding: 0 5px; border: none; background: none; color: var(--color-muted); cursor: pointer; }
   .remove-btn:hover { color: var(--color-danger); }
 
-  /* Date-range sensor inputs */
   .datetime-input { font-size: 11px; padding: 2px 5px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: inherit; flex: 1; }
 
-  /* ── Availability grid (time-window sensor) ─────────────────────────────── */
   .avail-wrap { user-select: none; touch-action: none; }
   .avail-header-row { display: grid; grid-template-columns: 28px repeat(24, 1fr); gap: 1px; margin-bottom: 1px; }
   .avail-row { display: grid; grid-template-columns: 28px repeat(24, 1fr); gap: 1px; }

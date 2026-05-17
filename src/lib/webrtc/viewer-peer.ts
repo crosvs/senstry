@@ -89,6 +89,14 @@ export async function handleViewerSignal(msg: SignalMessage, fromPubkey: string)
 		return;
 	}
 
+	if (session.sessionId !== msg.sessionId && msg.type === 'offer' && !session.dataChannel) {
+		// A prior timed-out attempt can leave a stale session in the map.  An offer is
+		// always sent in direct response to an offer-request from this viewer, so if the
+		// session has no open data channel yet, accept it and adopt the incoming session ID.
+		dbg('warn', 'rtc', `viewer: stale session id ${session.sessionId.slice(0, 8)} → adopting offer session ${msg.sessionId.slice(0, 8)} from ${fromPubkey.slice(0, 8)}`);
+		session.sessionId = msg.sessionId;
+	}
+
 	if (msg.type === 'offer' && msg.sdp) {
 		dbg('info', 'rtc', `viewer: processing offer from ${fromPubkey.slice(0, 8)}`);
 		try {
@@ -155,10 +163,20 @@ export async function ensureConnection(
 	ensureViewerSubscription(privkey, viewerPubkey);
 
 	const promise = new Promise<void>((resolve, reject) => {
-		const timeout = setTimeout(() => {
+		let disconnectGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+		const fail = (err: Error) => {
 			if (generation !== myGeneration) return;
+			if (disconnectGraceTimer !== null) { clearTimeout(disconnectGraceTimer); disconnectGraceTimer = null; }
+			clearTimeout(timeout);
 			connectPromises.delete(monitorPubkey);
-			reject(new Error('Connection timed out'));
+			streamState.set('failed');
+			closeSession(monitorPubkey);
+			reject(err);
+		};
+
+		const timeout = setTimeout(() => {
+			fail(new Error('Connection timed out — check that the monitor has "Accept viewer connections" enabled'));
 		}, 30_000);
 
 		const sessionId = randomUUID();
@@ -173,6 +191,7 @@ export async function ensureConnection(
 			e.channel.onmessage = (ev) => handleDataMessage(ev.data);
 			const open = () => {
 				if (generation !== myGeneration) return;
+				if (disconnectGraceTimer !== null) { clearTimeout(disconnectGraceTimer); disconnectGraceTimer = null; }
 				clearTimeout(timeout);
 				connectPromises.delete(monitorPubkey);
 				resolve();
@@ -193,15 +212,22 @@ export async function ensureConnection(
 		onIceStateChange(pc, (state) => {
 			if (generation !== myGeneration) return;
 			if (state === 'failed' || state === 'closed') {
-				clearTimeout(timeout);
-				connectPromises.delete(monitorPubkey);
-				streamState.set('failed');
-				reject(new Error('ICE failed'));
-				closeSession(monitorPubkey);
+				fail(new Error('ICE connection failed — NAT traversal may require a TURN server'));
+			} else if (state === 'disconnected') {
+				// 'disconnected' is transient on flaky networks; give it 8 s to recover before failing.
+				if (disconnectGraceTimer === null) {
+					disconnectGraceTimer = setTimeout(() => {
+						fail(new Error('ICE disconnected'));
+					}, 8_000);
+				}
+			} else if (state === 'connected' || state === 'completed') {
+				if (disconnectGraceTimer !== null) { clearTimeout(disconnectGraceTimer); disconnectGraceTimer = null; }
 			}
 		});
 
-		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId, mode, sourceId, channelId);
+		// Catch relay errors immediately rather than waiting out the full 30 s timeout.
+		sendOfferRequest(privkey, viewerPubkey, monitorPubkey, sessionId, mode, sourceId, channelId)
+			.catch((e) => fail(new Error(`Relay error: ${e instanceof Error ? e.message : 'publish failed'}`)));
 	});
 
 	connectPromises.set(monitorPubkey, promise);

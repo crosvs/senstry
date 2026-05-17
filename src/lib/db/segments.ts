@@ -31,7 +31,7 @@ export interface Segment {
 	// N>0  = pinned until unix timestamp N
 	pinnedUntil: number | null;
 	originMonitor: string;
-	sourceId: string;   // which input device produced this segment; legacy records default to 'default-mic'
+	channelId: string;  // which channel produced this segment; legacy records default to 'default-channel'
 	backupOf: string | null;
 	contentHash: string; // SHA-256 hex of blob content; '' for pre-v6 records (hash unavailable)
 }
@@ -210,7 +210,7 @@ export async function saveSegment(
 	startTime: number,
 	endTime: number,
 	originMonitor: string,
-	sourceId: string,
+	channelId: string,
 	backupOf: string | null = null,
 	existingId?: string
 ): Promise<string> {
@@ -244,7 +244,7 @@ export async function saveSegment(
 		pinned: false,
 		pinnedUntil: null,
 		originMonitor,
-		sourceId,
+		channelId,
 		backupOf,
 		contentHash,
 	};
@@ -273,7 +273,7 @@ export async function pinRange(
 	toTime: number,
 	pinnedUntil: number = 0,
 	mimeTypePrefix?: string,
-	sourceId?: string
+	channelId?: string
 ): Promise<string[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
@@ -281,7 +281,8 @@ export async function pinRange(
 		s.endTime >= fromTime &&
 		s.startTime <= toTime &&
 		(mimeTypePrefix == null || s.mimeType.startsWith(mimeTypePrefix)) &&
-		(sourceId == null || (s.sourceId ?? 'default-mic') === sourceId)
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
 	);
 	const tx = db.transaction('segments', 'readwrite');
 	await Promise.all(toPin.map((s) => tx.store.put({
@@ -322,33 +323,37 @@ export async function getSegmentAt(time: number, originMonitor?: string): Promis
 	return getSegmentById(meta.segmentId);
 }
 
-export async function getSegmentsAfter(after: number, count: number, originMonitor?: string, mimePrefix?: string): Promise<Segment[]> {
+export async function getSegmentsAfter(after: number, count: number, originMonitor?: string, mimePrefix?: string, channelId?: string): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
 	return all
 		.filter(s =>
 			s.startTime >= after &&
 			(originMonitor == null || s.originMonitor === originMonitor) &&
-			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
 		)
 		.sort((a, b) => a.startTime - b.startTime)
 		.slice(0, count);
 }
 
-export async function getSegmentsBefore(before: number, count: number, originMonitor?: string, mimePrefix?: string): Promise<Segment[]> {
+export async function getSegmentsBefore(before: number, count: number, originMonitor?: string, mimePrefix?: string, channelId?: string): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
 	return all
 		.filter(s =>
 			s.endTime <= before &&
 			(originMonitor == null || s.originMonitor === originMonitor) &&
-			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
 		)
 		.sort((a, b) => b.startTime - a.startTime) // newest first
 		.slice(0, count);
 }
 
-export async function getSegmentsInRange(from: number, to: number, originMonitor?: string, sourceId?: string): Promise<Segment[]> {
+export async function getSegmentsInRange(from: number, to: number, originMonitor?: string, channelId?: string): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await db.getAllFromIndex('segments', 'startTime') as Segment[];
 	return all
@@ -356,18 +361,20 @@ export async function getSegmentsInRange(from: number, to: number, originMonitor
 			s.endTime >= from &&
 			s.startTime <= to &&
 			(originMonitor == null || s.originMonitor === originMonitor) &&
-			(sourceId == null || (s.sourceId ?? 'default-mic') === sourceId)
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
 		)
 		.sort((a, b) => a.startTime - b.startTime);
 }
 
-export async function getCoverageMap(originMonitor?: string, mimePrefix?: string, sourceId?: string): Promise<[number, number][]> {
+export async function getCoverageMap(originMonitor?: string, mimePrefix?: string, channelId?: string): Promise<[number, number][]> {
 	const db = await openDB();
 	const all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
 		.filter((s) =>
 			(originMonitor == null || s.originMonitor === originMonitor) &&
 			(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
-			(sourceId == null || (s.sourceId ?? 'default-mic') === sourceId)
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
 		)
 		.sort((a, b) => a.startTime - b.startTime);
 

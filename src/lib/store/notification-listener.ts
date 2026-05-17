@@ -9,7 +9,8 @@ export interface AlertRecord {
 	monitorPubkey: string;
 	monitorLabel: string;
 	detectionType: string;
-	sourceId: string;
+	sensorState: 'sensing' | 'active' | 'idle';
+	channelId: string | null;
 	timestamp: number;       // from event payload (monitor clock)
 	receivedAt: number;      // local unix-sec when we got it
 	data?: Record<string, unknown>;
@@ -78,7 +79,8 @@ export function startAlertListener(
 				monitorPubkey: event.pubkey,
 				monitorLabel: (payload.monitorLabel as string) || event.pubkey.slice(0, 8),
 				detectionType: (payload.type as string) || 'unknown',
-				sourceId: (payload.sourceId as string) || '',
+				sensorState: (payload.sensorState as 'sensing' | 'active' | 'idle') || 'active',
+				channelId: (payload.channelId as string | null | undefined) ?? null,
 				timestamp: (payload.timestamp as number) || event.created_at,
 				receivedAt: Math.floor(Date.now() / 1000),
 				data: payload.data as Record<string, unknown> | undefined,
@@ -116,7 +118,7 @@ export function clearAlerts(): void {
 function _pushNotification(record: AlertRecord): void {
 	if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
 	const title = record.message || `${record.detectionType} detected`;
-	const body  = `Monitor: ${record.monitorLabel}${record.sourceId ? ' · ' + record.sourceId : ''}`;
+	const body  = `Monitor: ${record.monitorLabel}${record.channelId ? ' · ' + record.channelId : ''}`;
 	try {
 		const n = new Notification(title, {
 			body,

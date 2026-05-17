@@ -140,7 +140,7 @@
           <span class="alert-time">{fmtTs(alert.timestamp)}</span>
           <span class="alert-monitor">{nickFor(alert.monitorPubkey)}</span>
           <span class="alert-type" style="color:{typeColor(alert.detectionType)}">{alert.detectionType}</span>
-          <span class="alert-source">{alert.sourceId || '—'}</span>
+          <span class="alert-source">{alert.channelId || '—'}</span>
           <span class="alert-body">
             {#if alert.message}
               <span class="alert-msg">{alert.message}</span>

@@ -144,7 +144,7 @@
     endTime: number;
     triggerTime: number;
     originMonitor: string;
-    sourceId: string;
+    channelId: string;
     publishedAt: number | null; // from IDB record; null for nostr-only
   }
 
@@ -193,7 +193,7 @@
       if (idx !== undefined) {
         if (next[idx].source === 'nostr') { next[idx] = { ...next[idx], source: 'both', publishedAt: ref.publishedAt }; }
       } else {
-        next.push({ key: ref.refId, source: 'idb', refId: ref.refId, triggerType: ref.triggerType, startTime: ref.startTime, endTime: ref.endTime, triggerTime: ref.triggerTime, originMonitor: ref.originMonitor, sourceId: ref.sourceId ?? 'default-mic', publishedAt: ref.publishedAt });
+        next.push({ key: ref.refId, source: 'idb', refId: ref.refId, triggerType: ref.triggerType, startTime: ref.startTime, endTime: ref.endTime, triggerTime: ref.triggerTime, originMonitor: ref.originMonitor, channelId: ref.channelId ?? 'default-channel', publishedAt: ref.publishedAt });
         added++;
       }
     }
@@ -236,7 +236,7 @@
               if (idx >= 0) {
                 if (next[idx].source === 'idb') next[idx] = { ...next[idx], source: 'both' };
               } else {
-                next.push({ key: r.refId, source: 'nostr', refId: r.refId, triggerType: r.triggerType, startTime: r.startTime, endTime: r.endTime, triggerTime: r.triggerTime, originMonitor: payload.originMonitor ?? event.pubkey, sourceId: payload.sourceId ?? event.tags.find((t: string[]) => t[0] === 's')?.[1] ?? 'default-mic', publishedAt: null });
+                next.push({ key: r.refId, source: 'nostr', refId: r.refId, triggerType: r.triggerType, startTime: r.startTime, endTime: r.endTime, triggerTime: r.triggerTime, originMonitor: payload.originMonitor ?? event.pubkey, channelId: (payload.channelId ?? event.tags.find((t: string[]) => t[0] === 's')?.[1] ?? 'default-channel') as string, publishedAt: null });
               }
               return next.sort((a, b) => b.startTime - a.startTime);
             })();
@@ -274,7 +274,7 @@
     if (!a || a.source !== 'nostr') return;
     savingKeys = new Set([...savingKeys, key]);
     try {
-      await receiveFootageRef(a.refId, { originMonitor: a.originMonitor, triggerType: a.triggerType, startTime: a.startTime, endTime: a.endTime, triggerTime: a.triggerTime, sourceId: a.sourceId }, a.refId);
+      await receiveFootageRef(a.refId, { originMonitor: a.originMonitor, triggerType: a.triggerType, channelId: a.channelId, startTime: a.startTime, endTime: a.endTime, triggerTime: a.triggerTime }, a.refId);
       fetchedAlerts = fetchedAlerts.map(x => x.key === key ? { ...x, source: 'both', publishedAt: Date.now() } : x);
       dbg('info', 'idb', `alert saved: ${key.slice(0, 8)}`);
     } finally {
