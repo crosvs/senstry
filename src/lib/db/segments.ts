@@ -527,6 +527,49 @@ export async function getDistinctOriginMonitors(): Promise<string[]> {
 	return [...new Set(all.map(s => s.originMonitor))];
 }
 
+export async function getCoverageByChannel(originMonitor?: string, mimePrefix?: string): Promise<Record<string, [number, number][]>> {
+	const db = await openDB();
+	const all = (await db.getAllFromIndex('segments', 'startTime') as Segment[])
+		.filter(s =>
+			(originMonitor == null || s.originMonitor === originMonitor) &&
+			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
+		)
+		.sort((a, b) => a.startTime - b.startTime);
+
+	const byChannel: Record<string, Segment[]> = {};
+	for (const s of all) {
+		const ch = s.channelId ?? 'default-channel';
+		(byChannel[ch] ??= []).push(s);
+	}
+
+	const result: Record<string, [number, number][]> = {};
+	for (const [ch, segs] of Object.entries(byChannel)) {
+		const merged: [number, number][] = [];
+		for (const seg of segs) {
+			if (merged.length === 0) {
+				merged.push([seg.startTime, seg.endTime]);
+			} else {
+				const last = merged[merged.length - 1];
+				if (seg.startTime <= last[1] + 1) last[1] = Math.max(last[1], seg.endTime);
+				else merged.push([seg.startTime, seg.endTime]);
+			}
+		}
+		result[ch] = merged;
+	}
+	return result;
+}
+
+export async function getDistinctChannels(originMonitor?: string, from?: number, to?: number): Promise<string[]> {
+	const db = await openDB();
+	const all = await db.getAll('segments') as Segment[];
+	const filtered = all.filter(s =>
+		(originMonitor == null || s.originMonitor === originMonitor) &&
+		(from == null || s.endTime >= from) &&
+		(to == null || s.startTime <= to)
+	);
+	return [...new Set(filtered.map(s => s.channelId).filter(Boolean))].sort();
+}
+
 export async function getStorageUsed(originMonitor?: string): Promise<number> {
 	const db = await openDB();
 	const all = await db.getAll('segments') as Segment[];

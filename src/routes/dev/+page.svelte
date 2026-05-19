@@ -2,6 +2,9 @@
   import { identity, pairedDevices } from '$lib/store/identity';
   import { settings } from '$lib/store/settings';
   import { outboxFlusher } from '$lib/nostr/outbox';
+  import { nostrOnline, goOffline } from '$lib/store/nostr-online';
+  import { viewerConnection } from '$lib/store/viewer-connection';
+  import { loadLocalChannels, disconnectViewer } from '$lib/webrtc/viewer-peer';
   import { onMount, onDestroy } from 'svelte';
 
   import IdentitySection from '$lib/components/dev/IdentitySection.svelte';
@@ -15,15 +18,11 @@
   import SegmentStorageSection from '$lib/components/dev/SegmentStorageSection.svelte';
   import AlertsSection from '$lib/components/dev/AlertsSection.svelte';
   import type { SignalMessage } from '$lib/webrtc/signaling';
-  import type { SensorState, ActionState } from '$lib/store/pipeline';
   import type { AlertSession } from '$lib/components/dev/SentrySection.svelte';
 
   // ── Shared page-level state ───────────────────────────────────────────────
   let selectedMonitorPubkey = $state<string | null>(null);
-  let signalRouterActive = $state(false);
   let autoAccept = $state(true);
-  let sensorStates = $state<Record<string, SensorState>>({});
-  let actionStates = $state<Record<string, ActionState>>({});
   let activeAlerts = $state<AlertSession[]>([]);
 
   interface PendingOffer { fromPubkey: string; msg: SignalMessage; }
@@ -46,12 +45,27 @@
     pendingOffers = pendingOffers.filter(o => o.fromPubkey !== offer.fromPubkey);
   }
 
+  $effect(() => {
+    const pk = selectedMonitorPubkey;
+    disconnectViewer();
+    viewerConnection.set({
+      monitorPubkey: pk,
+      status: 'offline',
+      mode: null,
+      channels: [],
+      channelId: '',
+      error: null,
+    });
+    if (pk) void loadLocalChannels(pk);
+  });
+
   onMount(() => {
     outboxFlusher.start();
   });
 
   onDestroy(() => {
     outboxFlusher.stop();
+    if ($nostrOnline) goOffline().catch(() => {});
   });
 </script>
 
@@ -73,10 +87,7 @@
     <AlertsSection />
 
     <SentrySection
-      bind:signalRouterActive
       bind:autoAccept
-      bind:sensorStates
-      bind:actionStates
       bind:activeAlerts
       onPendingOffer={handlePendingOffer}
       acceptOffer={acceptingOffer}
@@ -100,7 +111,7 @@
       </div>
     {/if}
 
-    <SettingsSection {sensorStates} {actionStates} {activeAlerts} />
+    <SettingsSection {activeAlerts} />
 
     <!-- Device-scoped sections divider -->
     <div class="scope-divider" title="All sections below are scoped to the device selected here. Identity, relay, pairing, settings, and sentry above apply globally.">

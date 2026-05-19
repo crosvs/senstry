@@ -20,7 +20,8 @@
   import { saveSegment, pinRange, thinSegments, evictUnpinned, expirePinnedSegments, setMonitorRollingBuffer, SEGMENT_DURATION_S } from '$lib/db/segments';
   import { createFootageRef, updateFootageRef } from '$lib/db/footage';
   import { getPhotosInRange, pinPhoto } from '$lib/db/photos';
-  import { buildTriggerEvent, buildFootageRefEvent, KIND_TRIGGER } from '$lib/nostr/events';
+  import { buildTriggerEvent, buildFootageRefEvent, buildArmState, KIND_TRIGGER } from '$lib/nostr/events';
+  import { sensorStates, actionStates } from '$lib/store/monitor-runtime';
   import { publish, getRelays, subscribe } from '$lib/nostr/client';
   import { decrypt } from '$lib/nostr/crypto';
   import { enqueue } from '$lib/db/outbox';
@@ -33,10 +34,11 @@
   import { handleViewerSignal } from '$lib/webrtc/viewer-peer';
   import { startSignalRouter } from '$lib/webrtc/signal-router';
   import { monitorState, transitionMonitor, isStoring, isPublishing } from '$lib/store/monitor';
+  import { nostrOnline } from '$lib/store/nostr-online';
   import { dbg } from '$lib/store/debug';
   import DevSection from './DevSection.svelte';
   import LogPanel from './LogPanel.svelte';
-  import type { SignalMessage } from '$lib/webrtc/signaling';
+  import { sendSignal, type SignalMessage } from '$lib/webrtc/signaling';
 
   // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -52,19 +54,13 @@
   // ── Props ─────────────────────────────────────────────────────────────────
 
   interface Props {
-    signalRouterActive?: boolean;
     autoAccept?: boolean;
-    sensorStates?: Record<string, SensorState>;
-    actionStates?: Record<string, ActionState>;
     activeAlerts?: AlertSession[];
     onPendingOffer?: (fromPubkey: string, msg: SignalMessage) => void;
     acceptOffer?: { fromPubkey: string; msg: SignalMessage } | null;
   }
   let {
-    signalRouterActive = $bindable(false),
     autoAccept = $bindable(true),
-    sensorStates = $bindable<Record<string, SensorState>>({}),
-    actionStates = $bindable<Record<string, ActionState>>({}),
     activeAlerts = $bindable<AlertSession[]>([]),
     onPendingOffer,
     acceptOffer = null,
@@ -115,8 +111,8 @@
   // Per-action deactivation timers (post-roll)
   const actionDeactivationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  // NotifyAction cooldown tracking: key → cooldown expiry (unix ms)
-  const notifyCooldowns = new Map<string, number>();
+  // NotifyAction state tracking: key → -1 (in-flight) or cooldown expiry (unix ms)
+  const notifyStates = new Map<string, -1 | number>();
 
   // Interval handles for infinite snapshot bursts (snapshotCount === 0)
   const snapshotIntervals = new Map<string, ReturnType<typeof setInterval>>();
@@ -152,7 +148,13 @@
     }
   });
 
-  // ── Signal router ─────────────────────────────────────────────────────────
+  // ── Signal router — controlled by nostrOnline store ──────────────────────
+
+  // Per-device timestamp of last online announcement sent.
+  // Prevents re-announcing to the same peer when the signal router restarts
+  // due to a relay URL change while already online.
+  const _lastAnnounced = new Map<string, number>();
+  const ANNOUNCE_COOLDOWN_MS = 60_000;
 
   function startRouter() {
     if (!$identity || signalSub) return;
@@ -171,14 +173,35 @@
       },
       async (msg, fromPubkey) => { await handleViewerSignal(msg, fromPubkey); }
     );
-    signalRouterActive = true;
+    // Announce online to paired devices, skipping any we announced to recently.
+    const id = get(identity);
+    if (id) {
+      const sessionId = crypto.randomUUID();
+      const now = Date.now();
+      for (const device of get(pairedDevices)) {
+        const last = _lastAnnounced.get(device.pubkey) ?? 0;
+        if (now - last < ANNOUNCE_COOLDOWN_MS) continue;
+        _lastAnnounced.set(device.pubkey, now);
+        sendSignal(id.privkey, id.pubkey, device.pubkey, {
+          type: 'status', state: 'online', sessionId, isAnnounce: true,
+        }).catch(() => {});
+      }
+    }
   }
 
   function stopRouter() {
     signalSub?.close();
     signalSub = null;
-    signalRouterActive = false;
+    stopAllMonitorSessions();
   }
+
+  $effect(() => {
+    if ($nostrOnline) {
+      startRouter();
+    } else {
+      stopRouter();
+    }
+  });
 
   // ── Monitor lifecycle ─────────────────────────────────────────────────────
 
@@ -211,10 +234,10 @@
         neededSourceIds.add(sensor.sourceId);
       }
       for (const action of enabledRecordActions) {
-        const ch = $channels.find(c => c.id === action.channelId);
-        if (!ch) continue;
-        if (ch.videoSourceId) neededSourceIds.add(ch.videoSourceId);
-        if (ch.audioSourceId) neededSourceIds.add(ch.audioSourceId);
+        for (const capId of action.captureIds) {
+          const cap = $captures.find(c => c.id === capId);
+          if (cap?.sourceId && cap.sourceId !== 'none') neededSourceIds.add(cap.sourceId);
+        }
       }
       const enabledSnapActions = ($actions.filter((a): a is SnapshotAction => a.type === 'snapshot'))
         .filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id)));
@@ -307,22 +330,27 @@
           nostrTriggerSubs.set(sensor.id, ntSub);
           det = ntDet;
         } else {
-          // audio
-          const stream = openStreams.get(sensor.sourceId);
-          if (!stream) continue;
+          // audio — extract only audio tracks so screen-share sources work correctly
+          const rawStream = openStreams.get(sensor.sourceId);
+          if (!rawStream) continue;
+          const audioTracks = rawStream.getAudioTracks();
+          if (!audioTracks.length) {
+            dbg('warn', 'detector', `sensor:${sensor.id} source has no audio tracks — skipped`);
+            continue;
+          }
           const aDet = new AudioDetector({
             thresholdDb: sensor.thresholdDb,
             releaseThresholdDb: sensor.releaseThresholdDb,
             settlingMs: sensor.settlingMs,
             minDurationMs: sensor.minDurationMs,
           });
-          aDet.start(stream);
+          aDet.start(new MediaStream(audioTracks));
           det = aDet;
         }
 
         const capturedSensor = sensor;
         det.onStateChange = (state: SensorState) => {
-          sensorStates = { ...sensorStates, [capturedSensor.id]: state };
+          $sensorStates = { ...$sensorStates, [capturedSensor.id]: state };
           _evaluateLinks();
           _handleSensorStateForNotify(capturedSensor.id, state);
         };
@@ -334,6 +362,7 @@
       }
 
       transitionMonitor('active');
+      _publishArmState(true).catch(() => {});
 
       await loadStorageCleanup();
       const cfg = get(storageCleanup);
@@ -351,6 +380,7 @@
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to access camera/mic';
       transitionMonitor('idle');
+      _publishArmState(false).catch(() => {});
     }
   }
 
@@ -468,7 +498,7 @@
       const action = $actions.find(a => a.id === actionId);
       if (!action || action.type === 'notify') continue;
 
-      const isActive = actionStates[actionId]?.status === 'active';
+      const isActive = $actionStates[actionId]?.status === 'active';
       const pendingDeact = actionDeactivationTimers.has(actionId);
 
       if (shouldFire) {
@@ -504,7 +534,7 @@
 
   function _linkConditionMet(link: import('$lib/store/pipeline').Link): boolean {
     const results = link.sensorIds.map(id => {
-      const s = sensorStates[id];
+      const s = $sensorStates[id];
       if (!s) return false;
       return link.onState === 'sensing'
         ? s.status === 'sensing' || s.status === 'active'
@@ -515,7 +545,7 @@
 
   function _activateAction(action: Action) {
     const now = Date.now();
-    actionStates = { ...actionStates, [action.id]: { status: 'active', startedAt: now } };
+    $actionStates = { ...$actionStates, [action.id]: { status: 'active', startedAt: now } };
     dbg('info', 'detector', `action activated: ${action.name || action.type} (${action.id.slice(0, 8)})`);
     if (action.type === 'record') {
       for (const capId of action.captureIds) {
@@ -531,7 +561,7 @@
 
   function _deactivateActionNow(action: Action) {
     _cancelActionDeactivation(action.id);
-    actionStates = { ...actionStates, [action.id]: { status: 'idle' } };
+    $actionStates = { ...$actionStates, [action.id]: { status: 'idle' } };
     dbg('info', 'detector', `action deactivated: ${action.name || action.type}`);
     if (action.type === 'record') {
       for (const capId of action.captureIds) {
@@ -584,16 +614,17 @@
       const stream = openStreams.get(cap.sourceId);
       const id = get(identity);
       if (!stream || !id) return;
+      const chName = get(channels).find(c => c.id === action.channelId)?.name ?? action.channelId;
       capturePhotosOnTrigger(stream, {
         snapshotCount: 1, intervalSec: 0,
         imageWidth: cap.imageWidth, imageHeight: cap.imageHeight,
         imageQuality: cap.imageQuality, imageFormat: cap.imageFormat,
-      }, id.pubkey, Math.floor(Date.now() / 1000), action.channelId)
+      }, id.pubkey, Math.floor(Date.now() / 1000), chName)
         .then(async ids => {
           if (!ids.length || action.pinLifetimeSec == null) return;
           const now = Math.floor(Date.now() / 1000);
           const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
-          await pinRange(now - 2, now + 2, until, 'image/', action.channelId);
+          await pinRange(now - 2, now + 2, until, 'image/', chName);
         })
         .catch(err => dbg('warn', 'detector', `snapshot error: ${err instanceof Error ? err.message : err}`));
     };
@@ -612,17 +643,18 @@
 
   async function _handleSensorStateForNotify(sensorId: string, state: SensorState) {
     const id = get(identity);
-    if (!id || !isPublishing(get(monitorState)) || get(settings).pauseNostr) return;
+    if (!id || !isPublishing(get(monitorState)) || !get(nostrOnline)) return;
 
-    const sensorState: 'sensing' | 'active' | 'idle' =
-      state.status === 'sensing' ? 'sensing'
-      : state.status === 'active' ? 'active'
-      : 'idle';
+    // Only publish on active or idle — skip 'sensing' and 'settling' transitions.
+    const sensorState = state.status === 'active' ? 'active'
+      : (state.status === 'idle' || state.status === 'settling') ? 'idle'
+      : null;
+    if (!sensorState) return;
 
     const sensor = get(sensors).find(s => s.id === sensorId);
     const notifyActions = $links
       .filter(l => l.enabled && l.sensorIds.includes(sensorId))
-      .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+      .flatMap(l => l.actionIds.map(aId => $actions.find(a => a.id === aId)))
       .filter((a): a is NotifyAction => a?.type === 'notify');
 
     if (!notifyActions.length) return;
@@ -634,65 +666,113 @@
       : sensor?.type === 'daterange' ? 'daterange'
       : 'nostr-trigger';
 
-    // Find a channelId from any linked RecordAction or ClipAction on the same sensor
     const channelId: string | null = (() => {
       const linked = $links
         .filter(l => l.enabled && l.sensorIds.includes(sensorId))
-        .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
+        .flatMap(l => l.actionIds.map(aId => $actions.find(a => a.id === aId)))
         .find((a): a is RecordAction | ClipAction => a?.type === 'record' || a?.type === 'clip');
       return linked?.channelId ?? null;
     })();
 
+    const relays = getRelays();
+    const allDevices = get(pairedDevices);
+
     for (const action of notifyActions) {
-      if (!action.publishStates.includes(sensorState)) continue;
-
-      // Attach footageRefId from any active ClipAction session on same sensor
-      let footageRefId: string | null = null;
-      if (sensorState === 'active') {
-        const clipActions = $links
-          .filter(l => l.enabled && l.sensorIds.includes(sensorId))
-          .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
-          .filter((a): a is ClipAction => a?.type === 'clip');
-        for (const ca of clipActions) {
-          const s = footageSessions.get(ca.id);
-          if (s) { footageRefId = s.refId; break; }
-        }
-      }
-
-      const relays = getRelays();
-      const allDevices = get(pairedDevices);
       const targets = action.viewerPubkey
         ? allDevices.filter(d => d.pubkey === action.viewerPubkey)
         : allDevices;
 
       for (const device of targets) {
-        const cdKey = `${action.id}:${device.pubkey}`;
-        const cdEndsAt = notifyCooldowns.get(cdKey) ?? 0;
-        const inCooldown = Date.now() < cdEndsAt;
+        const key = `${action.id}:${device.pubkey}`;
+        const nsVal = notifyStates.get(key) ?? 0;
+        const inCooldown = nsVal !== -1 && Date.now() < nsVal;
 
-        if (action.onRetrigger === 'ignore' && inCooldown) continue;
-        if (action.onRetrigger === 'extend') {
-          // Push cooldown window forward; only send if we weren't already in cooldown
-          notifyCooldowns.set(cdKey, Date.now() + action.cooldownMs);
+        if (action.onRetrigger === 'ignore') {
+          // Single event on active with sensorTiming; client simulates active → idle.
+          if (sensorState !== 'active') continue;
           if (inCooldown) continue;
-        } else {
-          // 'ignore' (not in cooldown) or 'restart': always send, reset cooldown
-          notifyCooldowns.set(cdKey, Date.now() + action.cooldownMs);
-        }
+          notifyStates.set(key, Date.now() + action.cooldownMs);
 
-        const ev = buildTriggerEvent(
-          id.privkey, id.pubkey, device.pubkey,
-          detectionType, sensorState,
-          get(settings).selfLabel,
-          {}, footageRefId, channelId, sensorTiming,
-          action.messageTemplate, false,
-        );
-        try {
-          await publish(ev);
-        } catch (e) {
-          await enqueue(ev, relays);
+          let footageRefId: string | null = null;
+          const clipActions = $links
+            .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+            .flatMap(l => l.actionIds.map(aId => $actions.find(a => a.id === aId)))
+            .filter((a): a is ClipAction => a?.type === 'clip');
+          for (const ca of clipActions) {
+            const s = footageSessions.get(ca.id);
+            if (s) { footageRefId = s.refId; break; }
+          }
+
+          const ev = buildTriggerEvent(
+            id.privkey, id.pubkey, device.pubkey,
+            detectionType, 'active',
+            get(settings).selfLabel,
+            {}, footageRefId, channelId, sensorTiming,
+            action.messageTemplate, false,
+          );
+          try { await publish(ev); } catch { await enqueue(ev, relays); }
+
+        } else {
+          // extend / restart — publish active + idle pair.
+          if (sensorState === 'active') {
+            // Inter-incident cooldown: gap between idle and next active.
+            if (inCooldown) continue;
+            // Re-trigger while in-flight: publish new active to reset client timer.
+            const maxDurationMs = sensorTiming.settlingMs + 10_000;
+
+            let footageRefId: string | null = null;
+            const clipActions = $links
+              .filter(l => l.enabled && l.sensorIds.includes(sensorId))
+              .flatMap(l => l.actionIds.map(aId => $actions.find(a => a.id === aId)))
+              .filter((a): a is ClipAction => a?.type === 'clip');
+            for (const ca of clipActions) {
+              const s = footageSessions.get(ca.id);
+              if (s) { footageRefId = s.refId; break; }
+            }
+
+            const ev = buildTriggerEvent(
+              id.privkey, id.pubkey, device.pubkey,
+              detectionType, 'active',
+              get(settings).selfLabel,
+              {}, footageRefId, channelId, sensorTiming,
+              action.messageTemplate, false,
+              maxDurationMs, action.onRetrigger,
+            );
+            try { await publish(ev); } catch { await enqueue(ev, relays); }
+            notifyStates.set(key, -1);
+
+          } else {
+            // idle transition — only send if we previously marked this in-flight.
+            if (nsVal !== -1) continue;
+            notifyStates.set(key, Date.now() + action.cooldownMs);
+
+            const ev = buildTriggerEvent(
+              id.privkey, id.pubkey, device.pubkey,
+              detectionType, 'idle',
+              get(settings).selfLabel,
+              {}, null, channelId, sensorTiming,
+              action.messageTemplate, false,
+              undefined, action.onRetrigger,
+            );
+            try { await publish(ev); } catch { await enqueue(ev, relays); }
+          }
         }
       }
+    }
+  }
+
+  // ── Arm state publishing ──────────────────────────────────────────────────
+
+  async function _publishArmState(armed: boolean) {
+    const id = get(identity);
+    if (!id || !get(nostrOnline)) return;
+    const relays = getRelays();
+    const snapshot = armed ? Object.fromEntries(
+      Object.entries($sensorStates).map(([k, v]) => [k, { status: v.status }])
+    ) : undefined;
+    for (const device of get(pairedDevices)) {
+      const ev = buildArmState(id.privkey, id.pubkey, device.pubkey, armed, snapshot);
+      try { await publish(ev); } catch { await enqueue(ev, relays); }
     }
   }
 
@@ -702,7 +782,7 @@
     const overrides = new Map<string, { videoSourceId?: string | null; audioSourceId?: string | null }>();
     for (const ch of $channels) {
       const best = ($actions.filter((a): a is RecordAction => a.type === 'record' && a.channelId === ch.id))
-        .filter(a => actionStates[a.id]?.status === 'active')
+        .filter(a => $actionStates[a.id]?.status === 'active')
         .sort((a, b) => b.priority - a.priority)[0];
       if (best) {
         let videoSourceId: string | null = null;
@@ -731,7 +811,7 @@
 
     if (!eligible.length) return null;
 
-    const active = eligible.filter(e => actionStates[e.action.id]?.status === 'active');
+    const active = eligible.filter(e => $actionStates[e.action.id]?.status === 'active');
     if (active.length) return active.sort((a, b) => b.action.priority - a.action.priority)[0].cap;
     return eligible.sort((a, b) => a.action.priority - b.action.priority)[0].cap;
   }
@@ -759,22 +839,21 @@
   async function _startRecorderForChannel(channelId: string, captureType: 'video' | 'audio', cap: CaptureMethod) {
     const ch = get(channels).find(c => c.id === channelId);
     if (!ch || cap.type === 'photo') return;
+    const chName = ch.name;
 
     const mimeType = _selectMimeType(cap);
     const videoBps = captureType === 'video' ? ((cap as { videoBitsPerSec?: number }).videoBitsPerSec ?? 0) || 500_000 : undefined;
     const audioBps = 'audioBitsPerSec' in cap && cap.audioBitsPerSec > 0 ? cap.audioBitsPerSec : 64_000;
 
+    const sourceStream = openStreams.get(cap.sourceId);
+    if (!sourceStream) return;
     let recordStream: MediaStream;
     if (captureType === 'video') {
-      const videoStream = ch.videoSourceId ? openStreams.get(ch.videoSourceId) : null;
-      if (!videoStream) return;
-      const tracks = videoStream.getVideoTracks();
+      const tracks = sourceStream.getVideoTracks();
       if (!tracks.length) return;
       recordStream = new MediaStream(tracks);
     } else {
-      const audioStream = ch.audioSourceId ? openStreams.get(ch.audioSourceId) : null;
-      if (!audioStream) return;
-      const tracks = audioStream.getAudioTracks();
+      const tracks = sourceStream.getAudioTracks();
       if (!tracks.length) return;
       recordStream = new MediaStream(tracks);
     }
@@ -800,8 +879,8 @@
         const segEnd = currentSlot.segmentStart;
         if (blob.size > 0 && $identity) {
           try {
-            await saveSegment(blob, mimeType, segBegin, segEnd, $identity.pubkey, channelId);
-            dbg('info', 'idb', `segment saved ch:${channelId}/${captureType} [${segBegin}–${segEnd}] ${blob.size}B`);
+            await saveSegment(blob, mimeType, segBegin, segEnd, $identity.pubkey, chName);
+            dbg('info', 'idb', `segment saved ch:${chName}/${captureType} [${segBegin}–${segEnd}] ${blob.size}B`);
           } catch (err) {
             dbg('warn', 'idb', `segment save failed: ${err instanceof Error ? err.message : String(err)}`);
           }
@@ -859,7 +938,7 @@
     const clipActions = $links
       .filter(l => l.enabled && l.sensorIds.includes(sensorId))
       .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
-      .filter((a): a is ClipAction => a?.type === 'clip' && actionStates[a.id]?.status === 'active');
+      .filter((a): a is ClipAction => a?.type === 'clip' && $actionStates[a.id]?.status === 'active');
 
     for (const action of clipActions) {
       if (isStoring(get(monitorState))) {
@@ -872,7 +951,7 @@
       .filter(l => l.enabled && l.sensorIds.includes(sensorId))
       .flatMap(l => l.actionIds.map(id => $actions.find(a => a.id === id)))
       .filter((a): a is SnapshotAction =>
-        a?.type === 'snapshot' && a.snapshotCount > 0 && actionStates[a.id]?.status === 'active'
+        a?.type === 'snapshot' && a.snapshotCount > 0 && $actionStates[a.id]?.status === 'active'
       );
 
     for (const action of snapActions) {
@@ -881,6 +960,7 @@
       if (cap?.type !== 'photo') continue;
       const stream = openStreams.get(cap.sourceId);
       if (!stream) continue;
+      const chName = get(channels).find(c => c.id === action.channelId)?.name ?? action.channelId;
       capturePhotosOnTrigger(stream, {
         snapshotCount: action.snapshotCount,
         intervalSec: action.intervalSec,
@@ -888,7 +968,7 @@
         imageHeight: cap.imageHeight,
         imageQuality: cap.imageQuality,
         imageFormat: cap.imageFormat,
-      }, $identity.pubkey, evt.timestamp, action.channelId)
+      }, $identity.pubkey, evt.timestamp, chName)
         .then(async ids => {
           if (!ids.length) return;
           dbg('info', 'detector', `${ids.length} snapshot(s) stored for action ${action.name || action.id}`);
@@ -896,7 +976,7 @@
             const now = Math.floor(Date.now() / 1000);
             const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
             const spanEnd = evt.timestamp + (action.snapshotCount - 1) * Math.max(action.intervalSec, 1) + 2;
-            await pinRange(evt.timestamp, spanEnd, until, 'image/', action.channelId);
+            await pinRange(evt.timestamp, spanEnd, until, 'image/', chName);
           }
         })
         .catch(err => dbg('warn', 'detector', `snapshot error: ${err instanceof Error ? err.message : err}`));
@@ -990,7 +1070,7 @@
     }
     dbg('info', 'idb', `clip session closed: ${s.refId.slice(0, 8)}… [${s.startTime}–${s.endTime}]`);
     const id = get(identity);
-    if (!id || !isPublishing(get(monitorState)) || cfg.pauseNostr) return;
+    if (!id || !isPublishing(get(monitorState)) || !get(nostrOnline)) return;
     const relays = getRelays();
     const preRoll = action?.type === 'clip' ? action.preRollSec : 30;
     for (const device of get(pairedDevices)) {
@@ -1039,17 +1119,19 @@
     setMonitorRollingBuffer(null);
     setMonitorStream(null);
     stopAllMonitorSessions();
-    sensorStates = {};
-    actionStates = {};
-    notifyCooldowns.clear();
+    $sensorStates = {};
+    $actionStates = {};
+    notifyStates.clear();
     activeAlerts = [];
     monitorSnapshot = null;
     transitionMonitor('idle');
+    _publishArmState(false).catch(() => {});
   }
 
   onDestroy(() => {
     stopMonitor();
-    stopRouter();
+    signalSub?.close();
+    signalSub = null;
     clearInterval(sessionTick);
     if (cleanupTimer !== null) clearInterval(cleanupTimer);
   });
@@ -1116,9 +1198,8 @@
     : isActive                    ? { label: 'RUNNING',          color: 'var(--color-success)' }
     : sessions.some(s => s.iceState === 'connected' || s.iceState === 'completed')
                                   ? { label: 'CONNECTED',        color: 'var(--color-accent)'  }
-    : signalRouterActive && autoAccept
-                                  ? { label: 'LISTENING · AUTO', color: 'var(--color-warning)' }
-    : signalRouterActive          ? { label: 'LISTENING',        color: 'var(--color-warning)' }
+    : $nostrOnline && autoAccept  ? { label: 'LISTENING · AUTO', color: 'var(--color-warning)' }
+    : $nostrOnline                ? { label: 'LISTENING',        color: 'var(--color-warning)' }
                                   : { label: 'IDLE',             color: 'var(--color-border)'  }
   );
 
@@ -1193,7 +1274,7 @@
 
       <div class="ps-header">Sensors</div>
       {#each $sensors.filter(s => s.enabled) as sensor (sensor.id)}
-        {@const st = sensorStates[sensor.id]}
+        {@const st = $sensorStates[sensor.id]}
         <div class="ps-row">
           <span class="ps-badge {sensor.type === 'nostr-trigger' ? 'nostr' : sensor.type === 'schedule' || sensor.type === 'timewindow' || sensor.type === 'daterange' ? 'sched' : 'audio'}">
             {sensor.type === 'schedule' ? 'TIMER' : sensor.type === 'timewindow' ? 'TIME' : sensor.type === 'daterange' ? 'DATE' : sensor.type === 'nostr-trigger' ? 'NOSTR' : 'AUDIO'}
@@ -1208,7 +1289,7 @@
 
       <div class="ps-header">Actions</div>
       {#each actionsData.filter(a => $links.some(l => l.enabled && l.actionIds.includes(a.id))) as action (action.id)}
-        {@const st = actionStates[action.id]}
+        {@const st = $actionStates[action.id]}
         {@const session = action.type === 'clip' ? activeAlerts.find(a => a.actionId === action.id) : null}
         <div class="ps-row">
           <span class="ps-badge {action.type === 'record' ? 'link-actv' : action.type === 'clip' ? 'link-pin' : action.type === 'snapshot' ? 'link-photo' : 'link-act'}">
@@ -1246,23 +1327,11 @@
   <div class="rtc-section">
     <div class="rtc-section-title">Remote Viewing</div>
 
-    <div class="setting-row">
-      <div class="setting-info">
-        <span class="setting-lbl">Accept viewer connections</span>
-        <span class="setting-desc">Listen for incoming WebRTC requests via Nostr</span>
-      </div>
-      <button class="setting-toggle" aria-pressed={signalRouterActive}
-        style="background:{signalRouterActive ? 'var(--color-accent)' : 'var(--color-border)'}"
-        onclick={() => signalRouterActive ? stopRouter() : startRouter()}>
-        <span class="toggle-thumb" style="transform:translateX({signalRouterActive ? '14px' : '2px'})"></span>
-      </button>
-    </div>
-
-    {#if signalRouterActive}
+    {#if $nostrOnline}
     <div class="setting-row">
       <div class="setting-info">
         <span class="setting-lbl">Auto-accept requests</span>
-        <span class="setting-desc">Approve without manual confirmation</span>
+        <span class="setting-desc">Approve incoming WebRTC connections without manual confirmation</span>
       </div>
       <button class="setting-toggle" aria-pressed={autoAccept}
         style="background:{autoAccept ? 'var(--color-success)' : 'var(--color-border)'}"
@@ -1270,6 +1339,8 @@
         <span class="toggle-thumb" style="transform:translateX({autoAccept ? '14px' : '2px'})"></span>
       </button>
     </div>
+    {:else}
+    <div class="rtc-offline-note">Go online to accept viewer connections</div>
     {/if}
 
     {#if sessions.length > 0}
@@ -1350,6 +1421,7 @@
 
   .rtc-section { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
   .rtc-section-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--color-muted); margin-bottom: 4px; }
+  .rtc-offline-note { font-size: 10px; color: var(--color-muted); font-style: italic; padding: 4px 0; }
 
   .setting-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--color-border); }
   .setting-row:last-child { border-bottom: none; }

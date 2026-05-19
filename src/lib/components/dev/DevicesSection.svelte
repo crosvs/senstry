@@ -1,13 +1,17 @@
 <script lang="ts">
   import { identity, pairedDevices, removePairedDevice } from '$lib/store/identity';
+  import { settings } from '$lib/store/settings';
   import {
     getDistinctOriginMonitors, clearForMonitor, cleanupOrphanedOpfsFiles,
     type Segment
   } from '$lib/db/segments';
   import { getAllFootageRefs, clearFootageRefsForMonitor } from '$lib/db/footage';
-  import { getViewerSessionInfos } from '$lib/webrtc/viewer-peer';
+  import { getViewerSessionInfos, connectToMonitor, cancelConnect, disconnectViewer } from '$lib/webrtc/viewer-peer';
   import { getMonitorSessionInfos } from '$lib/webrtc/monitor-peer';
   import { sendSignal } from '$lib/webrtc/signaling';
+  import { peerStatuses } from '$lib/store/peer-status';
+  import { nostrOnline, nostrOfflineReason, goOnline, goOffline } from '$lib/store/nostr-online';
+  import { viewerConnection } from '$lib/store/viewer-connection';
   import DevSection from './DevSection.svelte';
   import { onDestroy } from 'svelte';
 
@@ -22,14 +26,8 @@
     alertCount: number;
   }
 
-  interface PingState {
-    status: 'pinging' | 'sent' | 'timeout' | 'error';
-    latencyMs?: number;
-    error?: string;
-  }
-
   let stats = $state<Record<string, DevStats>>({});
-  let pingStates = $state<Record<string, PingState>>({});
+  let pendingStatus = $state<Record<string, boolean>>({});
   let orphanedPubkeys = $state<string[]>([]);
   let loading = $state(false);
 
@@ -129,27 +127,38 @@
     }
   }
 
-  // ── Ping ──────────────────────────────────────────────────────────────────
-  async function ping(pubkey: string) {
+  // ── Status request ───────────────────────────────────────────────────────
+  async function requestStatus(pubkey: string) {
     if (!$identity) return;
-    const sessionId = crypto.randomUUID();
-    const t0 = Date.now();
-    pingStates = { ...pingStates, [pubkey]: { status: 'pinging' } };
+    pendingStatus = { ...pendingStatus, [pubkey]: true };
     const timer = setTimeout(() => {
-      if (pingStates[pubkey]?.status === 'pinging') {
-        pingStates = { ...pingStates, [pubkey]: { status: 'timeout' } };
-      }
+      pendingStatus = { ...pendingStatus, [pubkey]: false };
     }, 5000);
     try {
-      await sendSignal($identity.privkey, $identity.pubkey, pubkey, { type: 'ping', sessionId });
+      await sendSignal($identity.privkey, $identity.pubkey, pubkey, {
+        type: 'status-request', sessionId: crypto.randomUUID(),
+      });
+    } catch {
       clearTimeout(timer);
-      if (pingStates[pubkey]?.status === 'pinging') {
-        pingStates = { ...pingStates, [pubkey]: { status: 'sent', latencyMs: Date.now() - t0 } };
-      }
-    } catch (e) {
-      clearTimeout(timer);
-      pingStates = { ...pingStates, [pubkey]: { status: 'error', error: e instanceof Error ? e.message : 'Failed' } };
+      pendingStatus = { ...pendingStatus, [pubkey]: false };
     }
+  }
+
+  function fmtAge(updatedAt: number): string {
+    const ageSec = Math.floor(Date.now() / 1000) - updatedAt;
+    if (ageSec < 60) return `${ageSec}s ago`;
+    if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m ago`;
+    if (ageSec < 86400) return `${Math.floor(ageSec / 3600)}h ago`;
+    return `${Math.floor(ageSec / 86400)}d ago`;
+  }
+
+  // ── Connection ───────────────────────────────────────────────────────────
+  const vc = $derived($viewerConnection);
+
+  async function handleConnect(pk: string) {
+    if (!$identity) return;
+    try { await connectToMonitor($identity.privkey, $identity.pubkey, pk); }
+    catch { /* status='failed' written to store */ }
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -197,6 +206,12 @@
         <div class="card-top">
           <span class="role-badge own">OWN</span>
           <span class="device-name">This device</span>
+          {#if $nostrOnline}
+            <span class="status-dot online" title="Online">●</span>
+            <span class="status-age">online</span>
+          {:else if $nostrOfflineReason}
+            <span class="status-dot offline" title={$nostrOfflineReason}>⚠</span>
+          {/if}
           <span class="stats-line">{statsLine(ownPk)}</span>
           {#if viewers > 0}
             <span class="rtc-pill active">{viewers} viewer{viewers !== 1 ? 's' : ''}</span>
@@ -206,6 +221,12 @@
           <button class="pk-chip" onclick={() => navigator.clipboard.writeText(ownPk)} title={ownPk}>
             {ownPk.slice(0, 12)}…
           </button>
+          {#if $nostrOnline}
+            <button class="act-btn online-pill" onclick={() => goOffline().catch(() => {})}>● Online</button>
+          {:else}
+            <button class="act-btn accent" onclick={() => goOnline().catch(() => {})}
+              disabled={!$settings.relayUrl}>Go Online</button>
+          {/if}
           <span class="spacer"></span>
           <button
             class="act-btn"
@@ -224,12 +245,16 @@
       {@const pk = dev.pubkey}
       {@const isSelected = selectedMonitorPubkey === pk}
       {@const rtc = rtcFor(pk)}
-      {@const p = pingStates[pk]}
+      {@const ps = $peerStatuses[pk]}
       {@const blockReason = unpairBlockReason(pk)}
       <div class="device-card" class:is-selected={isSelected}>
         <div class="card-top">
           <span class="role-badge paired">PAIRED</span>
           <span class="device-name">{dev.nickname}</span>
+          {#if ps}
+            <span class="status-dot" class:online={ps.state === 'online'} class:offline={ps.state === 'offline'} title="{ps.state} · {fmtAge(ps.updatedAt)}">●</span>
+            <span class="status-age">{ps.state} · {fmtAge(ps.updatedAt)}</span>
+          {/if}
           <span class="stats-line">{statsLine(pk)}</span>
           {#if rtc.viewing}
             <span class="rtc-pill active">● viewing</span>
@@ -242,25 +267,14 @@
           <button class="pk-chip" onclick={() => navigator.clipboard.writeText(pk)} title={pk}>
             {pk.slice(0, 12)}…
           </button>
-          <!-- Ping -->
+          <!-- Status request -->
           <button
-            class="act-btn ping-btn"
-            class:ping-ok={p?.status === 'sent'}
-            class:ping-warn={p?.status === 'timeout'}
-            class:ping-err={p?.status === 'error'}
-            disabled={p?.status === 'pinging'}
-            onclick={() => ping(pk)}
-            title={p?.status === 'error' ? p.error : undefined}
+            class="act-btn"
+            disabled={!$nostrOnline || (pendingStatus[pk] ?? false)}
+            onclick={() => requestStatus(pk)}
+            title={!$nostrOnline ? 'Go online to request status' : 'Ask this device to report its current status'}
           >
-            {#if !p || p.status === 'pinging'}
-              {p?.status === 'pinging' ? '…' : 'Ping'}
-            {:else if p.status === 'sent'}
-              ✓ {p.latencyMs}ms
-            {:else if p.status === 'timeout'}
-              ⚠ no reply
-            {:else if p.status === 'error'}
-              ✗ error
-            {/if}
+            {(pendingStatus[pk] ?? false) ? '…' : 'Status?'}
           </button>
           <span class="spacer"></span>
           <!-- Select -->
@@ -286,6 +300,29 @@
             Unpair
           </button>
         </div>
+        {#if isSelected}
+          <div class="card-conn">
+            {#if vc.status === 'connecting'}
+              <span class="conn-dot">◌</span>
+              <span class="conn-label">Connecting…</span>
+              <button class="act-btn" onclick={() => cancelConnect(pk)}>Cancel</button>
+            {:else if vc.status === 'online'}
+              <span class="conn-dot ok">●</span>
+              <span class="conn-label ok">Online{vc.mode === 'live' ? ' · Live' : ''}</span>
+              <button class="act-btn" onclick={() => disconnectViewer(pk)}>Disconnect</button>
+            {:else if vc.status === 'failed'}
+              <span class="conn-dot err">✗</span>
+              <span class="conn-label err">{vc.error}</span>
+              <button class="act-btn accent" onclick={() => handleConnect(pk)}
+                disabled={!$identity || !$nostrOnline || $peerStatuses[pk]?.state === 'offline'}
+                title={!$nostrOnline ? 'Go online first' : $peerStatuses[pk]?.state === 'offline' ? 'Device is offline' : undefined}>Retry</button>
+            {:else}
+              <button class="act-btn accent" onclick={() => handleConnect(pk)}
+                disabled={!$identity || !$nostrOnline || $peerStatuses[pk]?.state === 'offline'}
+                title={!$nostrOnline ? 'Go online first' : $peerStatuses[pk]?.state === 'offline' ? 'Device is offline' : undefined}>Connect</button>
+            {/if}
+          </div>
+        {/if}
       </div>
     {/each}
 
@@ -318,6 +355,29 @@
             <button class="act-btn danger-soft" onclick={() => clearData(pk)}>Clear data</button>
           {/if}
         </div>
+        {#if isSelected}
+          <div class="card-conn">
+            {#if vc.status === 'connecting'}
+              <span class="conn-dot">◌</span>
+              <span class="conn-label">Connecting…</span>
+              <button class="act-btn" onclick={() => cancelConnect(pk)}>Cancel</button>
+            {:else if vc.status === 'online'}
+              <span class="conn-dot ok">●</span>
+              <span class="conn-label ok">Online{vc.mode === 'live' ? ' · Live' : ''}</span>
+              <button class="act-btn" onclick={() => disconnectViewer(pk)}>Disconnect</button>
+            {:else if vc.status === 'failed'}
+              <span class="conn-dot err">✗</span>
+              <span class="conn-label err">{vc.error}</span>
+              <button class="act-btn accent" onclick={() => handleConnect(pk)}
+                disabled={!$identity || !$nostrOnline}
+                title={!$nostrOnline ? 'Go online first' : undefined}>Retry</button>
+            {:else}
+              <button class="act-btn accent" onclick={() => handleConnect(pk)}
+                disabled={!$identity || !$nostrOnline}
+                title={!$nostrOnline ? 'Go online first' : undefined}>Connect</button>
+            {/if}
+          </div>
+        {/if}
       </div>
     {/each}
 
@@ -402,10 +462,26 @@
   .act-btn.danger-soft { border-color: rgba(239,68,68,0.3); color: var(--color-danger); opacity: 0.7; }
   .act-btn.danger-soft:hover:not(:disabled) { opacity: 1; }
 
-  .ping-btn { min-width: 68px; }
-  .ping-btn.ping-ok  { color: var(--color-success); border-color: rgba(34,197,94,0.3); }
-  .ping-btn.ping-warn { color: var(--color-warning); border-color: rgba(251,191,36,0.3); }
-  .ping-btn.ping-err  { color: var(--color-danger);  border-color: rgba(239,68,68,0.3); }
+  .status-dot { font-size: 9px; flex-shrink: 0; }
+  .status-dot.online  { color: var(--color-success); }
+  .status-dot.offline { color: var(--color-border); }
+  .status-age { font-size: 9px; color: var(--color-muted); white-space: nowrap; }
+  .online-pill { color: var(--color-success); border-color: rgba(34,197,94,0.35); font-weight: 600; }
+  .online-pill:hover:not(:disabled) { background: rgba(34,197,94,0.08); }
 
   .empty { font-size: 11px; color: var(--color-muted); text-align: center; padding: 10px 0; }
+
+  .card-conn {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 4px 8px;
+    background: rgba(255,255,255,0.015);
+    border-top: 1px solid var(--color-border);
+    font-size: 10px;
+  }
+  .conn-dot    { font-size: 9px; color: var(--color-muted); }
+  .conn-dot.ok  { color: var(--color-success); }
+  .conn-dot.err { color: var(--color-danger); }
+  .conn-label   { color: var(--color-muted); }
+  .conn-label.ok  { color: var(--color-success); }
+  .conn-label.err { color: var(--color-danger); }
 </style>

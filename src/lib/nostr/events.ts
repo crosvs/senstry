@@ -60,23 +60,27 @@ export function buildTriggerEvent(
 	monitorPubkey: string,
 	viewerPubkey: string,
 	detectionType: string,
-	sensorState: 'sensing' | 'active' | 'idle',
+	sensorState: 'active' | 'idle',
 	monitorLabel: string,
 	data: Record<string, unknown>,
 	footageRefId: string | null = null,
 	channelId: string | null = null,
 	sensorTiming: { minDurationMs: number; settlingMs: number } = { minDurationMs: 0, settlingMs: 0 },
 	messageTemplate?: string,
-	includeData = true
+	includeData = true,
+	maxDurationMs?: number,
+	onRetrigger?: 'ignore' | 'extend' | 'restart',
 ): NostrEvent {
 	const content = encrypt(privkey, viewerPubkey, JSON.stringify({
 		type: detectionType,
 		sensorState,
 		channelId,
-		sensorTiming,
+		...(sensorState === 'active' && { sensorTiming }),
+		...(maxDurationMs !== undefined && { maxDurationMs }),
+		...(onRetrigger !== undefined && { onRetrigger }),
 		monitorLabel,
 		timestamp: Math.floor(Date.now() / 1000),
-		...(includeData && { data }),
+		...(includeData && sensorState === 'active' && { data }),
 		...(messageTemplate && { message: messageTemplate }),
 		footageRefId
 	}));
@@ -97,12 +101,14 @@ export function buildArmState(
 	privkey: Uint8Array,
 	monitorPubkey: string,
 	viewerPubkey: string,
-	armed: boolean
+	armed: boolean,
+	sensorStates?: Record<string, { status: string }>,
 ): NostrEvent {
 	const content = encrypt(privkey, viewerPubkey, JSON.stringify({
 		type: 'arm-state',
 		armed,
-		timestamp: Math.floor(Date.now() / 1000)
+		timestamp: Math.floor(Date.now() / 1000),
+		...(sensorStates && { sensorStates }),
 	}));
 	return finalizeEvent({
 		kind: KIND_ARM_STATE,

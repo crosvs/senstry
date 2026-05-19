@@ -146,6 +146,8 @@ interface RecordAction {
 }
 ```
 
+When a `RecordAction` activates, `SentrySection._updateChannelActiveSources()` reads `cap.sourceId` from each `CaptureMethod` in `action.captureIds` to determine which sources to push to the live RTC compositor. **Do not read `ChannelConfig.videoSourceId`/`audioSourceId` for this purpose** — those are fallback defaults for the live stream, not the recording source.
+
 #### ClipAction
 
 Protects a footage window from eviction (pins it).

@@ -6,7 +6,6 @@ export const DEFAULT_RELAY = 'wss://relay.damus.io';
 export interface AppSettings {
 	relayUrl: string;
 	selfLabel: string;
-	pauseNostr: boolean;
 	storeEvents: boolean;
 	rtcIdleTimeoutMs: number;
 	nostrRateLimit: number;  // events per minute, default 200
@@ -15,7 +14,6 @@ export interface AppSettings {
 const defaults: AppSettings = {
 	relayUrl: DEFAULT_RELAY,
 	selfLabel: 'Monitor',
-	pauseNostr: false,
 	storeEvents: true,
 	rtcIdleTimeoutMs: 120_000,
 	nostrRateLimit: 200,

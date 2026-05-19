@@ -1,3 +1,5 @@
+import { get } from 'svelte/store';
+import { nostrOnline } from '$lib/store/nostr-online';
 import { publish } from './client';
 import {
 	KIND_INVITE_ACK, KIND_SIGNAL, KIND_TRIGGER, KIND_ARM_STATE,
@@ -53,6 +55,7 @@ export class OutboxFlusher {
 
 	async flush(): Promise<void> {
 		if (this.paused) return;
+		if (!get(nostrOnline)) return;
 
 		// Sort oldest-first so early events aren't starved when the queue is large,
 		// then cap the batch to avoid relay bursts after long offline periods.

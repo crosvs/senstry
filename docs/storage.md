@@ -58,6 +58,8 @@ Each file is named by the segment's UUID. There is no subdirectory structure. Th
 
 `getCoverageMap(originMonitor?, mimePrefix?, channelId?)` — merges overlapping segments into continuous `[start, end]` intervals.
 
+`getDistinctChannels(originMonitor?)` — returns the sorted list of distinct `channelId` values stored in IDB for the given monitor (or all monitors if omitted). Used by ContentViewerSection and SegmentStorageSection to populate channel filter dropdowns, and by the `segment-channels-request` data channel handler on the monitor side.
+
 ## Segment Pinning
 
 The `pinnedUntil` field controls eviction eligibility:
@@ -129,6 +131,8 @@ Footage refs are published to Nostr as kind 30020 (NIP-33 parameterized-replacea
 ## Outbox
 
 Nostr events that fail to publish immediately are queued in the `outbox` IDB store. `outboxFlusher` (started in `+page.svelte` via `onMount`) polls the queue and retries. Status values: `queued`, `published`, `failed`.
+
+The flusher is gated on `nostrOnline` — it returns immediately if Nostr is offline. `clearQueued()` marks all currently-queued items as `failed`; it is called by `goOffline()` to prevent a burst of stale events from firing on the next reconnect.
 
 ## Quota Management
 

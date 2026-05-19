@@ -10,20 +10,19 @@
     autoNameSensor, autoNameCapture, autoNameAction, autoNameChannel, autoNameLink,
     type SourceConfig, type SensorConfig, type CaptureMethod, type ChannelConfig,
     type Action, type RecordAction, type ClipAction, type SnapshotAction, type NotifyAction,
-    type Link, type SensorState, type ActionState, type StorageCleanupConfig, type ThinningRule,
+    type Link, type StorageCleanupConfig, type ThinningRule,
   } from '$lib/store/pipeline';
   import type { AlertSession } from './SentrySection.svelte';
+  import { sensorStates, actionStates } from '$lib/store/monitor-runtime';
   import { pairedDevices } from '$lib/store/identity';
   import DevSection from './DevSection.svelte';
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
 
   interface Props {
-    sensorStates?: Record<string, SensorState>;
-    actionStates?: Record<string, ActionState>;
     activeAlerts?: AlertSession[];
   }
-  let { sensorStates = {}, actionStates = {}, activeAlerts = [] }: Props = $props();
+  let { activeAlerts = [] }: Props = $props();
 
   let showRaw = $state(false);
   let saveFlash = $state(false);
@@ -40,7 +39,6 @@
   // General settings local state
   let localRelayUrl        = $state('');
   let localSelfLabel       = $state('Monitor');
-  let localPauseNostr      = $state(false);
   let localNostrRateLimit  = $state(200);
   let localRtcIdleTimeoutS = $state(120);
 
@@ -120,7 +118,6 @@
     const s = get(settings);
     localRelayUrl        = s.relayUrl;
     localSelfLabel       = s.selfLabel;
-    localPauseNostr      = s.pauseNostr;
     localNostrRateLimit  = s.nostrRateLimit;
     localRtcIdleTimeoutS = Math.round(s.rtcIdleTimeoutMs / 1000);
     localStorageCleanup = { ...get(storageCleanup) };
@@ -146,7 +143,6 @@
         ...get(settings),
         relayUrl:         localRelayUrl,
         selfLabel:        localSelfLabel,
-        pauseNostr:       localPauseNostr,
         nostrRateLimit:   localNostrRateLimit,
         rtcIdleTimeoutMs: localRtcIdleTimeoutS * 1000,
       });
@@ -171,7 +167,6 @@
     localLinks    = DEFAULT_LINKS.map(l => ({ ...l }));
     const { DEFAULT_RELAY } = await import('$lib/store/settings');
     localRelayUrl        = DEFAULT_RELAY;
-    localPauseNostr      = false;
     localNostrRateLimit  = 200;
     localRtcIdleTimeoutS = 120;
     localStorageCleanup  = {
@@ -202,7 +197,7 @@
   });
 
   function sensorBadge(id: string): { label: string; kind: string } {
-    const s = sensorStates[id];
+    const s = $sensorStates[id];
     if (!s || s.status === 'inactive') return { label: 'INACTIVE', kind: 'inactive' };
     if (s.status === 'idle') {
       if (s.nextFireAt != null) {
@@ -223,7 +218,7 @@
   }
 
   function actionBadge(id: string): { label: string; kind: string } {
-    const s = actionStates[id];
+    const s = $actionStates[id];
     if (!s || s.status === 'idle') return { label: 'IDLE', kind: 'idle' };
     if (s.status === 'active')
       return { label: `ACTIVE ${((now - s.startedAt) / 1000).toFixed(1)}s`, kind: 'active' };
@@ -263,7 +258,7 @@
   }
 
   function compatibleSources(captureType: CaptureMethod['type']): SourceConfig[] {
-    if (captureType === 'audio') return localSources.filter(s => s.type === 'microphone');
+    if (captureType === 'audio') return localSources.filter(s => s.type === 'microphone' || s.type === 'screen');
     return localSources.filter(s => s.type === 'camera' || s.type === 'screen');
   }
 
@@ -329,8 +324,8 @@
 
 <DevSection title="Settings">
   {#snippet summary()}
-    {#if Object.values(sensorStates).some(s => s.status === 'active')}
-      ACTIVE · {Object.values(sensorStates).filter(s => s.status === 'active').length} sensor{Object.values(sensorStates).filter(s => s.status === 'active').length === 1 ? '' : 's'}
+    {#if Object.values($sensorStates).some(s => s.status === 'active')}
+      ACTIVE · {Object.values($sensorStates).filter(s => s.status === 'active').length} sensor{Object.values($sensorStates).filter(s => s.status === 'active').length === 1 ? '' : 's'}
     {:else if activeAlerts.length > 0}
       CLIP · {activeAlerts.length} active
     {:else}
@@ -1016,27 +1011,6 @@
               value={act.messageTemplate ?? ''}
               oninput={(e) => { if (act.type === 'notify') act.messageTemplate = (e.target as HTMLInputElement).value || undefined; }} />
           </label>
-          <div class="field-row full-row">
-            <span class="field-lbl">Publish on</span>
-            <div class="checkbox-group">
-              {#each ['sensing', 'active', 'idle'] as st}
-                <label class="check-label">
-                  <input type="checkbox"
-                    checked={act.publishStates?.includes(st as 'sensing' | 'active' | 'idle')}
-                    onchange={(e) => {
-                      const checked = (e.target as HTMLInputElement).checked;
-                      if (act.type === 'notify') {
-                        const cur = act.publishStates ?? [];
-                        act.publishStates = checked
-                          ? [...cur, st as 'sensing' | 'active' | 'idle']
-                          : cur.filter(s => s !== st);
-                      }
-                    }} />
-                  {st}
-                </label>
-              {/each}
-            </div>
-          </div>
         {/if}
 
       </div>
@@ -1142,13 +1116,6 @@
       <label class="field-row full-row">
         <span class="field-lbl">Self label</span>
         <input class="name-input flex1" type="text" bind:value={localSelfLabel} />
-      </label>
-      <label class="field-row">
-        <span class="field-lbl">Pause Nostr</span>
-        <button class="toggle-pill" style="background:{localPauseNostr ? 'var(--color-warning)' : 'var(--color-border)'}"
-          onclick={() => { localPauseNostr = !localPauseNostr; }}>
-          <span class="pill-thumb" style="transform:translateX({localPauseNostr ? '14px' : '2px'})"></span>
-        </button>
       </label>
       <label class="field-row">
         <span class="field-lbl">Rate limit</span>

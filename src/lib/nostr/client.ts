@@ -1,6 +1,7 @@
 import { SimplePool } from 'nostr-tools/pool';
 import type { NostrEvent, Filter } from 'nostr-tools';
 import { dbg } from '$lib/store/debug';
+import { reportPublishError, reportPublishSuccess } from '$lib/store/nostr-online';
 
 let pool: SimplePool | null = null;
 let relayUrls: string[] = [];
@@ -162,8 +163,11 @@ export async function publish(
 		const raw = (failed[0] as PromiseRejectedResult).reason;
 		const msg = raw instanceof Error ? raw.message : String(raw);
 		dbg('error', 'nostr', `all relays rejected kind:${event.kind} id:${event.id.slice(0, 8)}: ${msg}`);
-		throw new Error(`publish failed: ${msg}`);
+		const err = new Error(`publish failed: ${msg}`);
+		reportPublishError(err);
+		throw err;
 	}
+	reportPublishSuccess();
 	if (failed.length > 0) {
 		const raw = (failed[0] as PromiseRejectedResult).reason;
 		const msg = raw instanceof Error ? raw.message : String(raw);

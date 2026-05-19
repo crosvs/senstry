@@ -11,7 +11,7 @@ Nostr is used exclusively as a **signaling and notification channel** — no med
 
 | Kind | Name | Direction | Encryption | Description |
 |------|------|-----------|------------|-------------|
-| 1059 | Signal (gift-wrap) | Both | NIP-59 + NIP-44 | All WebRTC signaling (offer-request, offer, answer, hangup, ping, pong) |
+| 1059 | Signal (gift-wrap) | Both | NIP-59 + NIP-44 | All WebRTC signaling (offer-request, offer, answer, hangup, ping, pong, status, status-request) |
 | 5000 | Invite Ack | Viewer → Monitor | NIP-44 | Pairing acknowledgement with scanner pubkey + relay list |
 | 5010 | Trigger | Monitor → Viewer | NIP-44 | Detection event (sensor fired, with metadata) |
 | 5011 | Arm State | Monitor → Viewer | NIP-44 | Monitor armed or disarmed |
@@ -54,6 +54,76 @@ The inner rumor is a real signed event (kind 5001) that includes:
 giftWrap(inner: NostrEvent, senderPrivkey: Uint8Array, recipientPubkey: string): NostrEvent
 giftUnwrap(outer: NostrEvent, receiverPrivkey: Uint8Array): NostrEvent  // returns inner rumor
 ```
+
+## Nostr Online Gate (`store/nostr-online.ts`)
+
+`nostrOnline` is a writable boolean store that gates all Nostr activity. No publish or signal is sent while it is `false`.
+
+```typescript
+export const nostrOnline = writable(false);
+export const nostrOfflineReason = writable<string | null>(null);
+```
+
+### `goOnline()` / `goOffline()`
+
+`goOnline()` sets `nostrOnline = true`. `SentrySection`'s `$effect` observes this and opens the signal router, then broadcasts an online announcement.
+
+`goOffline()` must send the offline signal **before** setting `nostrOnline = false` so the signal can still publish:
+1. Broadcasts `{ type: 'status', state: 'offline' }` to all paired devices
+2. Calls `clearQueued()` — marks all pending outbox items as failed
+3. Sets `nostrOnline = false`
+
+### Auto-offline on relay errors
+
+`reportPublishError(err)` is called by `client.ts` on every all-relay publish failure:
+- Ignores `'rate-limited'` (local token bucket, not a relay error)
+- Counts `'publish failed:'` and `'no relays configured'` errors
+- After 3 consecutive failures: sets `nostrOfflineReason` and calls `goOffline()`
+- `reportPublishSuccess()` resets the counter on any successful publish
+
+## Presence / Status Protocol
+
+Devices communicate Nostr online/offline status using `status` and `status-request` signal messages (kind 1059 gift-wrap, `STATUS_TTL_S = 3600` — accepted up to 1 hour after inner `created_at`).
+
+### Announcement vs. awareness reply
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `isAnnounce: true` | present | "I just came online" broadcast to all paired devices |
+| `isAnnounce` | absent | Awareness reply — "I see you, I'm also online" |
+
+Only `isAnnounce: true` triggers an auto-reply. Awareness replies do not, preventing feedback loops.
+
+### Protocol flow
+
+```
+Device A goes online
+  → sends { type: 'status', state: 'online', isAnnounce: true } to all paired
+
+Device B receives (if fresh ≤15s AND startup grace expired AND per-peer cooldown cleared)
+  → calls updatePeerStatus('A', 'online', createdAt)
+  → replies { type: 'status', state: 'online' }  (no isAnnounce)
+
+Device A receives reply
+  → calls updatePeerStatus('B', 'online', createdAt)
+  → does NOT reply (no isAnnounce in received message)
+```
+
+**Rate-limit protection**: Three independent guards prevent awareness reply bursts on aggressive public relays (e.g. damus.io):
+
+| Guard | Where | Value | Purpose |
+|-------|-------|-------|---------|
+| Startup grace | `signal-router.ts` | 20s after `startSignalRouter()` | Reserves rate-limit budget for WebRTC handshake at startup |
+| Per-peer awareness cooldown | `signal-router.ts` | 60s per sender pubkey | Prevents reply bursts on relay replay/reconnect |
+| Announcement cooldown | `SentrySection.startRouter()` | 60s per paired device | Prevents double announcements when relay URL changes |
+
+`status-request` messages bypass the startup grace — they always get an immediate reply (used by the "Status?" button).
+
+The `peerStatuses` store (`store/peer-status.ts`) holds the known state per pubkey. `updatePeerStatus` has a freshness guard using inner event `createdAt` — stale relay replays never overwrite a newer known state.
+
+### Status request
+
+The "Status?" button in DevicesSection sends `{ type: 'status-request' }`. The signal router auto-replies with the current online status without routing to application code.
 
 ## Client (`nostr/client.ts`)
 
@@ -105,6 +175,8 @@ Tags on the outer kind 5010 event:
 ## Outbox
 
 Events that fail to publish (relay offline, rate limit, network error) are queued in IDB `outbox` store. `outboxFlusher` runs in `+page.svelte` and retries queued events. This ensures no triggers are lost during transient relay outages.
+
+The flusher is gated on `nostrOnline` — it returns early if Nostr is offline, preventing blind retries that would accumulate and burst on reconnect. `clearQueued()` marks all queued items as `failed` immediately when going offline.
 
 ## Keys (`nostr/keys.ts`)
 

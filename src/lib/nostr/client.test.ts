@@ -16,6 +16,7 @@ vi.mock('nostr-tools/pool', () => ({
 import {
 	setRelays, getRelays, publish, subscribe,
 	setRateLimit, getRateLimitAvailable, getPublishRate,
+	getCooldownRemaining, clearCooldown,
 	_resetForTest,
 } from './client';
 import type { NostrEvent } from 'nostr-tools';
@@ -162,5 +163,63 @@ describe('subscribe', () => {
 		onevent(ev);
 
 		expect(handler).toHaveBeenCalledWith(ev);
+	});
+});
+
+// ── publish cooldownKey ───────────────────────────────────────────────────────
+
+describe('publish cooldownKey', () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+		// Set a fixed point in time AFTER the outer beforeEach ran (real time ≈ May 2026),
+		// then call _resetForTest() so the token bucket's lastRefill aligns with fake time.
+		vi.setSystemTime(new Date('2026-07-01T00:00:00Z'));
+		_resetForTest();
+		setRelays([RELAY]);
+		setRateLimit(200);
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it('getCooldownRemaining returns 0 when no cooldown is active', () => {
+		expect(getCooldownRemaining('key-a')).toBe(0);
+	});
+
+	it('first publish with cooldownKey succeeds and sets cooldown', async () => {
+		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 })).resolves.toBeUndefined();
+		expect(getCooldownRemaining('k')).toBeGreaterThan(0);
+	});
+
+	it('second publish within cooldown throws "cooldown" and does not call relay', async () => {
+		await publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 });
+		mockPublish.mockClear();
+		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 })).rejects.toThrow('cooldown');
+		expect(mockPublish).not.toHaveBeenCalled();
+	});
+
+	it('publish succeeds again after cooldown expires', async () => {
+		await publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 });
+		vi.advanceTimersByTime(10_001);
+		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 })).resolves.toBeUndefined();
+	});
+
+	it('clearCooldown removes an active cooldown', async () => {
+		await publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 60_000 });
+		clearCooldown('k');
+		expect(getCooldownRemaining('k')).toBe(0);
+		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 60_000 })).resolves.toBeUndefined();
+	});
+
+	it('cooldownMs=0 / undefined does not set a cooldown after publish', async () => {
+		await publish(makeEvent(), { cooldownKey: 'k' }); // no cooldownMs
+		expect(getCooldownRemaining('k')).toBe(0);
+	});
+
+	it('independent cooldown keys do not interfere', async () => {
+		await publish(makeEvent(), { cooldownKey: 'a', cooldownMs: 10_000 });
+		// 'b' has no cooldown — should publish fine
+		await expect(publish(makeEvent(), { cooldownKey: 'b', cooldownMs: 10_000 })).resolves.toBeUndefined();
 	});
 });

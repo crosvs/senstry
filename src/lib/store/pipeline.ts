@@ -108,11 +108,10 @@ export interface NotifyAction {
 	name: string;
 	type: 'notify';
 	cooldownMs: number;
-	onRetrigger: 'ignore' | 'extend' | 'restart'; // behaviour when sensor fires during cooldown
+	onRetrigger: 'ignore' | 'extend' | 'restart';
 	includeData: boolean;
 	messageTemplate?: string;
 	viewerPubkey: string | null;    // null = broadcast to all paired devices
-	publishStates: ('sensing' | 'active' | 'idle')[];
 }
 
 export type Action = RecordAction | ClipAction | SnapshotAction | NotifyAction;
@@ -265,7 +264,7 @@ export const DEFAULT_ACTIONS: Action[] = [
 	{
 		id: 'default-notify', name: '', type: 'notify',
 		cooldownMs: 30_000, onRetrigger: 'ignore', includeData: true,
-		viewerPubkey: null, publishStates: ['active'], messageTemplate: 'Loud noise detected',
+		viewerPubkey: null, messageTemplate: 'Loud noise detected',
 	},
 ];
 
@@ -362,11 +361,15 @@ export async function loadPipeline(): Promise<void> {
 		await putSetting('pipeline.nostrActions', null);
 	} else {
 		if (ac?.length) {
-			// Backfill onRetrigger on NotifyActions that predate the field, and
-			// coerce null pinLifetimeSec on ClipActions to 0 (pin forever).
+			// Backfill onRetrigger on NotifyActions that predate the field,
+			// strip publishStates (removed), coerce null pinLifetimeSec on ClipActions.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			actions.set(ac.map((a: any): Action => {
-				if (a.type === 'notify' && !('onRetrigger' in a)) return { ...a, onRetrigger: 'ignore' } as NotifyAction;
+				if (a.type === 'notify') {
+					// eslint-disable-next-line @typescript-eslint/no-unused-vars
+					const { publishStates: _ps, onRetrigger, ...rest } = a;
+					return { ...rest, onRetrigger: onRetrigger ?? 'ignore' } as NotifyAction;
+				}
 				if (a.type === 'clip' && a.pinLifetimeSec == null) return { ...a, pinLifetimeSec: 7 * 24 * 3600 } as ClipAction;
 				return a as Action;
 			}));
@@ -379,7 +382,6 @@ export async function loadPipeline(): Promise<void> {
 				includeData: a.includeData ?? true,
 				messageTemplate: a.messageTemplate,
 				viewerPubkey: a.viewerPubkey ?? null,
-				publishStates: a.publishStates ?? ['active'],
 			}));
 			const merged = [...DEFAULT_ACTIONS.filter(a => a.type !== 'notify'), ...notifyActions];
 			await savePipeline({ actions: merged });
@@ -430,7 +432,6 @@ function _migrateTypedLinks(oldLinks: any[], oldNostrActions: any[]): { newActio
 			includeData: na.includeData ?? true,
 			messageTemplate: na.messageTemplate,
 			viewerPubkey: na.viewerPubkey ?? null,
-			publishStates: na.publishStates ?? ['active'],
 		});
 	}
 
@@ -494,13 +495,8 @@ function _migrateTypedLinks(oldLinks: any[], oldNostrActions: any[]): { newActio
 				act = {
 					id: l.nostrActionId || `act-notify-${l.id}`, name: '',
 					type: 'notify', cooldownMs: 30_000, onRetrigger: 'ignore' as const,
-					includeData: true, viewerPubkey: null, publishStates: l.publishStates ?? ['active'],
+					includeData: true, viewerPubkey: null,
 				};
-				notifyMap.set(act.id, act);
-			} else {
-				// Merge publishStates from link into action
-				const extra = (l.publishStates ?? []).filter((s: string) => !act!.publishStates.includes(s as 'sensing' | 'active' | 'idle'));
-				if (extra.length) act = { ...act, publishStates: [...act.publishStates, ...extra] as ('sensing' | 'active' | 'idle')[] };
 				notifyMap.set(act.id, act);
 			}
 			newLinks.push({ id: `lnk-${l.id}`, name: l.name ?? '', enabled: l.enabled ?? true, sensorIds, condition: 'any', onState, actionIds: [act.id] });
@@ -563,7 +559,7 @@ async function _migrateFromLegacy(): Promise<void> {
 		const notifyAction: NotifyAction = {
 			id: `notify-${t.id}`, name: '', type: 'notify',
 			cooldownMs: t.notifyCooldownMs ?? 30_000, onRetrigger: 'ignore',
-			includeData: true, viewerPubkey: null, publishStates: ['active'],
+			includeData: true, viewerPubkey: null,
 		};
 		newActions.push(notifyAction);
 
@@ -705,7 +701,7 @@ export function newSnapshotAction(channelId: string): SnapshotAction {
 }
 
 export function newNotifyAction(): NotifyAction {
-	return { id: randomUUID(), name: '', type: 'notify', cooldownMs: 30_000, onRetrigger: 'ignore', includeData: true, viewerPubkey: null, publishStates: ['active'] };
+	return { id: randomUUID(), name: '', type: 'notify', cooldownMs: 30_000, onRetrigger: 'ignore', includeData: true, viewerPubkey: null };
 }
 
 // ── Auto-name utilities ───────────────────────────────────────────────────────

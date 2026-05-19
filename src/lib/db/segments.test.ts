@@ -3,6 +3,7 @@ import { IDBFactory } from 'fake-indexeddb';
 import {
 	saveSegment, pinRange, getSegmentById, getSegmentsInRange,
 	getCoverageMap, clearForMonitor, getStorageUsed,
+	getCoverageByChannel, getDistinctChannels,
 	MAX_ROLLING_SEGMENTS, SEGMENT_DURATION_S, setMonitorRollingBuffer,
 	_setTestBlobStore, _resetOpfsDirForTest,
 } from './segments';
@@ -239,5 +240,102 @@ describe('getStorageUsed', () => {
 		await saveSegment(b, 'audio/webm', 0, 10, MONITOR_A, 'default-mic');
 		await saveSegment(b, 'audio/webm', 0, 10, MONITOR_B, 'default-mic');
 		expect(await getStorageUsed(MONITOR_A)).toBe(3);
+	});
+});
+
+// ── getCoverageByChannel ──────────────────────────────────────────────────────
+
+describe('getCoverageByChannel', () => {
+	it('returns an empty object when no segments exist', async () => {
+		expect(await getCoverageByChannel()).toEqual({});
+	});
+
+	it('groups segments by channelId and merges contiguous intervals', async () => {
+		await saveSegment(blob(), 'audio/webm',  0, 10, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm', 10, 20, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm', 20, 30, MONITOR_A, 'cam');
+
+		const result = await getCoverageByChannel(MONITOR_A);
+		expect(result['cam']).toEqual([[0, 30]]);
+	});
+
+	it('produces separate ranges for gaps within a channel', async () => {
+		await saveSegment(blob(), 'audio/webm',  0, 10, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm', 20, 30, MONITOR_A, 'cam'); // gap at [10, 20]
+
+		const result = await getCoverageByChannel(MONITOR_A);
+		expect(result['cam']).toEqual([[0, 10], [20, 30]]);
+	});
+
+	it('produces independent coverage for each channel', async () => {
+		await saveSegment(blob(), 'audio/webm',  0, 10, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm',  5, 15, MONITOR_A, 'mic');
+
+		const result = await getCoverageByChannel(MONITOR_A);
+		expect(result['cam']).toEqual([[0, 10]]);
+		expect(result['mic']).toEqual([[5, 15]]);
+	});
+
+	it('filters by originMonitor', async () => {
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_B, 'cam');
+
+		const result = await getCoverageByChannel(MONITOR_A);
+		expect(Object.keys(result)).toHaveLength(1);
+		expect(result['cam']).toEqual([[0, 10]]);
+	});
+
+	it('filters by mimePrefix', async () => {
+		await saveSegment(blob(), 'video/webm', 0, 10, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_A, 'mic');
+
+		const resultVideo = await getCoverageByChannel(MONITOR_A, 'video/');
+		expect(resultVideo['cam']).toBeDefined();
+		expect(resultVideo['mic']).toBeUndefined();
+	});
+});
+
+// ── getDistinctChannels ───────────────────────────────────────────────────────
+
+describe('getDistinctChannels', () => {
+	it('returns an empty array when no segments exist', async () => {
+		expect(await getDistinctChannels()).toEqual([]);
+	});
+
+	it('returns deduplicated channel names sorted alphabetically', async () => {
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_A, 'zzz');
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_A, 'aaa');
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_A, 'aaa'); // duplicate
+		expect(await getDistinctChannels(MONITOR_A)).toEqual(['aaa', 'zzz']);
+	});
+
+	it('filters by originMonitor', async () => {
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_A, 'cam');
+		await saveSegment(blob(), 'audio/webm', 0, 10, MONITOR_B, 'other-cam');
+		expect(await getDistinctChannels(MONITOR_A)).toEqual(['cam']);
+	});
+
+	it('with from/to range, only returns channels with segments in that window', async () => {
+		await saveSegment(blob(), 'audio/webm',  0, 10, MONITOR_A, 'early');
+		await saveSegment(blob(), 'audio/webm', 50, 60, MONITOR_A, 'late');
+
+		// Query the [40, 70] window — only 'late' overlaps
+		const channels = await getDistinctChannels(MONITOR_A, 40, 70);
+		expect(channels).toEqual(['late']);
+	});
+
+	it('range filter includes segments that partially overlap the window', async () => {
+		// Segment [0, 15] overlaps with query window [10, 30]
+		await saveSegment(blob(), 'audio/webm',  0, 15, MONITOR_A, 'overlap');
+		await saveSegment(blob(), 'audio/webm', 50, 60, MONITOR_A, 'outside');
+
+		const channels = await getDistinctChannels(MONITOR_A, 10, 30);
+		expect(channels).toEqual(['overlap']);
+	});
+
+	it('without range, returns all channels regardless of time', async () => {
+		await saveSegment(blob(), 'audio/webm',  0, 10, MONITOR_A, 'early');
+		await saveSegment(blob(), 'audio/webm', 50, 60, MONITOR_A, 'late');
+		expect(await getDistinctChannels(MONITOR_A)).toEqual(['early', 'late']);
 	});
 });

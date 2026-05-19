@@ -1,12 +1,12 @@
 <script lang="ts">
   import { identity } from '$lib/store/identity';
-  import { channels } from '$lib/store/pipeline';
   import {
-    ensureConnection, requestCoverageMap,
+    requestCoverageMap, requestChannelCoverage,
     requestSegment, requestSegmentById,
     requestSegmentsAfter, requestSegmentsBefore,
   } from '$lib/webrtc/viewer-peer';
-  import { getSegmentById, getSegmentsInRange, getSegmentsAfter, getSegmentsBefore, saveSegment, getCoverageMap } from '$lib/db/segments';
+  import { viewerConnection } from '$lib/store/viewer-connection';
+  import { getSegmentById, getSegmentsInRange, getSegmentsAfter, getSegmentsBefore, saveSegment, getCoverageMap, getCoverageByChannel, getDistinctChannels } from '$lib/db/segments';
   import { getFootageRef } from '$lib/db/footage';
   import { dbg } from '$lib/store/debug';
   import { untrack } from 'svelte';
@@ -68,7 +68,22 @@
     endTime: number;
     blob: Blob;
     url: string;
+    channelId?: string;
   }
+
+  let channelPriority = $state<string[]>([]);
+
+  // Per-channel coverage map — populated by coverage fetch (local IDB or RTC).
+  // Keys are channel names; values are merged [startTime, endTime] intervals.
+  let coverageByChannel = $state<Record<string, [number, number][]>>({});
+
+  // Channel IDs discovered from local IDB before any coverage fetch.
+  let localChannelIds = $state<string[]>([]);
+
+  // '' = all channels; non-empty = filter fetch/IDB queries to this channel
+  let fetchChannelFilter = $state('');
+  // '' = all channels; non-empty = filter player to this channel only on Load Fetched
+  let playerChannelFilter = $state('');
 
   let playerSegs = $state<PlayerSeg[]>([]);
   let playerStatus = $state('');
@@ -85,14 +100,22 @@
 
   let playerVolume = $state(1);
 
-  // Video segment covering the current position
-  const playerCurVideo = $derived(
-    playerSegs.find(s => s.mimeType.startsWith('video/') && s.startTime <= playerPosition && s.endTime > playerPosition) ?? null
-  );
-  // Audio segment covering the current position
-  const playerCurAudio = $derived(
-    playerSegs.find(s => s.mimeType.startsWith('audio/') && s.startTime <= playerPosition && s.endTime > playerPosition) ?? null
-  );
+  // Video segment covering the current position — prefer highest-priority channel
+  const playerCurVideo = $derived((() => {
+    for (const chId of channelPriority) {
+      const seg = playerSegs.find(s => s.channelId === chId && s.mimeType.startsWith('video/') && s.startTime <= playerPosition && s.endTime > playerPosition);
+      if (seg) return seg;
+    }
+    return playerSegs.find(s => s.mimeType.startsWith('video/') && s.startTime <= playerPosition && s.endTime > playerPosition) ?? null;
+  })());
+  // Audio segment covering the current position — prefer highest-priority channel
+  const playerCurAudio = $derived((() => {
+    for (const chId of channelPriority) {
+      const seg = playerSegs.find(s => s.channelId === chId && s.mimeType.startsWith('audio/') && s.startTime <= playerPosition && s.endTime > playerPosition);
+      if (seg) return seg;
+    }
+    return playerSegs.find(s => s.mimeType.startsWith('audio/') && s.startTime <= playerPosition && s.endTime > playerPosition) ?? null;
+  })());
   // Most recently ended video segment (position has moved past its endTime)
   const playerLastEndedVideo = $derived(
     [...playerSegs.filter(s => s.mimeType.startsWith('video/') && s.endTime <= playerPosition)]
@@ -238,7 +261,10 @@
     if (playerAudioEl) { playerAudioEl.removeAttribute('data-seg-key'); playerAudioEl.removeAttribute('src'); }
     if (playerImgEl)   { playerImgEl.removeAttribute('data-seg-key'); playerImgEl.removeAttribute('src'); }
 
-    const inRange = fetchedSegs.filter(s => s.startTime < to && s.endTime > from);
+    const inRange = fetchedSegs.filter(s =>
+      s.startTime < to && s.endTime > from &&
+      (!playerChannelFilter || s.channelId === playerChannelFilter)
+    );
     if (inRange.length === 0) {
       playerStatus = '✗ No fetched segments in range — fetch some first';
       return;
@@ -251,6 +277,7 @@
       endTime: s.endTime,
       blob: s.blob,
       url: URL.createObjectURL(s.blob),
+      channelId: s.channelId,
     }));
     loaded.sort((a, b) => a.startTime - b.startTime);
     playerSegs = loaded;
@@ -260,7 +287,8 @@
     playerStatus = `✓ ${loaded.length} segment${loaded.length !== 1 ? 's' : ''} — ${vCount}v ${aCount}a ${pCount}p`;
   }
 
-  let fetchChannelId = $state('');
+  const vc = $derived($viewerConnection);
+  const isOnline = $derived(vc.status === 'online');
 
   // ── Segment Viewer (in fetched-segments area) ────────────────────────────
   interface FetchedSeg {
@@ -272,9 +300,72 @@
     blob: Blob;
     segmentId?: string;
     backupOf?: string | null;
+    channelId?: string;
   }
 
   let fetchedSegs = $state<FetchedSeg[]>([]);
+
+  // Distinct channels present in the fetched list — drives the priority reorder UI.
+  const fetchedChannelIds = $derived(
+    [...new Set(fetchedSegs.map(s => s.channelId).filter((id): id is string => !!id))]
+  );
+
+  // All known channel IDs: from coverage map, IDB discovery, and fetched segments.
+  // Filtered to channels that overlap the current time range when coverage data is available.
+  const knownChannelIds = $derived((() => {
+    const all = [...new Set([...Object.keys(coverageByChannel), ...localChannelIds, ...fetchedChannelIds])];
+    const range = parseRangeInput(rangeTs);
+    if (!range || Object.keys(coverageByChannel).length === 0) return all.sort();
+    const [from, to] = range;
+    return all.filter(ch => {
+      const ranges = coverageByChannel[ch];
+      if (!ranges) return true; // discovered but no coverage data — include it
+      return ranges.some(([s, e]) => e >= from && s <= to);
+    }).sort();
+  })());
+
+  // Reset channel state on device switch; populate basic channel list from local IDB.
+  $effect(() => {
+    const effectivePubkey = selectedMonitorPubkey ?? $identity?.pubkey;
+    localChannelIds = [];
+    coverageByChannel = {};
+    fetchChannelFilter = '';
+    playerChannelFilter = '';
+    if (effectivePubkey) {
+      getDistinctChannels(effectivePubkey).then(ids => { localChannelIds = ids; });
+    }
+  });
+
+  // Auto-clear channel filters when the selected channel is no longer in the visible list.
+  $effect(() => {
+    const ids = knownChannelIds;
+    if (fetchChannelFilter && !ids.includes(fetchChannelFilter)) fetchChannelFilter = '';
+    if (playerChannelFilter && !ids.includes(playerChannelFilter)) playerChannelFilter = '';
+  });
+
+  // Sync channelPriority when new channels appear in fetchedSegs (preserve existing order).
+  $effect(() => {
+    const chIds = fetchedChannelIds;
+    const current = untrack(() => channelPriority);
+    channelPriority = [
+      ...current.filter(id => chIds.includes(id)),
+      ...chIds.filter(id => !current.includes(id)),
+    ];
+  });
+
+  function moveChannelUp(i: number) {
+    if (i <= 0) return;
+    const copy = [...channelPriority];
+    [copy[i - 1], copy[i]] = [copy[i], copy[i - 1]];
+    channelPriority = copy;
+  }
+  function moveChannelDown(i: number) {
+    if (i >= channelPriority.length - 1) return;
+    const copy = [...channelPriority];
+    [copy[i], copy[i + 1]] = [copy[i + 1], copy[i]];
+    channelPriority = copy;
+  }
+
   let currentIdx = $state(-1);
   let currentViewerUrl = $state<string | null>(null);
   let autoPlayNext = $state(false);
@@ -408,8 +499,8 @@
 
       if (effectivePubkey) {
         const metas = dir === 'after'
-          ? await getSegmentsAfter(refTime, ADJACENT_COUNT, effectivePubkey, undefined, fetchChannelId || undefined)
-          : await getSegmentsBefore(refTime, ADJACENT_COUNT, effectivePubkey, undefined, fetchChannelId || undefined);
+          ? await getSegmentsAfter(refTime, ADJACENT_COUNT, effectivePubkey, undefined, fetchChannelFilter || undefined)
+          : await getSegmentsBefore(refTime, ADJACENT_COUNT, effectivePubkey, undefined, fetchChannelFilter || undefined);
 
         const filtered = metas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
         for (const meta of filtered) {
@@ -418,7 +509,7 @@
           const withBlob = await getSegmentById(meta.segmentId);
           if (!withBlob) continue;
           const blob = await materializeBlob(withBlob.blob, withBlob.mimeType);
-          pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
+          pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf, channelId: withBlob.channelId });
           added++;
         }
       }
@@ -436,7 +527,7 @@
             if (fetchedSegs.some(s => s.key === key || s.segmentId === meta.segmentId)) continue;
             try {
               const res = await requestSegmentById(meta.segmentId, $identity.privkey, $identity.pubkey, selectedMonitorPubkey);
-              pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined });
+              pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined, channelId: res.channelId });
               added++;
             } catch { continue; }
           }
@@ -471,15 +562,26 @@
 
   async function requestRemoteCoverage() {
     if (!$identity || !selectedMonitorPubkey) { remoteCoverageStatus = 'Select a monitor device first'; return; }
-    remoteCoverageLoading = true; remoteCoverageStatus = 'Connecting…'; remoteCoverage = null;
+    remoteCoverageLoading = true; remoteCoverageStatus = 'Requesting…'; remoteCoverage = null;
+    const privkey = $identity.privkey;
+    const viewerPubkey = $identity.pubkey;
+    const monitorPubkey = selectedMonitorPubkey;
     try {
-      await ensureConnection($identity.privkey, $identity.pubkey, selectedMonitorPubkey, 'data');
-      remoteCoverageStatus = 'Requesting…';
-      const map = await requestCoverageMap($identity.privkey, $identity.pubkey, selectedMonitorPubkey);
-      remoteCoverage = map;
-      remoteCoverageStatus = map.length ? `✓ ${map.length} range${map.length !== 1 ? 's' : ''}` : '✓ No footage';
-    } catch (e) {
-      remoteCoverageStatus = `✗ ${e instanceof Error ? e.message : 'Failed'}`;
+      const [coverageResult, channelCoverageResult] = await Promise.allSettled([
+        requestCoverageMap(privkey, viewerPubkey, monitorPubkey),
+        requestChannelCoverage(privkey, viewerPubkey, monitorPubkey),
+      ]);
+      if (coverageResult.status === 'fulfilled') {
+        remoteCoverage = coverageResult.value;
+        remoteCoverageStatus = coverageResult.value.length
+          ? `✓ ${coverageResult.value.length} range${coverageResult.value.length !== 1 ? 's' : ''}`
+          : '✓ No footage';
+      } else {
+        remoteCoverageStatus = `✗ ${coverageResult.reason instanceof Error ? coverageResult.reason.message : 'Failed'}`;
+      }
+      if (channelCoverageResult.status === 'fulfilled') {
+        coverageByChannel = { ...coverageByChannel, ...channelCoverageResult.value };
+      }
     } finally { remoteCoverageLoading = false; }
   }
 
@@ -488,9 +590,13 @@
     if (!effectivePubkey) { localCoverageStatus = 'No device selected'; return; }
     localCoverageLoading = true; localCoverageStatus = 'Reading IDB…'; localCoverage = null;
     try {
-      const map = await getCoverageMap(effectivePubkey, undefined, fetchChannelId || undefined);
+      const [map, byChannel] = await Promise.all([
+        getCoverageMap(effectivePubkey, undefined, fetchChannelFilter || undefined),
+        getCoverageByChannel(effectivePubkey),
+      ]);
       localCoverage = map;
       localCoverageStatus = map.length ? `✓ ${map.length} range${map.length !== 1 ? 's' : ''}` : '✓ Nothing stored';
+      coverageByChannel = { ...coverageByChannel, ...byChannel };
     } catch (e) {
       localCoverageStatus = `✗ ${e instanceof Error ? e.message : 'Failed'}`;
     } finally { localCoverageLoading = false; }
@@ -535,7 +641,7 @@
 
     fetchLoading = true; fetchStatus = 'Querying local IDB…';
     try {
-      const metas = await getSegmentsInRange(from, to, effectivePubkey, fetchChannelId || undefined);
+      const metas = await getSegmentsInRange(from, to, effectivePubkey, fetchChannelFilter || undefined);
       const filtered = metas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
       if (filtered.length === 0) { fetchStatus = '✗ No local segments in range for selected types'; fetchLoading = false; return; }
 
@@ -548,7 +654,7 @@
         if (!withBlob) continue;
         existing.add(key);
         const blob = await materializeBlob(withBlob.blob, withBlob.mimeType);
-        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
+        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf, channelId: withBlob.channelId });
         added++;
       }
       fetchStatus = added === 0 ? '✗ No new segments' : `✓ ${added} local segment${added !== 1 ? 's' : ''}`;
@@ -566,7 +672,7 @@
 
     fetchLoading = true; fetchStatus = 'Checking local IDB…';
     try {
-      const localMetas = await getSegmentsInRange(from, to, effectivePubkey, fetchChannelId || undefined);
+      const localMetas = await getSegmentsInRange(from, to, effectivePubkey, fetchChannelFilter || undefined);
       const localFiltered = localMetas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
       const existing = new Set(fetchedSegs.map(s => s.key));
       let added = 0;
@@ -578,7 +684,7 @@
         if (!withBlob) continue;
         existing.add(key);
         const blob = await materializeBlob(withBlob.blob, withBlob.mimeType);
-        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf });
+        pushSeg({ key, source: 'idb', mimeType: withBlob.mimeType, startTime: withBlob.startTime, endTime: withBlob.endTime, blob, segmentId: withBlob.segmentId, backupOf: withBlob.backupOf, channelId: withBlob.channelId });
         added++;
       }
 
@@ -589,8 +695,6 @@
       }
 
       if (selectedMonitorPubkey) {
-        fetchStatus = 'Connecting for gap-fill…';
-        await ensureConnection($identity.privkey, $identity.pubkey, selectedMonitorPubkey, 'data');
         const MAX = 100;
 
         for (const mimePrefix of fetchTypeFilter) {
@@ -615,7 +719,7 @@
                 const key = `rtc-${res.startTime}-${res.endTime}-${res.mimeType.split('/')[0]}`;
                 if (!existing.has(key)) {
                   existing.add(key);
-                  pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined });
+                  pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined, channelId: res.channelId });
                   added++;
                   if (res.segmentId && localBackupOfIds.has(res.segmentId)) savedKeys = new Set([...savedKeys, key]);
                 }
@@ -645,8 +749,6 @@
     const MAX = 100;
 
     try {
-      await ensureConnection($identity.privkey, $identity.pubkey, selectedMonitorPubkey, 'data');
-
       for (const mimePrefix of fetchTypeFilter) {
         if (added >= MAX) break;
         fetchStatus = `Getting ${TYPE_LABELS[mimePrefix]} coverage…`;
@@ -666,7 +768,7 @@
               const key = `rtc-${res.startTime}-${res.endTime}-${res.mimeType.split('/')[0]}`;
               if (!existing.has(key)) {
                 existing.add(key);
-                pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined });
+                pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined, channelId: res.channelId });
                 added++;
               }
               t = res.endTime > t ? res.endTime : t + step;
@@ -696,7 +798,7 @@
     try {
       const res = await requestSegmentById(id, $identity.privkey, $identity.pubkey, selectedMonitorPubkey);
       const key = `rtc-id-${id}`;
-      pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined });
+      pushSeg({ key, source: 'rtc', mimeType: res.mimeType, startTime: res.startTime, endTime: res.endTime, blob: res.blob, segmentId: res.segmentId || undefined, channelId: res.channelId });
       showSeg(fetchedSegs.findIndex(s => s.key === key));
       segIdStatus = `✓ ${res.mimeType} [${fmtTs(res.startTime)}–${fmtTs(res.endTime)}]`;
     } catch (e) {
@@ -720,7 +822,7 @@
       if (seg) {
         const key = `idb-${seg.segmentId}`;
         const blob = await materializeBlob(seg.blob, seg.mimeType);
-        pushSeg({ key, source: 'idb', mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, blob, segmentId: seg.segmentId, backupOf: seg.backupOf });
+        pushSeg({ key, source: 'idb', mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, blob, segmentId: seg.segmentId, backupOf: seg.backupOf, channelId: seg.channelId });
         showSeg(fetchedSegs.findIndex(s => s.key === key));
         segIdStatus = `✓ Local [${fmtTs(seg.startTime)}–${fmtTs(seg.endTime)}]`;
       } else {
@@ -742,7 +844,7 @@
     if (savedKeys.has(seg.key) || savingKeys.has(seg.key)) return;
     savingKeys = new Set([...savingKeys, seg.key]);
     try {
-      await saveSegment(seg.blob, seg.mimeType, seg.startTime, seg.endTime, selectedMonitorPubkey, 'default-channel', seg.segmentId ?? null);
+      await saveSegment(seg.blob, seg.mimeType, seg.startTime, seg.endTime, selectedMonitorPubkey, seg.channelId ?? 'default-channel', seg.segmentId ?? null);
       savedKeys = new Set([...savedKeys, seg.key]);
       dbg('info', 'idb', `saved remote segment [${fmtTs(seg.startTime)}–${fmtTs(seg.endTime)}] as monitor ${selectedMonitorPubkey.slice(0, 8)}`);
     } catch (e) {
@@ -767,91 +869,23 @@
   });
 </script>
 
-<DevSection title="Content Viewer">
+<DevSection title="Fetch Content">
 
-  <!-- ── General Player ───────────────────────────────────────────────────── -->
-  <div class="subsec-title">Player</div>
-
-  <div class="player-box">
-    <!-- Video always rendered; visibility controlled by style so bind:this is always resolved -->
-    <video bind:this={playerVideoEl}
-      style:display={playerCurVideo || playerShowLastFrame ? 'block' : 'none'}
-      class="player-media" playsinline></video>
-    <img bind:this={playerImgEl} alt="Snapshot"
-      style:display={!playerCurVideo && !playerShowLastFrame && playerCurPhoto ? 'block' : 'none'}
-      class="player-media" />
-    {#if !playerCurVideo && !playerShowLastFrame && !playerCurPhoto}
-      <div class="player-empty">
-        {#if !playerSegs.length}No segments loaded — fetch segments below, then click Load Fetched{:else}No footage at this position{/if}
-      </div>
-    {/if}
-  </div>
-  <!-- Audio always rendered (hidden) -->
-  <audio bind:this={playerAudioEl} style="display:none"></audio>
-
-  <!-- Scrubber + controls -->
-  {#if playerSegs.length > 0}
-    <div class="player-scrubber-row">
-      <input type="range"
-        min={playerRangeFrom} max={playerRangeTo} step={1}
-        value={playerPosition}
-        oninput={(e) => playerSeekTo(+(e.target as HTMLInputElement).value)}
-        class="player-scrubber" />
-    </div>
-  {/if}
-
-  <div class="row" style="gap:6px">
-    <button class="act-btn accent" onclick={playerPlaying ? playerPause : playerPlay}
-      disabled={!playerSegs.length}>
-      {playerPlaying ? '⏸ Pause' : '▶ Play'}
-    </button>
-    <button class="act-btn" onclick={playerStop} disabled={!playerSegs.length} title="Stop and return to start">
-      ■ Stop
-    </button>
-    {#if playerSegs.length > 0}
-      <span class="player-pos">
-        {fmtTs(playerPosition)}
-        {#if playerRangeTo > playerRangeFrom}
-          · +{fmtDur(Math.round(playerPosition - playerRangeFrom))} / {fmtDur(playerRangeTo - playerRangeFrom)}
-        {/if}
-        {#if playerCurVideo && playerCurAudio}· video+audio
-        {:else if playerCurVideo}· video
-        {:else if playerCurAudio}· audio
-        {:else if playerShowLastFrame}· last frame
-        {:else if playerCurPhoto}· photo
-        {/if}
-      </span>
-    {/if}
-    <label class="vol-label" title="Volume">
-      🔊
-      <input type="range" min={0} max={1} step={0.01} bind:value={playerVolume} class="vol-slider" />
-      <span class="vol-pct">{Math.round(playerVolume * 100)}%</span>
-    </label>
-  </div>
-  <div class="row" style="margin-top:2px">
-    <button class="act-btn accent-soft" onclick={loadPlayerSegments} title="Load fetched segments in the time range into the player">
-      Load Fetched
-    </button>
-    {#if playerStatus}
-      <span class="status" class:ok={playerStatus.startsWith('✓')} class:err={playerStatus.startsWith('✗')}>{playerStatus}</span>
-    {/if}
-  </div>
-
-  <!-- ── Time Range + Coverage + Fetch ────────────────────────────────────── -->
-  <div class="subsec-title" style="margin-top:10px">Time Range</div>
+  <!-- ── Time Range + Coverage ────────────────────────────────────────────── -->
+  <div class="subsec-title">Time Range</div>
   <div class="range-row">
     <input type="date" class="date-input" bind:value={rangeDate} onchange={applyDate} />
     <span class="muted-sep">or manually:</span>
     <input class="ts-input" bind:value={rangeTs} placeholder="unix or start-end" style="width:200px" />
   </div>
   <div class="row" style="margin-top:4px">
-    <button class="act-btn accent" onclick={requestRemoteCoverage} disabled={remoteCoverageLoading || !selectedMonitorPubkey}>
+    <button class="act-btn accent" onclick={requestRemoteCoverage} disabled={remoteCoverageLoading || !selectedMonitorPubkey || !isOnline}>
       {remoteCoverageLoading ? 'Requesting…' : 'Remote Coverage'}
     </button>
     <button class="act-btn" onclick={loadLocalCoverage} disabled={localCoverageLoading}>
       {localCoverageLoading ? 'Reading…' : 'Local Coverage'}
     </button>
-    <button class="act-btn accent-soft" onclick={fetchBothCoverage} disabled={bothCoverageLoading || !selectedMonitorPubkey}>
+    <button class="act-btn accent-soft" onclick={fetchBothCoverage} disabled={bothCoverageLoading || !selectedMonitorPubkey || !isOnline}>
       {bothCoverageLoading ? 'Loading…' : 'Local + Remote'}
     </button>
     {#if remoteCoverageStatus}
@@ -896,7 +930,7 @@
     {/if}
   {/if}
 
-  <!-- Type filter + fetch row -->
+  <!-- Type filter + channel + fetch row -->
   <div class="row" style="margin-top:4px; gap:4px;">
     <span class="muted-sep">Types:</span>
     {#each (['video/', 'audio/', 'image/'] as MimePrefix[]) as prefix}
@@ -905,22 +939,40 @@
       </button>
     {/each}
     <span class="muted-sep" style="margin-left:4px">|</span>
-    <select class="source-select" bind:value={fetchChannelId} title="Filter by channel (local fetches and player load)">
-      <option value="">All channels</option>
-      {#each $channels as ch (ch.id)}
-        <option value={ch.id}>{ch.name || ch.id.slice(0, 8)}</option>
+    <select class="source-select"
+      onchange={(e) => { fetchChannelFilter = (e.target as HTMLSelectElement).value; }}
+      disabled={knownChannelIds.length === 0}
+      title={knownChannelIds.length === 0 ? 'Load coverage to discover channels' : 'Filter fetch by channel'}>
+      <option value="" selected={fetchChannelFilter === ''}>All channels</option>
+      {#each knownChannelIds as chId (chId)}
+        <option value={chId} selected={chId === fetchChannelFilter}>{chId}</option>
       {/each}
     </select>
     <span class="muted-sep">|</span>
-    <button class="act-btn accent" onclick={fetchSegmentsInRange} disabled={fetchLoading || !selectedMonitorPubkey}>
+    <button class="act-btn accent" onclick={fetchSegmentsInRange} disabled={fetchLoading || !selectedMonitorPubkey || !isOnline}>
       {fetchLoading ? 'Fetching…' : 'Fetch WebRTC'}
     </button>
     <button class="act-btn" onclick={fetchSegmentsLocal} disabled={fetchLoading}>Fetch Local</button>
-    <button class="act-btn accent-soft" onclick={fetchSegmentsSmart} disabled={fetchLoading}>Smart Fetch</button>
+    <button class="act-btn accent-soft" onclick={fetchSegmentsSmart} disabled={fetchLoading || !isOnline}>Smart Fetch</button>
     {#if fetchStatus}
       <span class="status" class:ok={fetchStatus.startsWith('✓')} class:err={fetchStatus.startsWith('✗')}>{fetchStatus}</span>
     {/if}
   </div>
+
+  <!-- ── Fetch by ID ─────────────────────────────────────────────────────── -->
+  <div class="subsec-title" style="margin-top:8px">Fetch by Segment / Alert ID</div>
+  <div class="row">
+    <input class="id-input" bind:value={segIdInput} placeholder="Segment ID or alert refId" type="text" />
+    <button class="act-btn accent" onclick={fetchByIdRtc} disabled={segIdLoading || !selectedMonitorPubkey || !isOnline}>
+      {segIdLoading ? '…' : 'WebRTC'}
+    </button>
+    <button class="act-btn" onclick={fetchByIdIdb} disabled={segIdLoading}>
+      {segIdLoading ? '…' : 'Local IDB'}
+    </button>
+  </div>
+  {#if segIdStatus}
+    <span class="status" class:ok={segIdStatus.startsWith('✓')} class:err={segIdStatus.startsWith('✗')}>{segIdStatus}</span>
+  {/if}
 
   <!-- ── Fetched Segments ───────────────────────────────────────────────────── -->
   {#if fetchedSegs.length > 0}
@@ -929,6 +981,21 @@
       <button class="raw-toggle" class:active={showRaw} onclick={() => showRaw = !showRaw}>Raw</button>
       <button class="act-btn small-danger" onclick={clearSegments}>Clear All</button>
     </div>
+
+    {#if fetchedChannelIds.length > 1}
+      <div class="priority-row">
+        <span class="muted-sep">Channel priority (player):</span>
+        {#each channelPriority as chId, i (chId)}
+          <span class="prio-chip" title="Player shows this channel's footage when multiple channels cover the same time">
+            <span class="prio-rank">#{i + 1}</span>
+            <span class="prio-name">{chId}</span>
+            {#if i > 0}<button class="prio-btn" onclick={() => moveChannelUp(i)} title="Higher priority">↑</button>{/if}
+            {#if i < channelPriority.length - 1}<button class="prio-btn" onclick={() => moveChannelDown(i)} title="Lower priority">↓</button>{/if}
+          </span>
+        {/each}
+        <span class="muted-sep">· player shows #1 video, #1 audio (fallback to next available)</span>
+      </div>
+    {/if}
 
     <!-- Segment Viewer -->
     <div class="viewer-box">
@@ -1015,8 +1082,8 @@
           <div class="seg-raw">
             <pre>{JSON.stringify(
               seg.source === 'rtc'
-                ? { key: seg.key, source: seg.source, mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, monitorSegmentId: seg.segmentId ?? null, sizeBytes: seg.blob.size }
-                : { key: seg.key, source: seg.source, mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, segmentId: seg.segmentId ?? null, backupOf: seg.backupOf ?? null, sizeBytes: seg.blob.size }
+                ? { key: seg.key, source: seg.source, mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, monitorSegmentId: seg.segmentId ?? null, channelId: seg.channelId ?? null, sizeBytes: seg.blob.size }
+                : { key: seg.key, source: seg.source, mimeType: seg.mimeType, startTime: seg.startTime, endTime: seg.endTime, segmentId: seg.segmentId ?? null, channelId: seg.channelId ?? null, backupOf: seg.backupOf ?? null, sizeBytes: seg.blob.size }
             , null, 2)}</pre>
           </div>
         {/if}
@@ -1024,22 +1091,88 @@
     </div>
   {/if}
 
-  <!-- ── Fetch by ID ─────────────────────────────────────────────────────── -->
-  <div class="subsec-title" style="margin-top:8px">Fetch by Segment / Alert ID</div>
-  <div class="row">
-    <input class="id-input" bind:value={segIdInput} placeholder="Segment ID or alert refId" type="text" />
-    <button class="act-btn accent" onclick={fetchByIdRtc} disabled={segIdLoading || !selectedMonitorPubkey}>
-      {segIdLoading ? '…' : 'WebRTC'}
+  <LogPanel sources={['rtc', 'idb']} />
+</DevSection>
+
+<DevSection title="Fetched Segments Player">
+
+  <!-- Channel filter + Load Fetched -->
+  <div class="row" style="margin-bottom:4px">
+    <select class="source-select"
+      onchange={(e) => { playerChannelFilter = (e.target as HTMLSelectElement).value; }}
+      disabled={knownChannelIds.length === 0}
+      title={knownChannelIds.length === 0 ? 'Load coverage to discover channels' : 'Filter player to a specific channel'}>
+      <option value="" selected={playerChannelFilter === ''}>All channels</option>
+      {#each knownChannelIds as chId (chId)}
+        <option value={chId} selected={chId === playerChannelFilter}>{chId}</option>
+      {/each}
+    </select>
+    <button class="act-btn accent-soft" onclick={loadPlayerSegments} title="Load fetched segments in the time range into the player">
+      Load Fetched
     </button>
-    <button class="act-btn" onclick={fetchByIdIdb} disabled={segIdLoading}>
-      {segIdLoading ? '…' : 'Local IDB'}
-    </button>
+    {#if playerStatus}
+      <span class="status" class:ok={playerStatus.startsWith('✓')} class:err={playerStatus.startsWith('✗')}>{playerStatus}</span>
+    {/if}
   </div>
-  {#if segIdStatus}
-    <span class="status" class:ok={segIdStatus.startsWith('✓')} class:err={segIdStatus.startsWith('✗')}>{segIdStatus}</span>
+
+  <!-- ── General Player ───────────────────────────────────────────────────── -->
+  <div class="player-box">
+    <!-- Video always rendered; visibility controlled by style so bind:this is always resolved -->
+    <video bind:this={playerVideoEl}
+      style:display={playerCurVideo || playerShowLastFrame ? 'block' : 'none'}
+      class="player-media" playsinline></video>
+    <img bind:this={playerImgEl} alt="Snapshot"
+      style:display={!playerCurVideo && !playerShowLastFrame && playerCurPhoto ? 'block' : 'none'}
+      class="player-media" />
+    {#if !playerCurVideo && !playerShowLastFrame && !playerCurPhoto}
+      <div class="player-empty">
+        {#if !playerSegs.length}No segments loaded — fetch content above, then click Load Fetched{:else}No footage at this position{/if}
+      </div>
+    {/if}
+  </div>
+  <!-- Audio always rendered (hidden) -->
+  <audio bind:this={playerAudioEl} style="display:none"></audio>
+
+  <!-- Scrubber + controls -->
+  {#if playerSegs.length > 0}
+    <div class="player-scrubber-row">
+      <input type="range"
+        min={playerRangeFrom} max={playerRangeTo} step={1}
+        value={playerPosition}
+        oninput={(e) => playerSeekTo(+(e.target as HTMLInputElement).value)}
+        class="player-scrubber" />
+    </div>
   {/if}
 
-  <LogPanel sources={['rtc', 'idb']} />
+  <div class="row" style="gap:6px">
+    <button class="act-btn accent" onclick={playerPlaying ? playerPause : playerPlay}
+      disabled={!playerSegs.length}>
+      {playerPlaying ? '⏸ Pause' : '▶ Play'}
+    </button>
+    <button class="act-btn" onclick={playerStop} disabled={!playerSegs.length} title="Stop and return to start">
+      ■ Stop
+    </button>
+    {#if playerSegs.length > 0}
+      <span class="player-pos">
+        {fmtTs(playerPosition)}
+        {#if playerRangeTo > playerRangeFrom}
+          · +{fmtDur(Math.round(playerPosition - playerRangeFrom))} / {fmtDur(playerRangeTo - playerRangeFrom)}
+        {/if}
+        {#if playerCurVideo && playerCurAudio}· video+audio
+        {:else if playerCurVideo}· video
+        {:else if playerCurAudio}· audio
+        {:else if playerShowLastFrame}· last frame
+        {:else if playerCurPhoto}· photo
+        {/if}
+      </span>
+    {/if}
+    <label class="vol-label" title="Volume">
+      🔊
+      <input type="range" min={0} max={1} step={0.01} bind:value={playerVolume} class="vol-slider" />
+      <span class="vol-pct">{Math.round(playerVolume * 100)}%</span>
+    </label>
+  </div>
+
 </DevSection>
 
 <style>
@@ -1145,4 +1278,10 @@
   .status.err { color: var(--color-danger); }
   .source-select { font-size: 10px; padding: 2px 4px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: ui-monospace, monospace; max-width: 160px; }
   .empty { font-size: 11px; color: var(--color-muted); padding: 4px 0; }
+  .priority-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-bottom: 4px; }
+  .prio-chip { display: flex; align-items: center; gap: 2px; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 4px; padding: 1px 4px; font-size: 9px; }
+  .prio-rank { color: var(--color-accent); font-family: ui-monospace, monospace; min-width: 14px; }
+  .prio-name { color: var(--color-text); font-family: ui-monospace, monospace; }
+  .prio-btn { font-size: 9px; padding: 0 3px; border: none; background: none; color: var(--color-muted); cursor: pointer; line-height: 1.2; }
+  .prio-btn:hover { color: var(--color-accent); }
 </style>

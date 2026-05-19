@@ -15,7 +15,7 @@ npm run check      # svelte-check + tsc — run this after every change
 npm run test       # vitest run (unit tests, no browser)
 ```
 
-**Always run `npm run check` after edits.** 0 errors is the bar; the ~11 existing warnings are pre-existing and unrelated to any current work.
+**Always run `npm run check` after edits.** 0 errors is the bar; the ~9 existing warnings are pre-existing and unrelated to any current work.
 
 ## Tech Stack
 
@@ -56,6 +56,8 @@ src/
       pipeline.ts             ← all pipeline types + stores + persistence + migration
       identity.ts             ← keypair + paired devices
       settings.ts             ← app settings (relay, label, rate limit, idle timeout)
+      nostr-online.ts         ← nostrOnline gate + relay error auto-offline
+      peer-status.ts          ← peerStatuses store + updatePeerStatus (presence)
       monitor.ts              ← monitor runtime state enum
       debug.ts                ← dbg() logger with category filter
     detectors/
@@ -66,7 +68,7 @@ src/
       nostr-trigger.ts        ← fires on incoming Nostr trigger events
       photo.ts                ← photo capture helper
     components/dev/
-      SentrySection.svelte    ← arm/disarm, detector loop, action state machine
+      SentrySection.svelte    ← arm/disarm, detector loop, action state machine, signal router lifecycle
       SettingsSection.svelte  ← full pipeline UI (sources, sensors, captures, channels, links, actions)
       LiveViewSection.svelte  ← WebRTC live stream viewer
       ContentViewerSection.svelte ← segment player + fetch UI
@@ -96,6 +98,31 @@ The pipeline uses a two-layer model:
 - **Actions** own their config and runtime state: `RecordAction`, `ClipAction`, `SnapshotAction`, `NotifyAction`
 
 Do not conflate them. `SentrySection` manages `actionStates` (the runtime `Record<actionId, ActionState>`). `SettingsSection` manages the persisted config.
+
+### Nostr Online Gate
+
+`nostrOnline` (in `store/nostr-online.ts`) is the master on/off switch for all Nostr activity. No Nostr event is sent while it is `false`.
+
+- `goOnline()` — sets `nostrOnline = true`; SentrySection's `$effect` opens the signal router and announces `status: online, isAnnounce: true` to all paired devices
+- `goOffline()` — announces `status: offline` to all paired devices FIRST (so the signal can still publish), then calls `clearQueued()` to discard pending outbox items, then sets `nostrOnline = false`
+- Relay errors auto-offline: `reportPublishError` in `client.ts` increments a failure counter; after 3 consecutive all-relay failures it sets `nostrOfflineReason` and calls `goOffline()`. Rate-limit errors (local token bucket) are ignored.
+- The outbox flusher (`nostr/outbox.ts`) is also gated on `nostrOnline` — it returns early if offline.
+- **Monitor continues running when offline.** Going offline/online does not affect monitor state.
+
+### Presence / Status Protocol
+
+Devices announce their Nostr online status to paired devices via `status` signal messages. The protocol avoids feedback loops:
+
+- On `goOnline()`: broadcast `{ type: 'status', state: 'online', isAnnounce: true }` to all paired devices
+- On `goOffline()`: broadcast `{ type: 'status', state: 'offline' }` before disconnecting
+- On receiving `{ isAnnounce: true }` from a fresh event (≤15s old): reply once with `{ type: 'status', state: 'online' }` (no `isAnnounce`) — this is an awareness reply, not a re-announcement
+- Awareness replies do NOT trigger another reply — only `isAnnounce: true` messages do
+- **Startup grace** (`AWARENESS_STARTUP_GRACE_MS = 20_000`): awareness replies are suppressed for the first 20 seconds after `startSignalRouter()` runs. This reserves relay rate-limit budget for the WebRTC handshake (offer-request + answer) when both devices come online simultaneously.
+- **Per-peer awareness cooldown** (`AWARENESS_COOLDOWN_MS = 60_000` in `signal-router.ts`): don't reply to the same peer more than once per minute — prevents reply bursts on relay reconnect/replay
+- **Announcement cooldown** (`ANNOUNCE_COOLDOWN_MS = 60_000` in `SentrySection.startRouter()`): don't re-announce to the same paired device within 60 seconds — prevents double announcements when the signal router restarts due to a relay URL change
+- `status-request` messages get an immediate online status reply regardless of startup grace (used by the "Status?" button)
+- `STATUS_TTL_S = 3600`: status signals are accepted up to 1 hour after their inner `created_at`
+- `peerStatuses` store tracks known online/offline states. `updatePeerStatus` has a freshness guard: newer `createdAt` only, preventing stale relay replays from overwriting a known-good state
 
 ### Channel Active Sources
 When a `RecordAction` activates, `SentrySection._updateChannelActiveSources()` pushes the recording captures' source IDs to `monitor-peer.setChannelActiveSources()`. The live RTC compositor uses these as overrides; `ChannelConfig.videoSourceId`/`audioSourceId` are fallback defaults only.
@@ -136,3 +163,5 @@ Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, 
 - **Don't trickle ICE** — always go through `waitForIceGathering` before sending SDP
 - **Don't use Svelte 4 reactivity** — no `$:`, no `export let` for bindable state (use `$props()` with `$bindable()`)
 - **Don't add the same segment twice** — use `backupOf` to track canonical origin IDs across viewer chains
+- **Never send Nostr events when `nostrOnline` is false** — check `get(nostrOnline)` before any `publish()` call not already inside `outboxFlusher`
+- **RecordAction source selection uses `cap.sourceId`** — not `ChannelConfig.videoSourceId`/`audioSourceId` (those are live-RTC fallbacks only)

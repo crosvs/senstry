@@ -1,14 +1,16 @@
 import { createPeer, onIceStateChange, waitForIceGathering } from './peer';
 import { sendOffer, sendHangup } from './signaling';
-import { getCoverageMap, getSegmentsInRange, getSegmentById, getSegmentsAfter, getSegmentsBefore, type SegmentWithBlob } from '$lib/db/segments';
+import { getCoverageMap, getCoverageByChannel, getSegmentsInRange, getSegmentById, getSegmentsAfter, getSegmentsBefore, getDistinctChannels, type SegmentWithBlob } from '$lib/db/segments';
 import type { SignalMessage } from './signaling';
 import type { ChannelConfig } from '$lib/store/pipeline';
+import { dbg } from '$lib/store/debug';
 
 interface MonitorSession {
 	pc: RTCPeerConnection;
 	viewerPubkey: string;
 	sessionId: string;
-	dataChannel: RTCDataChannel | null;
+	controlChannel: RTCDataChannel | null;  // metadata + queries
+	dataChannel: RTCDataChannel | null;     // segment chunk payloads
 	idleTimer: ReturnType<typeof setTimeout> | null;
 	generation: number;
 }
@@ -16,6 +18,11 @@ interface MonitorSession {
 // One session per connected viewer, keyed by viewer pubkey.
 const sessions = new Map<string, MonitorSession>();
 let globalGeneration = 0;
+
+// Rate-limit data-mode offer-requests per viewer — relays replay many stale ones on startup.
+// Live-mode requests always bypass this so a user-initiated live connect is never blocked.
+const offerRequestTimes = new Map<string, number>();
+const OFFER_REQUEST_COOLDOWN_MS = 5_000;
 
 // Streams provided when the monitor is armed — one per open source, keyed by sourceId.
 const activeStreams = new Map<string, MediaStream>();
@@ -92,6 +99,14 @@ export async function handleOfferRequest(
 	const existing = sessions.get(fromPubkey);
 	if (existing && existing.sessionId === msg.sessionId) return;
 
+	// Rate-limit data-mode offer-requests to absorb relay replay bursts on startup.
+	// Live-mode is always allowed — it's an explicit user action, not background noise.
+	if (msg.mode !== 'live') {
+		const last = offerRequestTimes.get(fromPubkey) ?? 0;
+		if (Date.now() - last < OFFER_REQUEST_COOLDOWN_MS) return;
+	}
+	offerRequestTimes.set(fromPubkey, Date.now());
+
 	closeSession(fromPubkey);
 	const myGeneration = ++globalGeneration;
 
@@ -100,6 +115,7 @@ export async function handleOfferRequest(
 		pc,
 		viewerPubkey: fromPubkey,
 		sessionId: msg.sessionId,
+		controlChannel: null,
 		dataChannel: null,
 		idleTimer: null,
 		generation: myGeneration
@@ -144,12 +160,14 @@ export async function handleOfferRequest(
 		for (const track of composite.getTracks()) pc.addTrack(track, composite);
 	}
 
-	const dc = pc.createDataChannel('data');
-	session.dataChannel = dc;
-	dc.onmessage = (e) => {
+	const controlDc = pc.createDataChannel('control');
+	const dataDc    = pc.createDataChannel('data');
+	session.controlChannel = controlDc;
+	session.dataChannel    = dataDc;
+	controlDc.onmessage = (e) => {
 		if (sessions.get(fromPubkey)?.generation !== myGeneration) return;
 		resetIdleTimer(privkey, monitorPubkey, session);
-		handleDataMessage(dc, e.data, monitorPubkey);
+		handleDataMessage(controlDc, dataDc, e.data, monitorPubkey);
 	};
 
 	onIceStateChange(pc, (state) => {
@@ -160,11 +178,31 @@ export async function handleOfferRequest(
 	const offer = await pc.createOffer();
 	await pc.setLocalDescription(offer);
 	await waitForIceGathering(pc);
-	try {
-		await sendOffer(privkey, monitorPubkey, fromPubkey, pc.localDescription!.sdp!, msg.sessionId);
-	} catch (e) {
+	// Retry with backoff — public relays (e.g. damus.io) allow ~1 kind:1059 per 10s per keypair.
+	// Same-IP devices share the rate-limit bucket, so the viewer's offer-request may consume the
+	// slot right before the monitor tries to send the offer.
+	const OFFER_RETRY_DELAYS_MS = [8_000, 15_000];
+	let offerSent = false;
+	for (let attempt = 0; attempt <= OFFER_RETRY_DELAYS_MS.length; attempt++) {
+		try {
+			await sendOffer(privkey, monitorPubkey, fromPubkey, pc.localDescription!.sdp!, msg.sessionId);
+			offerSent = true;
+			break;
+		} catch (e) {
+			const errMsg = e instanceof Error ? e.message : String(e);
+			const delay = OFFER_RETRY_DELAYS_MS[attempt];
+			if (delay !== undefined && (errMsg.includes('rate-limited') || errMsg.includes('publish failed'))) {
+				dbg('warn', 'rtc', `monitor: offer rate-limited, retrying in ${delay / 1000}s…`);
+				await new Promise(r => setTimeout(r, delay));
+			} else {
+				closeSession(fromPubkey);
+				throw e;
+			}
+		}
+	}
+	if (!offerSent) {
 		closeSession(fromPubkey);
-		throw e;
+		throw new Error('monitor: offer send failed after retries (rate-limited)');
 	}
 
 	resetIdleTimer(privkey, monitorPubkey, session);
@@ -184,19 +222,42 @@ export function handleHangup(msg: SignalMessage, fromPubkey: string): void {
 	if (session?.sessionId === msg.sessionId) closeSession(fromPubkey);
 }
 
-async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor: string): Promise<void> {
+async function handleDataMessage(
+	controlDc: RTCDataChannel,
+	dataDc: RTCDataChannel,
+	raw: string,
+	originMonitor: string,
+): Promise<void> {
 	let req: { type: string } & Record<string, unknown>;
 	try { req = JSON.parse(raw); } catch { return; }
 
 	if (req.type === 'source-list-request') {
-		dc.send(JSON.stringify({ type: 'source-list', sourceIds: Array.from(activeStreams.keys()) }));
+		controlDc.send(JSON.stringify({ type: 'source-list', sourceIds: Array.from(activeStreams.keys()) }));
+		return;
+	}
+
+	if (req.type === 'channel-list-request') {
+		controlDc.send(JSON.stringify({ type: 'channel-list', channels: Array.from(activeChannels.values()) }));
+		return;
+	}
+
+	if (req.type === 'segment-channels-request') {
+		const channels = await getDistinctChannels(originMonitor);
+		controlDc.send(JSON.stringify({ type: 'segment-channels', channels }));
 		return;
 	}
 
 	if (req.type === 'coverage-request') {
 		const mimePrefix = req.mimePrefix as string | undefined;
 		const segments = await getCoverageMap(originMonitor, mimePrefix);
-		dc.send(JSON.stringify({ type: 'coverage-map', segments, mimePrefix: mimePrefix ?? null }));
+		controlDc.send(JSON.stringify({ type: 'coverage-map', segments, mimePrefix: mimePrefix ?? null }));
+		return;
+	}
+
+	if (req.type === 'coverage-channels-request') {
+		const mimePrefix = req.mimePrefix as string | undefined;
+		const channels = await getCoverageByChannel(originMonitor, mimePrefix);
+		controlDc.send(JSON.stringify({ type: 'coverage-channels', channels }));
 		return;
 	}
 
@@ -204,7 +265,7 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 		const after = req.after as number;
 		const count = Math.min((req.count as number | undefined) ?? 5, 20);
 		const segs = await getSegmentsAfter(after, count, originMonitor);
-		dc.send(JSON.stringify({
+		controlDc.send(JSON.stringify({
 			type: 'segments-after',
 			after,
 			segments: segs.map(s => ({
@@ -223,7 +284,7 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 		const before = req.before as number;
 		const count = Math.min((req.count as number | undefined) ?? 5, 20);
 		const segs = await getSegmentsBefore(before, count, originMonitor);
-		dc.send(JSON.stringify({
+		controlDc.send(JSON.stringify({
 			type: 'segments-before',
 			before,
 			segments: segs.map(s => ({
@@ -248,17 +309,17 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 		);
 
 		if (!meta) {
-			dc.send(JSON.stringify({ type: 'segment-error', requestTime, reason: 'not-stored' }));
+			controlDc.send(JSON.stringify({ type: 'segment-error', requestTime, reason: 'not-stored' }));
 			return;
 		}
 
 		const segment = await getSegmentById(meta.segmentId);
 		if (!segment) {
-			dc.send(JSON.stringify({ type: 'segment-error', requestTime, reason: 'blob-missing' }));
+			controlDc.send(JSON.stringify({ type: 'segment-error', requestTime, reason: 'blob-missing' }));
 			return;
 		}
 
-		await sendSegmentOverDc(dc, segment, { requestTime });
+		await sendSegmentOverDc(controlDc, dataDc, segment, { requestTime });
 	}
 
 	if (req.type === 'segment-request-by-id') {
@@ -279,16 +340,17 @@ async function handleDataMessage(dc: RTCDataChannel, raw: string, originMonitor:
 		}
 
 		if (!segment) {
-			dc.send(JSON.stringify({ type: 'segment-error-by-id', segmentId: id, reason: 'not-stored' }));
+			controlDc.send(JSON.stringify({ type: 'segment-error-by-id', segmentId: id, reason: 'not-stored' }));
 			return;
 		}
 
-		await sendSegmentOverDc(dc, segment, { segmentId: id });
+		await sendSegmentOverDc(controlDc, dataDc, segment, { segmentId: id });
 	}
 }
 
 async function sendSegmentOverDc(
-	dc: RTCDataChannel,
+	controlDc: RTCDataChannel,
+	dataDc: RTCDataChannel,
 	segment: SegmentWithBlob,
 	key: { requestTime: number } | { segmentId: string }
 ): Promise<void> {
@@ -301,7 +363,8 @@ async function sendSegmentOverDc(
 	// Propagate the root monitor's ID through viewer chains (ViewerA re-serving to ViewerB)
 	// so all downstream viewers deduplicate against the same canonical ID.
 	const canonicalSegmentId = segment.backupOf ?? segment.segmentId;
-	dc.send(JSON.stringify({
+	// Metadata goes on the control channel (low-latency, unblocked by chunk transfers).
+	controlDc.send(JSON.stringify({
 		type: byId ? 'segment-meta-by-id' : 'segment-meta',
 		...key,
 		segmentId: canonicalSegmentId,  // always included so viewer can set backupOf
@@ -310,13 +373,15 @@ async function sendSegmentOverDc(
 		mimeType: segment.mimeType,
 		sizeBytes: segment.sizeBytes,
 		originMonitor: segment.originMonitor,
+		channelId: segment.channelId,
 		contentHash: (segment as { contentHash?: string }).contentHash ?? '',
 	}));
 
+	// Chunk payloads go on the data channel so they don't block concurrent control messages.
 	for (let i = 0; i < total; i++) {
 		const slice = bytes.slice(i * CHUNK, (i + 1) * CHUNK);
 		const b64 = btoa(String.fromCharCode(...slice));
-		dc.send(JSON.stringify({
+		dataDc.send(JSON.stringify({
 			type: byId ? 'segment-chunk-by-id' : 'segment-chunk',
 			...key,
 			startTime: segment.startTime,
@@ -346,7 +411,7 @@ export function getMonitorSessionInfos(): MonitorSessionInfo[] {
 		viewerPubkey: s.viewerPubkey,
 		sessionId: s.sessionId,
 		iceState: s.pc.iceConnectionState,
-		dcState: s.dataChannel?.readyState ?? null,
+		dcState: s.controlChannel?.readyState ?? null,
 		trackCount: s.pc.getSenders().length,
 	}));
 }

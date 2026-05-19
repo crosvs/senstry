@@ -6,25 +6,31 @@ import { dbg } from '$lib/store/debug';
 import type { NostrEvent } from 'nostr-tools';
 
 export interface SignalMessage {
-	type: 'offer-request' | 'offer' | 'answer' | 'hangup' | 'ping' | 'pong';
+	type: 'offer-request' | 'offer' | 'answer' | 'hangup' | 'ping' | 'pong' | 'status' | 'status-request';
 	sessionId: string;
 	sdp?: string;
 	mode?: 'live' | 'data'; // live = viewer wants stream tracks; data = segment/coverage only
 	sourceId?: string;      // live mode only — which source stream to receive (omit = all sources)
 	channelId?: string;     // live mode only — which channel to receive (video+audio composite)
+	state?: 'online' | 'offline'; // status messages only
+	isAnnounce?: boolean;         // true = initial "I just came online" broadcast; absent = awareness reply
 }
 
-export type SignalHandler = (msg: SignalMessage, fromPubkey: string) => void | Promise<void>;
+export type SignalHandler = (msg: SignalMessage, fromPubkey: string, createdAt: number) => void | Promise<void>;
 
 // NIP-59 gift-wrap outer events have randomised created_at for privacy,
 // so `since` relay filters don't work. We check the inner rumor's honest
-// timestamp and discard anything older than SIGNAL_TTL_S seconds.
-const SIGNAL_TTL_S = 60;
+// timestamp and discard anything older than the per-type TTL.
+// 10s covers the full offer-request→offer→answer round-trip with relay latency.
+// 3600s for status events which are persistent presence signals, not ephemeral handshakes.
+const SIGNAL_TTL_S = 10;
+const STATUS_TTL_S = 3600;
 
 // Deduplicate events by outer event ID — relays may replay the same event
-// on reconnect. Cleared every TTL interval to bound memory growth.
+// on reconnect. Cleared every 60s (longer than SIGNAL_TTL_S) to prevent relay
+// re-deliveries within the TTL window from being double-processed.
 const seenEventIds = new Set<string>();
-setInterval(() => seenEventIds.clear(), SIGNAL_TTL_S * 1000);
+setInterval(() => seenEventIds.clear(), 60_000);
 
 export function listenForSignals(
 	privkey: Uint8Array,
@@ -38,11 +44,12 @@ export function listenForSignals(
 			seenEventIds.add(event.id);
 			try {
 				const inner = giftUnwrap(event, privkey);
-				const age = Math.floor(Date.now() / 1000) - inner.created_at;
-				if (age > SIGNAL_TTL_S) return;
 				const msg = JSON.parse(inner.content) as SignalMessage;
+				const ttl = (msg.type === 'status' || msg.type === 'status-request') ? STATUS_TTL_S : SIGNAL_TTL_S;
+				const age = Math.floor(Date.now() / 1000) - inner.created_at;
+				if (age > ttl) return;
 				dbg('in', 'rtc', `signal ${msg.type} sess:${msg.sessionId.slice(0, 8)} from:${inner.pubkey.slice(0, 8)}`, msg);
-				handler(msg, inner.pubkey);
+				handler(msg, inner.pubkey, inner.created_at);
 			} catch {
 				// Undecryptable — not meant for this recipient
 			}

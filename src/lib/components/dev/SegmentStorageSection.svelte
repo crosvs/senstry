@@ -3,7 +3,7 @@
   import {
     getCoverageMap, getSegmentsInRange, getStorageUsed, clearForMonitor,
     cleanupOrphanedOpfsFiles, deleteSegment, pinSegment, unpinSegment,
-    expirePinnedSegments, thinSegments, evictUnpinned, type Segment
+    expirePinnedSegments, thinSegments, evictUnpinned, getDistinctChannels, type Segment
   } from '$lib/db/segments';
   import { storageCleanup, loadStorageCleanup } from '$lib/store/pipeline';
   import { onMount } from 'svelte';
@@ -58,6 +58,8 @@
   let segLoading = $state(false);
   let segRangeTs = $state('');
   let segDate = $state('');
+  let segChannelFilter = $state('');
+  let segChannelOptions = $state<string[]>([]);
 
   function applyDateToRange(date: string): string {
     if (!date) return '';
@@ -85,7 +87,7 @@
     const expired = await expirePinnedSegments();
     if (expired > 0) dbg('info', 'idb', `expired ${expired} pinned segment(s)`);
     const [from, to] = parseRange(segRangeTs);
-    const segs = await getSegmentsInRange(from, to, effectivePubkey ?? undefined);
+    const segs = await getSegmentsInRange(from, to, effectivePubkey ?? undefined, segChannelFilter || undefined);
     const map = new Map<string, Segment[]>();
     for (const s of segs) {
       const d = new Date(s.startTime * 1000).toISOString().slice(0, 10);
@@ -378,8 +380,22 @@
   });
 
   $effect(() => {
-    const _trigger = effectivePubkey; // track derived so effect re-runs on device/identity change
+    const _trigger = effectivePubkey;
+    segChannelFilter = '';
+    segChannelOptions = [];
     loadAll();
+  });
+
+  // Update available channels reactively when the time range or device changes,
+  // so the user can pick a date → see which channels have footage → then filter.
+  $effect(() => {
+    const pk = effectivePubkey;
+    const [from, to] = parseRange(segRangeTs);
+    if (!pk) return;
+    getDistinctChannels(pk, from, to).then(ids => {
+      segChannelOptions = ids;
+      if (segChannelFilter && !ids.includes(segChannelFilter)) segChannelFilter = '';
+    });
   });
 </script>
 
@@ -420,8 +436,16 @@
     <input type="date" class="date-input" bind:value={segDate}
       onchange={() => { segRangeTs = applyDateToRange(segDate); }} />
     <input class="ts-input" bind:value={segRangeTs} placeholder="unix or start-end" />
+    {#if segChannelOptions.length > 0}
+      <select class="source-select" bind:value={segChannelFilter} title="Filter segments by channel">
+        <option value="">All channels</option>
+        {#each segChannelOptions as chId (chId)}
+          <option value={chId}>{chId}</option>
+        {/each}
+      </select>
+    {/if}
     <button class="act-btn accent" onclick={loadSegments}>Filter</button>
-    <button class="act-btn" onclick={() => { segRangeTs = ''; segDate = ''; loadSegments(); }}>All</button>
+    <button class="act-btn" onclick={() => { segRangeTs = ''; segDate = ''; segChannelFilter = ''; loadSegments(); }}>All</button>
   </div>
 
   {#if segLoading}
@@ -464,7 +488,7 @@
                   <button class="rm-btn" onclick={() => removeSeg(seg.segmentId)} title="Delete segment">✕</button>
                 </div>
                 {#if rawSegIds.has(seg.segmentId)}
-                  <pre class="raw-small">{JSON.stringify({ segmentId: seg.segmentId, originMonitor: seg.originMonitor, startTime: seg.startTime, endTime: seg.endTime, mimeType: seg.mimeType, sizeBytes: seg.sizeBytes, pinned: seg.pinned, pinnedUntil: seg.pinnedUntil ?? null, backupOf: seg.backupOf ?? null }, null, 2)}</pre>
+                  <pre class="raw-small">{JSON.stringify({ segmentId: seg.segmentId, originMonitor: seg.originMonitor, channelId: seg.channelId ?? null, startTime: seg.startTime, endTime: seg.endTime, mimeType: seg.mimeType, sizeBytes: seg.sizeBytes, pinned: seg.pinned, pinnedUntil: seg.pinnedUntil ?? null, backupOf: seg.backupOf ?? null }, null, 2)}</pre>
                 {/if}
               </div>
             {/each}
@@ -581,6 +605,7 @@
   .filter-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   .date-input { font-size: 11px; padding: 3px 6px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); font-family: inherit; }
   .ts-input { font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-text); font-family: inherit; flex: 1; min-width: 0; }
+  .source-select { font-size: 10px; padding: 2px 4px; border-radius: 4px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-family: ui-monospace, monospace; max-width: 160px; }
 
   .day-row { border: 1px solid var(--color-border); border-radius: 5px; overflow: hidden; }
   .day-btn { display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 8px; background: var(--color-surface); border: none; cursor: pointer; color: var(--color-text); font-size: 11px; font-family: inherit; text-align: left; }

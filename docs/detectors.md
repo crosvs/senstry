@@ -112,13 +112,34 @@ Useful for temporary monitoring (vacation, event window).
 
 ## NostrTriggerDetector (`detectors/nostr-trigger.ts`)
 
-Fires when a kind 5010 trigger event is received from a specific monitor pubkey.
+Fires when a kind 5010 trigger event is received from a specific monitor pubkey. Unlike other detectors, it does not implement the `Detector` interface directly — it has no `start(stream)`. Instead, `SentrySection` owns the Nostr subscription and calls `handleRemoteState()` when a matching event arrives.
 
+```typescript
+class NostrTriggerDetector {
+  onStateChange: ((state: SensorState) => void) | null;
+  onDetection: ((event: DetectionEvent<NostrTriggerData>) => void) | null;
+  onFiringChange: ((firing: boolean) => void) | null;
+
+  handleRemoteState(
+    remoteState: 'sensing' | 'active' | 'idle',
+    meta: { monitorPubkey, channelId, detectionType },
+    timing: { minDurationMs, settlingMs }
+  ): void;
+
+  stop(): void;
+}
+```
+
+**SensorConfig fields used:**
 - `monitorPubkey` — which monitor to listen to
-- `nostrChannelId` — optional channel filter
+- `nostrChannelId` — optional channel filter (`null` = any channel)
 - `detectionTypes` — optional array of detection type strings to filter on
 
-This allows chaining: a viewer device acts as a monitor that fires on events from another monitor — forwarding or escalating alerts.
+**Timing synchronization:**
+- On remote `sensing`: starts a hold timer using the sender's `minDurationMs`. If elapsed without a follow-up `active`, escalates to `active` locally.
+- On remote `idle`: enters settling using `max(localSettlingMs, sender's settlingMs)`, ensuring the local device never settles before the remote one.
+
+This allows chaining: a viewer device acts as a monitor that fires on events from another monitor — forwarding or escalating alerts across a device network.
 
 ## Photo Capture (`detectors/photo.ts`)
 

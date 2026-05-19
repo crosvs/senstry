@@ -82,21 +82,28 @@ On page load, `+layout.svelte` runs in order:
 5. `loadPairedDevices()` — populate devices store
 6. Start Nostr subscriptions (alert listener if identity exists)
 
+## Nostr Online Gate
+
+`nostrOnline` (`store/nostr-online.ts`) is the master switch for all Nostr activity. The monitor is **local-first** — it runs entirely without Nostr. Going online/offline does not affect the monitor state machine; it only controls whether signals and notifications are published.
+
+When `nostrOnline` flips to `true`, `SentrySection` opens the signal router subscription and broadcasts an online announcement to all paired devices. When it flips to `false`, the router is closed.
+
+Relay errors trigger auto-offline: 3 consecutive all-relay publish failures set `nostrOfflineReason` and call `goOffline()`.
+
 ## Monitor State Machine
 
 ```
 idle ──startMonitor()──▶ starting ──streams open──▶ active
                                                        │
                          ◀──stopMonitor()─────────── stopping
-                                │
-                         paused-nostr   (Nostr paused, still recording)
-                         no-store       (recording off, Nostr on)
 ```
+
+The monitor can be in any state while `nostrOnline` is either `true` or `false` — they are independent dimensions. `isPublishing()` in `store/monitor.ts` reflects whether the monitor would normally publish, but actual publishing is additionally gated on `get(nostrOnline)`.
 
 Helper predicates in `store/monitor.ts`:
 - `isActive(state)` — detectors running
 - `isStoring(state)` — MediaRecorder running
-- `isPublishing(state)` — Nostr events being sent
+- `isPublishing(state)` — Nostr events being sent (also requires `nostrOnline`)
 
 ## Privacy Properties
 
@@ -106,5 +113,6 @@ Helper predicates in `store/monitor.ts`:
 | Relay operator reads event content | NIP-44 ChaCha20-Poly1305 encryption to recipient pubkey |
 | Media exfiltration | Media never published to relay; only sent P2P over WebRTC to paired viewers |
 | Identity theft | Private key in IDB, never exposed in URL/cookies/localStorage |
-| Replay attacks | Signal TTL: inner rumor `created_at` checked; stale signals (>60s) dropped |
+| Replay attacks | Signal TTL: inner rumor `created_at` checked; stale signals (>10s for RTC, >1h for status) dropped |
+| Presence stale-replay | `updatePeerStatus` freshness guard: only newer `createdAt` updates the known state |
 | Segment dedup across viewer chains | `backupOf` field tracks canonical origin segment ID |

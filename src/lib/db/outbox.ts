@@ -51,6 +51,14 @@ export async function markFailed(outboxId: string): Promise<void> {
 	});
 }
 
+export async function clearQueued(): Promise<void> {
+	const db = await openDB();
+	const queued = await db.getAllFromIndex('outbox', 'status', 'queued') as OutboxItem[];
+	for (const item of queued) {
+		await db.put('outbox', { ...item, status: 'failed' });
+	}
+}
+
 export async function requeueFailed(): Promise<void> {
 	const db = await openDB();
 	const failed = await db.getAllFromIndex('outbox', 'status', 'failed') as OutboxItem[];
