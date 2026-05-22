@@ -23,6 +23,7 @@
   import { buildTriggerEvent, buildFootageRefEvent, buildArmState, KIND_TRIGGER } from '$lib/nostr/events';
   import { sensorStates, actionStates } from '$lib/store/monitor-runtime';
   import { publish, getRelays, subscribe } from '$lib/nostr/client';
+  import { useNostrAction } from '$lib/nostr/use-nostr-action.svelte';
   import { decrypt } from '$lib/nostr/crypto';
   import { enqueue } from '$lib/db/outbox';
   import {
@@ -76,6 +77,7 @@
   let signalSub: { close: () => void } | null = null;
   let sessionTick: ReturnType<typeof setInterval>;
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  const armAction = useNostrAction();
   let openSourceIds = $state(new Set<string>());
   let sourceDb = $state(new Map<string, number>());
   let meterRaf: number | null = null;
@@ -205,7 +207,19 @@
 
   // ── Monitor lifecycle ─────────────────────────────────────────────────────
 
-  async function startMonitor() {
+  async function handleStartMonitor() {
+    await armAction.run(onQueued => {
+      return startMonitor(onQueued);
+    });
+  }
+
+  async function handleStopMonitor() {
+    await armAction.run(onQueued => {
+      return stopMonitor(onQueued);
+    });
+  }
+
+  async function startMonitor(onQueued?: (id: string, cancel: () => void) => void) {
     if (!$identity) return;
     error = '';
     transitionMonitor('starting');
@@ -362,7 +376,7 @@
       }
 
       transitionMonitor('active');
-      _publishArmState(true).catch(() => {});
+      _publishArmState(true, onQueued).catch(() => {});
 
       await loadStorageCleanup();
       const cfg = get(storageCleanup);
@@ -381,7 +395,7 @@
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to access camera/mic';
       transitionMonitor('idle');
-      _publishArmState(false).catch(() => {});
+      _publishArmState(false, onQueued).catch(() => {});
     }
   }
 
@@ -764,16 +778,24 @@
 
   // ── Arm state publishing ──────────────────────────────────────────────────
 
-  async function _publishArmState(armed: boolean) {
+  async function _publishArmState(armed: boolean, onQueued?: (id: string, cancel: () => void) => void) {
     const id = get(identity);
     if (!id || !get(nostrOnline)) return;
     const relays = getRelays();
     const snapshot = armed ? Object.fromEntries(
       Object.entries($sensorStates).map(([k, v]) => [k, { status: v.status }])
     ) : undefined;
-    for (const device of get(pairedDevices)) {
+    const devices = get(pairedDevices);
+    for (const [idx, device] of devices.entries()) {
       const ev = buildArmState(id.privkey, id.pubkey, device.pubkey, armed, snapshot);
-      try { await publish(ev); } catch { await enqueue(ev, relays); }
+      try {
+        await publish(ev, {
+          label: `arm:${armed ? 'armed' : 'disarmed'}`,
+          onQueued: idx === 0 ? onQueued : undefined  // Track only first publish
+        });
+      } catch {
+        await enqueue(ev, relays);
+      }
     }
   }
 
@@ -1087,7 +1109,7 @@
 
   // ── Stop monitor ──────────────────────────────────────────────────────────
 
-  async function stopMonitor() {
+  async function stopMonitor(onQueued?: (id: string, cancel: () => void) => void) {
     transitionMonitor('stopping');
     if (cleanupTimer !== null) { clearInterval(cleanupTimer); cleanupTimer = null; }
     for (const [actionId, s] of footageSessions) {
@@ -1126,7 +1148,7 @@
     activeAlerts = [];
     monitorSnapshot = null;
     transitionMonitor('idle');
-    _publishArmState(false).catch(() => {});
+    _publishArmState(false, onQueued).catch(() => {});
   }
 
   onDestroy(() => {
@@ -1222,11 +1244,13 @@
 
   <!-- ── Monitor ──────────────────────────────────────────────────────────── -->
   {#if isActive}
-    <button class="monitor-btn stop" onclick={stopMonitor}>Stop Monitor</button>
+    <button class="monitor-btn stop" onclick={armAction.pending ? armAction.cancel : handleStopMonitor}>
+      {armAction.pending ? `⏳ Cancel` : 'Stop Monitor'}
+    </button>
   {:else}
-    <button class="monitor-btn start" onclick={startMonitor}
-      disabled={$monitorState === 'starting' || $monitorState === 'stopping'}>
-      {$monitorState === 'starting' ? 'Starting…' : $monitorState === 'stopping' ? 'Stopping…' : 'Start Monitor'}
+    <button class="monitor-btn start" onclick={armAction.pending ? armAction.cancel : handleStartMonitor}
+      disabled={($monitorState === 'starting' || $monitorState === 'stopping') && !armAction.pending}>
+      {$monitorState === 'starting' ? 'Starting…' : $monitorState === 'stopping' ? 'Stopping…' : armAction.pending ? `⏳ Cancel` : 'Start Monitor'}
     </button>
   {/if}
 

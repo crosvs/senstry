@@ -174,14 +174,25 @@ Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, 
 `loadPipeline()` in `pipeline.ts` checks for legacy IDB keys first; if truly fresh, it writes `DEFAULT_*` constants directly. Reset from SettingsSection also uses these constants. Keep them in sync.
 
 ### Adding a Nostr action button
-Any button that publishes a Nostr event must use the `useNostrAction` hook to handle rate-limiting queue display and cancellation:
+Every button triggering a Nostr interaction must use the `useNostrAction` hook **with a single-button toggle pattern** (no separate cancel buttons):
 
 1. Import and create at component init: `const myAction = useNostrAction();`
-2. Wrap the publish call: `await myAction.run(onQueued => publishMyEvent(..., { onQueued }))`
-3. Update button state: show `⏳ ${myAction.etaLabel}` while pending, disable button
-4. Show cancel button: `{#if myAction.pending}<button onclick={myAction.cancel}>✕</button>{/if}`
+2. Wrap the Nostr call in `action.run()`:
+   - **Publish**: `await myAction.run(onQueued => publish(event, { label: '...', onQueued }))`
+   - **Subscribe/Listen**: `await myAction.run(onQueued => { const sub = subscribe(...); onQueued('label', () => sub.close()); return promiseThatResolves; })`
+3. Single button with toggle onclick and text:
+   ```svelte
+   <button onclick={myAction.pending ? myAction.cancel : handleClick}>
+     {myAction.pending ? `⏳ ${myAction.etaLabel}` : 'Action Label'}
+   </button>
+   ```
 
-This surfaces rate-limit queue position to the user and allows cancellation before send. See `docs/nostr.md` for full API and example usage.
+**Critical distinctions:**
+- **Publish buttons** show `⏳ ETA` (e.g., "⏳ 2s", "⏳ sending…") — indicates queued time
+- **Listen buttons** show clear action text (e.g., "Cancel Invite", "Stop Waiting") — never use "⏳"
+- **No separate cancel buttons** — use toggle pattern on a single button only
+
+For subscriptions that need cleanup (clear UI state), implement state cleanup in three places: success, cancel callback via `onQueued`, and error handler. See `docs/nostr.md` for full API, examples, and state cleanup patterns.
 
 ## Things to Avoid
 
@@ -191,6 +202,6 @@ This surfaces rate-limit queue position to the user and allows cancellation befo
 - **Don't use Svelte 4 reactivity** — no `$:`, no `export let` for bindable state (use `$props()` with `$bindable()`)
 - **Don't add the same segment twice** — use `backupOf` to track canonical origin IDs across viewer chains; also check `originMonitor` to prevent cross-device ID collisions
 - **Never send Nostr events when `nostrOnline` is false** — check `get(nostrOnline)` before any `publish()` call not already inside `outboxFlusher`
-- **Every Nostr button must use `useNostrAction`** — direct publish calls without the hook skip rate-limit queue feedback and cancel support; use the hook to show ETA and allow cancellation
+- **Every Nostr button must use `useNostrAction` with single-button toggle** — implement as `onclick={action.pending ? action.cancel : handleClick}` with text toggling between action and pending state. Never use separate cancel buttons. Never use "⏳ ETA" on subscription buttons (only on publishes). See "Adding a Nostr action button" section above.
 - **RecordAction source selection uses `cap.sourceId`** — not `ChannelConfig.videoSourceId`/`audioSourceId` (those are live-RTC fallbacks only)
 - **Fetched segments list filters by `selectedMonitorPubkey` automatically** — don't add manual filtering; `ContentViewerSection.svelte` derives `browsedSegsWithIdx` from `$props.selectedMonitorPubkey`

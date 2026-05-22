@@ -47,10 +47,11 @@ export async function createInviteQR(
 export function listenForInviteAck(
 	privkey: Uint8Array,
 	inviterPubkey: string,
-	onPaired: (scannerPubkey: string, scannerRelays: string[], scannerLabel: string) => void
+	onPaired: (scannerPubkey: string, scannerRelays: string[], scannerLabel: string) => void,
+	opts?: { since?: number }
 ): { close: () => void } {
 	const sub = subscribe(
-		{ kinds: [KIND_INVITE_ACK], '#p': [inviterPubkey] },
+		{ kinds: [KIND_INVITE_ACK], '#p': [inviterPubkey], since: opts?.since ?? Math.floor(Date.now() / 1000) },
 		async (event: NostrEvent) => {
 			try {
 				const payload = JSON.parse(

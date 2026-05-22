@@ -4,6 +4,7 @@
   import { createInviteQR, listenForInviteAck, acceptInvite } from '$lib/pairing/invite';
   import { buildInviteAck } from '$lib/nostr/events';
   import { publish, setRelays } from '$lib/nostr/client';
+  import { useNostrAction } from '$lib/nostr/use-nostr-action.svelte';
   import { decodeInviteUri } from '$lib/utils/qr';
   import { generateNickname } from '$lib/utils/nickname';
   import DevSection from './DevSection.svelte';
@@ -16,11 +17,11 @@
   let qrCountdown = $state('');
   let ackSub: { close: () => void } | null = null;
   let pairedNotice = $state('');
-  let qrLoading = $state(false);
 
   let manualInput = $state('');
   let manualStatus = $state('');
-  let manualLoading = $state(false);
+  const qrAction = useNostrAction();
+  const pairAction = useNostrAction();
 
   let editingNickname = $state<string | null>(null);
   let editNicknameVal = $state('');
@@ -43,25 +44,53 @@
 
   async function generateQR() {
     if (!$identity) return;
-    qrLoading = true;
     ackSub?.close();
     if (countdownInterval) clearInterval(countdownInterval);
-    try {
-      const result = await createInviteQR($identity.privkey, $identity.pubkey, $settings.selfLabel);
-      qrSrc = result.qrDataUrl;
-      qrUri = result.uri;
-      qrExpiry = Date.now() + 5 * 60 * 1000;
-      updateCountdown();
-      countdownInterval = setInterval(updateCountdown, 1000);
-      ackSub = listenForInviteAck($identity.privkey, $identity.pubkey, async (scannerPubkey, scannerRelays) => {
-        const nickname = generateNickname();
-        await addPairedDevice({ pubkey: scannerPubkey, nickname, addedAt: Date.now(), relays: scannerRelays, capabilities: [], lastSeenAt: null });
-        pairedNotice = `Paired as "${nickname}"`;
-        setTimeout(() => (pairedNotice = ''), 4000);
+    await qrAction.run(onQueued => {
+      return new Promise<void>(async (resolve) => {
+        try {
+          const result = await createInviteQR($identity.privkey, $identity.pubkey, $settings.selfLabel);
+          qrSrc = result.qrDataUrl;
+          qrUri = result.uri;
+          qrExpiry = Date.now() + 5 * 60 * 1000;
+          updateCountdown();
+          countdownInterval = setInterval(updateCountdown, 1000);
+
+          let listenCancelled = false;
+          ackSub = listenForInviteAck($identity.privkey, $identity.pubkey, async (scannerPubkey, scannerRelays) => {
+            if (listenCancelled) return;
+            const nickname = generateNickname();
+            await addPairedDevice({ pubkey: scannerPubkey, nickname, addedAt: Date.now(), relays: scannerRelays, capabilities: [], lastSeenAt: null });
+            pairedNotice = `Paired as "${nickname}"`;
+            setTimeout(() => (pairedNotice = ''), 4000);
+            // Cleanup on successful pairing
+            if (countdownInterval) clearInterval(countdownInterval);
+            qrSrc = '';
+            qrUri = '';
+            qrCountdown = '';
+            ackSub?.close();
+            resolve();
+          }, { since: Math.floor(Date.now() / 1000) });
+
+          onQueued('invite-listen', () => {
+            listenCancelled = true;
+            ackSub?.close();
+            if (countdownInterval) clearInterval(countdownInterval);
+            qrSrc = '';
+            qrUri = '';
+            qrCountdown = '';
+            resolve();
+          });
+        } catch (e) {
+          console.error('Generate QR failed:', e);
+          if (countdownInterval) clearInterval(countdownInterval);
+          qrSrc = '';
+          qrUri = '';
+          qrCountdown = '';
+          throw e;
+        }
       });
-    } finally {
-      qrLoading = false;
-    }
+    });
   }
 
   async function copyLink() {
@@ -70,7 +99,6 @@
 
   async function pairManual() {
     if (!$identity || !manualInput.trim()) return;
-    manualLoading = true;
     manualStatus = '';
     try {
       const payload = decodeInviteUri(manualInput.trim());
@@ -78,13 +106,13 @@
       const result = await acceptInvite($identity.privkey, $identity.pubkey, payload);
       if (!result.valid) { manualStatus = `✗ ${result.reason ?? 'Invalid invite'}`; return; }
       const ack = buildInviteAck($identity.privkey, $identity.pubkey, payload.pk, payload.inviteId, payload.secret, payload.relays);
-      await publish(ack);
+      await pairAction.run(onQueued =>
+        publish(ack, { label: 'invite-ack', onQueued })
+      );
       manualStatus = `✓ Paired with ${payload.label}`;
       manualInput = '';
     } catch (e) {
       manualStatus = `✗ ${e instanceof Error ? e.message : 'Invalid pairing URI'}`;
-    } finally {
-      manualLoading = false;
     }
   }
 
@@ -120,7 +148,9 @@
   <!-- Generate invite -->
   <div class="subsection">
     <div class="row">
-      <button class="act-btn accent" onclick={generateQR} disabled={qrLoading}>Generate Invite QR</button>
+      <button class="act-btn accent" onclick={qrAction.pending ? qrAction.cancel : generateQR}>
+        {qrAction.pending ? 'Cancel Invite' : 'Generate Invite QR'}
+      </button>
       {#if qrUri}
         <button class="act-btn" onclick={copyLink}>Copy Link</button>
         <span class="countdown">{qrCountdown}</span>
@@ -143,7 +173,9 @@
       rows="2"
     ></textarea>
     <div class="row">
-      <button class="act-btn accent" onclick={pairManual} disabled={manualLoading || !manualInput.trim()}>Pair</button>
+      <button class="act-btn accent" onclick={pairAction.pending ? pairAction.cancel : pairManual} disabled={!pairAction.pending && !manualInput.trim()}>
+        {pairAction.pending ? `⏳ Cancel` : 'Pair'}
+      </button>
       {#if manualStatus}
         <span class="status" class:ok={manualStatus.startsWith('✓')} class:err={manualStatus.startsWith('✗')}>{manualStatus}</span>
       {/if}

@@ -169,7 +169,28 @@ Used by the `useNostrAction` hook to display queue position and ETA to the user.
 
 ## UI Pattern: `useNostrAction` Hook
 
-Any button that publishes a Nostr event should use the `useNostrAction` hook to provide visual feedback and cancellation:
+**Core Rule: Every button that initiates a Nostr interaction must use `useNostrAction`.**
+
+Nostr interactions fall into two categories with different UI patterns:
+
+### 1. Publish (Rate-Limited Queue)
+Events are queued and spaced apart. Show the queue position/ETA to the user.
+- Button starts: "Send Email" / "Arm Monitor" / "Test Relay"
+- While pending: "⏳ 2s" (shows queue ETA, updates in real-time)
+- Click again to cancel: removes from queue before send
+
+### 2. Subscribe/Listen (Active Subscription)
+Subscriptions are active and waiting for events. User should see what's happening.
+- Button starts: "Generate Invite QR" / "Request Status"
+- While listening: "Cancel Invite" / "Stop Waiting" (clear what's being cancelled, NOT "⏳")
+- Click to cancel: closes subscription immediately
+- **DO NOT use "⏳ ETA" for listeners** — ETA only applies to publish queue
+
+### Implementation Pattern
+
+#### Single-Button Toggle (all interactions)
+
+The button handling both action and cancel is **the only pattern allowed**. Never use separate cancel buttons.
 
 ```typescript
 import { useNostrAction } from '$lib/nostr/use-nostr-action.svelte';
@@ -183,16 +204,15 @@ async function handleStatusClick() {
 }
 ```
 
-In the template, show the button state and provide a cancel option:
+Template code (applies to both publish and subscribe/listen):
 
 ```svelte
-<button onclick={handleStatusClick} disabled={statusAction.pending}>
+<button onclick={statusAction.pending ? statusAction.cancel : handleStatusClick}>
   {statusAction.pending ? `⏳ ${statusAction.etaLabel}` : 'Status?'}
 </button>
-{#if statusAction.pending}
-  <button onclick={statusAction.cancel} title="Cancel" class="cancel-btn">✕</button>
-{/if}
 ```
+
+The same button changes both its onclick handler and text based on `pending` state. **Do not render separate cancel buttons.**
 
 ### Properties
 
@@ -201,9 +221,150 @@ In the template, show the button state and provide a cancel option:
 - `run(fn)` — execute async function; passes `onQueued(id, cancelFn)` callback for the publish helper to call
 - `cancel()` — cancel the queued publish (no-op when not pending)
 
-### Passing `onQueued` to publish helpers
+### Examples: Publish vs. Subscribe
 
-Any helper that publishes (e.g. `sendSignal`, `publishEvent`) should accept an optional `onQueued` callback:
+**Publishing events** (arm state, test relay):
+```typescript
+// In component init
+const armAction = useNostrAction();
+
+// In handler
+async function handleArmClick() {
+  await armAction.run(onQueued =>
+    publish(armEvent, { label: 'arm:armed', onQueued })
+  );
+}
+
+// In template
+<button onclick={armAction.pending ? armAction.cancel : handleArmClick}>
+  {armAction.pending ? `⏳ ${armAction.etaLabel}` : 'Start Monitor'}
+</button>
+```
+
+The button shows "⏳ 2s", "⏳ sending…" during queue/send, then reverts to "Start Monitor". Clicking while pending removes the event from queue.
+
+**Subscriptions/listeners** (generate invite, request status):
+```typescript
+// In component init
+const qrAction = useNostrAction();
+
+// In handler
+async function generateQR() {
+  await qrAction.run(onQueued => {
+    return new Promise<void>(async (resolve) => {
+      const result = await createInviteQR(...);
+      // Show QR
+      
+      let cancelled = false;
+      const sub = listenForInviteAck(async (pk, relays) => {
+        if (cancelled) return;
+        // Pairing succeeded
+        // Clean up: clear QR, close subscription, etc.
+        resolve();
+      });
+      
+      onQueued('invite-listen', () => {
+        cancelled = true;
+        sub.close();
+        // Clean up: clear QR, etc.
+        resolve();
+      });
+    });
+  });
+}
+
+// In template
+<button onclick={qrAction.pending ? qrAction.cancel : generateQR}>
+  {qrAction.pending ? 'Cancel Invite' : 'Generate Invite QR'}
+</button>
+```
+
+The button shows "Cancel Invite" while listening for the pairing response. Clicking cancels the subscription immediately (no queue involved). **Never show "⏳" on listener buttons.**
+
+**Key difference:**
+- Publish: button shows "⏳ ETA" (time-in-queue). Click to remove from queue.
+- Listen: button shows clear action like "Cancel Invite" or "Stop Waiting" (no "⏳"). Click to close subscription.
+
+### State Cleanup (Subscriptions)
+
+When wrapping a subscription in a `new Promise<void>()`, clean up UI state in **three places**:
+1. **Success callback** — when the subscription resolves (e.g., pairing complete)
+2. **Cancel callback** — when user clicks the button to cancel
+3. **Error handler** — when an error occurs
+
+Example from `generateQR()`:
+
+```typescript
+await qrAction.run(onQueued => {
+  return new Promise<void>(async (resolve) => {
+    try {
+      const result = await createInviteQR(...);
+      qrSrc = result.qrDataUrl;  // Show QR
+      
+      const sub = listenForInviteAck(async (pk, relays) => {
+        // 1. SUCCESS: pairing complete
+        await addPairedDevice({ pubkey: pk, ... });
+        // Cleanup
+        qrSrc = '';
+        qrUri = '';
+        qrCountdown = '';
+        sub.close();
+        if (countdownInterval) clearInterval(countdownInterval);
+        resolve();
+      });
+      
+      onQueued('invite-listen', () => {
+        // 2. CANCEL: user clicked button
+        sub.close();
+        qrSrc = '';
+        qrUri = '';
+        qrCountdown = '';
+        if (countdownInterval) clearInterval(countdownInterval);
+        resolve();
+      });
+    } catch (e) {
+      // 3. ERROR: exception during setup
+      qrSrc = '';
+      qrUri = '';
+      qrCountdown = '';
+      if (countdownInterval) clearInterval(countdownInterval);
+      throw e;
+    }
+  });
+});
+```
+
+This ensures the UI always returns to a clean state regardless of how the subscription ends.
+
+### Relay Query Optimization
+
+For subscriptions, pass `since` to avoid querying the relay for old events:
+
+```typescript
+export function listenForInviteAck(
+  privkey: Uint8Array,
+  pubkey: string,
+  handler: (scannerPubkey: string, relays: string[]) => void,
+  opts?: { since?: number }
+): { close: () => void } {
+  return subscribe(
+    { kinds: [5000], '#p': [pubkey], since: opts?.since ?? Math.floor(Date.now() / 1000) },
+    handler
+  );
+}
+```
+
+When calling from a button handler, pass the current time:
+
+```typescript
+const sub = listenForInviteAck(privkey, pubkey, handler, { since: Math.floor(Date.now() / 1000) });
+```
+
+This prevents the relay from replaying old invites, keeping startup latency low and respecting rate limits.
+
+### Passing callbacks to helpers
+
+Any helper that performs Nostr operations (publish, subscribe, listen) should accept optional callbacks for tracking:
 
 ```typescript
 export async function sendSignal(
@@ -219,7 +380,9 @@ export async function sendSignal(
 }
 ```
 
-The `cancel` function returned by `client.publish()` removes the event from the queue if it hasn't sent yet.
+For publish: `cancel()` removes the event from the queue if it hasn't sent yet.
+
+For subscribe: `cancel()` should close the subscription so the UI is no longer waiting.
 
 ## Trigger Event Content
 

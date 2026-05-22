@@ -3,6 +3,7 @@
     getRelays, setRelays, getActiveSubs, subscribe, publish,
     setRateLimit, getRateLimitAvailable, getPublishRate, type ActiveSub
   } from '$lib/nostr/client';
+  import { useNostrAction } from '$lib/nostr/use-nostr-action.svelte';
   import { settings, saveSettings, DEFAULT_RELAY } from '$lib/store/settings';
   import { identity } from '$lib/store/identity';
   import { finalizeEvent } from 'nostr-tools/pure';
@@ -13,7 +14,7 @@
   let relayEdit = $state($settings.relayUrl);
   let editing = $state(false);
   let testStatus = $state('');
-  let testLoading = $state(false);
+  const testAction = useNostrAction();
   let rateLimitInput = $state($settings.nostrRateLimit);
   let tokensAvail = $state(0);
   let publishedLast60s = $state(0);
@@ -39,8 +40,7 @@
 
   async function testRelay() {
     if (!$identity) { testStatus = 'No identity'; return; }
-    testLoading = true;
-    testStatus = 'Testing…';
+    testStatus = '';
     const start = Date.now();
     try {
       const ev = finalizeEvent({
@@ -49,12 +49,12 @@
         tags: [['t', 'senstry-test']],
         content: 'connection test',
       }, $identity.privkey);
-      await publish(ev);
+      await testAction.run(onQueued =>
+        publish(ev, { label: 'relay-test', onQueued })
+      );
       testStatus = `✓ OK (${Date.now() - start}ms)`;
     } catch (e) {
       testStatus = `✗ ${e instanceof Error ? e.message : 'Failed'}`;
-    } finally {
-      testLoading = false;
     }
   }
 
@@ -100,7 +100,9 @@
         <span class="mono small">{$settings.relayUrl}</span>
         <button class="act-btn" onclick={() => (editing = true)}>Edit</button>
       {/if}
-      <button class="act-btn" onclick={testRelay} disabled={testLoading}>Test</button>
+      <button class="act-btn" onclick={testAction.pending ? testAction.cancel : testRelay}>
+        {testAction.pending ? `⏳ Cancel` : 'Test'}
+      </button>
       {#if testStatus}
         <span class="status" class:ok={testStatus.startsWith('✓')} class:err={testStatus.startsWith('✗')}>{testStatus}</span>
       {/if}

@@ -13,6 +13,7 @@
   import { nostrOnline, nostrOfflineReason, goOnline, goOffline } from '$lib/store/nostr-online';
   import { relayRateLimits, clearExpiredRateLimits } from '$lib/nostr/client';
   import { viewerConnection } from '$lib/store/viewer-connection';
+  import { useNostrAction } from '$lib/nostr/use-nostr-action.svelte';
   import DevSection from './DevSection.svelte';
   import NostrQueuePanel from './NostrQueuePanel.svelte';
   import { onDestroy } from 'svelte';
@@ -35,9 +36,13 @@
   }
 
   let stats = $state<Record<string, DevStats>>({});
-  let pendingStatus = $state<Record<string, boolean>>({});
   let orphanedPubkeys = $state<string[]>([]);
   let loading = $state(false);
+  const statusActions = new Map<string, ReturnType<typeof useNostrAction>>();
+  function getStatusAction(pubkey: string) {
+    if (!statusActions.has(pubkey)) statusActions.set(pubkey, useNostrAction());
+    return statusActions.get(pubkey)!;
+  }
 
   // ── RTC polling + rate-limit countdown ───────────────────────────────────
   let rtcTick = $state(0);
@@ -147,18 +152,12 @@
   // ── Status request ───────────────────────────────────────────────────────
   async function requestStatus(pubkey: string) {
     if (!$identity) return;
-    pendingStatus = { ...pendingStatus, [pubkey]: true };
-    const timer = setTimeout(() => {
-      pendingStatus = { ...pendingStatus, [pubkey]: false };
-    }, 5000);
-    try {
-      await sendSignal($identity.privkey, $identity.pubkey, pubkey, {
+    const action = getStatusAction(pubkey);
+    await action.run(onQueued =>
+      sendSignal($identity.privkey, $identity.pubkey, pubkey, {
         type: 'status-request', sessionId: crypto.randomUUID(),
-      });
-    } catch {
-      clearTimeout(timer);
-      pendingStatus = { ...pendingStatus, [pubkey]: false };
-    }
+      }, { onQueued })
+    );
   }
 
   function fmtAge(updatedAt: number): string {
@@ -296,14 +295,17 @@
             {pk.slice(0, 12)}…
           </button>
           <!-- Status request -->
-          <button
-            class="act-btn"
-            disabled={!$nostrOnline || (pendingStatus[pk] ?? false)}
-            onclick={() => requestStatus(pk)}
-            title={!$nostrOnline ? 'Go online to request status' : 'Ask this device to report its current status'}
-          >
-            {(pendingStatus[pk] ?? false) ? '…' : 'Status?'}
-          </button>
+          {#if true}
+            {@const statusAction = getStatusAction(pk)}
+            <button
+              class="act-btn"
+              disabled={!$nostrOnline && statusAction.pending}
+              onclick={statusAction.pending ? statusAction.cancel : () => requestStatus(pk)}
+              title={!$nostrOnline && !statusAction.pending ? 'Go online to request status' : statusAction.pending ? 'Cancel request' : 'Ask this device to report its current status'}
+            >
+              {statusAction.pending ? `⏳ Cancel` : 'Status?'}
+            </button>
+          {/if}
           <span class="spacer"></span>
           <!-- Select -->
           <button
