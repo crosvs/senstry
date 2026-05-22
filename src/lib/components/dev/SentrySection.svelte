@@ -370,11 +370,12 @@
         cleanupTimer = setInterval(async () => {
           const currentCfg = get(storageCleanup);
           if (!currentCfg.autoCleanupEnabled) return;
-          const expired = await expirePinnedSegments();
+          const monPubkey = get(identity)?.pubkey;
+          const expired = await expirePinnedSegments(monPubkey);
           if (expired > 0) dbg('info', 'idb', `auto-cleanup: expired ${expired} pinned segment(s)`);
-          const thinned = await thinSegments(currentCfg.thinningRules);
+          const thinned = await thinSegments(currentCfg.thinningRules, monPubkey);
           if (thinned > 0) dbg('info', 'idb', `auto-cleanup: thinned ${thinned} segment(s)`);
-          await evictUnpinned();
+          await evictUnpinned(monPubkey);
         }, cfg.autoCleanupIntervalSec * 1000);
       }
     } catch (e) {
@@ -562,7 +563,7 @@
   function _deactivateActionNow(action: Action) {
     _cancelActionDeactivation(action.id);
     $actionStates = { ...$actionStates, [action.id]: { status: 'idle' } };
-    dbg('info', 'detector', `action deactivated: ${action.name || action.type}`);
+    dbg('info', 'detector', `action deactivated: ${action.name || action.type} (${action.id.slice(0, 8)})`);
     if (action.type === 'record') {
       for (const capId of action.captureIds) {
         const cap = $captures.find(c => c.id === capId);
@@ -624,9 +625,9 @@
           if (!ids.length || action.pinLifetimeSec == null) return;
           const now = Math.floor(Date.now() / 1000);
           const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
-          await pinRange(now - 2, now + 2, until, 'image/', chName);
+          await pinRange(now - 2, now + 2, until, 'image/', chName, id.pubkey);
         })
-        .catch(err => dbg('warn', 'detector', `snapshot error: ${err instanceof Error ? err.message : err}`));
+        .catch(err => dbg('warn', 'detector', `snapshot error action:${action.id.slice(0, 8)} ch:${chName} cap:${cap.sourceId}: ${err instanceof Error ? err.message : err}`));
     };
 
     fireSnapshot(); // immediate first shot
@@ -882,7 +883,7 @@
             await saveSegment(blob, mimeType, segBegin, segEnd, $identity.pubkey, chName);
             dbg('info', 'idb', `segment saved ch:${chName}/${captureType} [${segBegin}–${segEnd}] ${blob.size}B`);
           } catch (err) {
-            dbg('warn', 'idb', `segment save failed: ${err instanceof Error ? err.message : String(err)}`);
+            dbg('warn', 'idb', `segment save failed ch:${chName}/${captureType} [${segBegin}–${segEnd}] ${blob.size}B: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
         const newBest = _bestCaptureForChannel(channelId, captureType);
@@ -896,7 +897,7 @@
           channelRecorders.delete(key);
         }
       };
-      rec.onerror = (e) => dbg('warn', 'idb', `recorder error: ${(e as ErrorEvent).message ?? e}`);
+      rec.onerror = (e) => dbg('warn', 'idb', `recorder error ch:${channelId}/${captureType} cap:${cap.name} ${mimeType}: ${(e as ErrorEvent).message ?? e}`);
       currentSlot.recorder = rec;
       currentSlot.segmentStart = Math.floor(Date.now() / 1000);
       rec.start();
@@ -971,15 +972,15 @@
       }, $identity.pubkey, evt.timestamp, chName)
         .then(async ids => {
           if (!ids.length) return;
-          dbg('info', 'detector', `${ids.length} snapshot(s) stored for action ${action.name || action.id}`);
+          dbg('info', 'detector', `${ids.length} snapshot(s) stored action:${action.name || action.id.slice(0, 8)} ch:${chName} cap:${cap.sourceId}`);
           if (action.pinLifetimeSec != null) {
             const now = Math.floor(Date.now() / 1000);
             const until = action.pinLifetimeSec === 0 ? 0 : now + action.pinLifetimeSec;
             const spanEnd = evt.timestamp + (action.snapshotCount - 1) * Math.max(action.intervalSec, 1) + 2;
-            await pinRange(evt.timestamp, spanEnd, until, 'image/', chName);
+            await pinRange(evt.timestamp, spanEnd, until, 'image/', chName, $identity.pubkey);
           }
         })
-        .catch(err => dbg('warn', 'detector', `snapshot error: ${err instanceof Error ? err.message : err}`));
+        .catch(err => dbg('warn', 'detector', `snapshot error action:${action.name || action.id.slice(0, 8)} ch:${chName} cap:${cap.sourceId}: ${err instanceof Error ? err.message : err}`));
     }
   }
 
@@ -1010,7 +1011,7 @@
       session = { refId: ref.refId, startTime: from, endTime: to, mimeType: 'audio/webm', triggerType: evt.type, channelId: action.channelId, timer: null };
       footageSessions.set(action.id, session);
       syncAlerts();
-      dbg('info', 'idb', `clip session created: ${ref.refId.slice(0, 8)}…`);
+      dbg('info', 'idb', `clip session created: ${ref.refId.slice(0, 8)}… action:${action.id.slice(0, 8)} ch:${action.channelId} trigger:${evt.type} [${from}–${to}]`);
     } else if (action.onRetrigger === 'restart') {
       // Close current session immediately and open a new one from this event
       if (session.timer) clearTimeout(session.timer);
@@ -1024,7 +1025,7 @@
       session = { refId: ref.refId, startTime: from, endTime: to, mimeType: 'audio/webm', triggerType: evt.type, channelId: action.channelId, timer: null };
       footageSessions.set(action.id, session);
       syncAlerts();
-      dbg('info', 'idb', `clip session restarted: ${ref.refId.slice(0, 8)}…`);
+      dbg('info', 'idb', `clip session restarted: ${ref.refId.slice(0, 8)}… action:${action.id.slice(0, 8)} ch:${action.channelId} trigger:${evt.type} [${from}–${to}]`);
     } else if (action.onRetrigger === 'extend') {
       const newEnd = Math.max(session.endTime, to);
       if (newEnd > session.endTime) {
@@ -1060,7 +1061,7 @@
       const monPubkey = get(identity)?.pubkey;
       // Pin audio/video segments in the time window
       if (action.captureTypes.some(t => t === 'audio' || t === 'video')) {
-        await pinRange(s.startTime, s.endTime, until, undefined, s.channelId);
+        await pinRange(s.startTime, s.endTime, until, undefined, s.channelId, monPubkey ?? undefined);
       }
       // Pin photos taken during the window by this monitor
       if (action.captureTypes.includes('photo') && monPubkey) {
@@ -1068,7 +1069,7 @@
         await Promise.all(photos.map(p => pinPhoto(p.photoId, true)));
       }
     }
-    dbg('info', 'idb', `clip session closed: ${s.refId.slice(0, 8)}… [${s.startTime}–${s.endTime}]`);
+    dbg('info', 'idb', `clip session closed: ${s.refId.slice(0, 8)}… action:${actionId.slice(0, 8)} ch:${s.channelId} trigger:${s.triggerType} [${s.startTime}–${s.endTime}]`);
     const id = get(identity);
     if (!id || !isPublishing(get(monitorState)) || !get(nostrOnline)) return;
     const relays = getRelays();

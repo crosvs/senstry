@@ -67,20 +67,20 @@ export function startSignalRouter(
 		} else if (msg.type === 'offer-request' || msg.type === 'answer') {
 			// Monitor-bound: offer-request initiates a session; answer completes the handshake.
 			Promise.resolve(monitorHandler(msg, fromPubkey, createdAt)).catch((e) =>
-				dbg('warn', 'rtc', `monitorHandler error: ${e instanceof Error ? e.message : e}`)
+				dbg('warn', 'rtc', `monitorHandler ${msg.type} error sess:${msg.sessionId?.slice(0, 8)} from:${fromPubkey.slice(0, 8)}: ${e instanceof Error ? e.message : e}`)
 			);
 		} else if (msg.type === 'hangup') {
 			// Hangup can come from either direction — dispatch to both; each checks its own session map.
 			Promise.resolve(monitorHandler(msg, fromPubkey, createdAt)).catch((e) =>
-				dbg('warn', 'rtc', `monitorHandler hangup error: ${e instanceof Error ? e.message : e}`)
+				dbg('warn', 'rtc', `monitorHandler hangup error sess:${msg.sessionId?.slice(0, 8)} from:${fromPubkey.slice(0, 8)}: ${e instanceof Error ? e.message : e}`)
 			);
 			Promise.resolve(viewerHandler(msg, fromPubkey, createdAt)).catch((e) =>
-				dbg('warn', 'rtc', `viewerHandler hangup error: ${e instanceof Error ? e.message : e}`)
+				dbg('warn', 'rtc', `viewerHandler hangup error sess:${msg.sessionId?.slice(0, 8)} from:${fromPubkey.slice(0, 8)}: ${e instanceof Error ? e.message : e}`)
 			);
 		} else {
 			// offer, pong — viewer-bound.
 			Promise.resolve(viewerHandler(msg, fromPubkey, createdAt)).catch((e) =>
-				dbg('warn', 'rtc', `viewerHandler error: ${e instanceof Error ? e.message : e}`)
+				dbg('warn', 'rtc', `viewerHandler ${msg.type} error sess:${msg.sessionId?.slice(0, 8)} from:${fromPubkey.slice(0, 8)}: ${e instanceof Error ? e.message : e}`)
 			);
 		}
 	});

@@ -60,10 +60,10 @@
       <button class="act-btn" onclick={handleStopLive}>Stop Live</button>
     {:else if vc.status === 'online' && vc.mode === 'data'}
       <button class="act-btn accent" onclick={handleGoLive} disabled={liveLoading || !vc.channelId}>
-        {liveLoading ? 'Connecting…' : 'Go Live'}
+        {liveLoading ? 'Connecting…' : 'Watch Live'}
       </button>
     {:else}
-      <button class="act-btn" disabled>Go Live</button>
+      <button class="act-btn" disabled>Watch Live</button>
       <span class="status">Connect via Devices first</span>
     {/if}
     <select class="source-select"

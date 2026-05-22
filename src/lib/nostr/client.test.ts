@@ -5,7 +5,6 @@ const mockPublish = vi.fn();
 const mockSubscribeMany = vi.fn();
 
 // Use a real class so `new SimplePool()` works as a constructor.
-// This prevents the "not a constructor" error from using arrow-fn mocks.
 vi.mock('nostr-tools/pool', () => ({
 	SimplePool: class {
 		publish = mockPublish;
@@ -23,10 +22,12 @@ import type { NostrEvent } from 'nostr-tools';
 
 const RELAY = 'wss://fake-relay.test/';
 
+let _idSeq = 0;
 function makeEvent(kind = 1): NostrEvent {
+	const id = (_idSeq++).toString(16).padStart(64, '0');
 	return {
 		kind,
-		id: 'a'.repeat(64),
+		id,
 		pubkey: 'b'.repeat(64),
 		created_at: Math.floor(Date.now() / 1000),
 		tags: [],
@@ -36,10 +37,10 @@ function makeEvent(kind = 1): NostrEvent {
 }
 
 beforeEach(() => {
+	_idSeq = 0;
 	_resetForTest();
 	mockPublish.mockReset();
 	mockSubscribeMany.mockReset();
-	// Default: relay accepts the event
 	mockPublish.mockReturnValue([Promise.resolve('ok')]);
 	mockSubscribeMany.mockReturnValue({ close: vi.fn() });
 	setRelays([RELAY]);
@@ -66,32 +67,19 @@ describe('relay config', () => {
 	});
 });
 
-// ── rate limiter ──────────────────────────────────────────────────────────────
+// ── rate limit configuration ──────────────────────────────────────────────────
 
 describe('rate limiter', () => {
-	it('getRateLimitAvailable returns ~max right after setRateLimit', () => {
+	it('getRateLimitAvailable returns configured rate', () => {
 		setRateLimit(50);
-		expect(getRateLimitAvailable()).toBeCloseTo(50, 0);
+		expect(getRateLimitAvailable()).toBe(50);
 	});
 
-	it('available tokens decrease after each publish', async () => {
-		setRateLimit(10);
-		const before = getRateLimitAvailable();
-		await publish(makeEvent());
-		await publish(makeEvent());
-		expect(getRateLimitAvailable()).toBeLessThan(before);
-	});
-
-	it('throws rate-limited when bucket is empty', async () => {
-		// Set max to a tiny value so the bucket empties immediately
-		setRateLimit(0.001);
-		await expect(publish(makeEvent())).rejects.toThrow('rate-limited');
-	});
-
-	it('does not call SimplePool.publish when rate-limited', async () => {
-		setRateLimit(0.001);
-		await publish(makeEvent()).catch(() => {});
-		expect(mockPublish).not.toHaveBeenCalled();
+	it('getRateLimitAvailable reflects updated rate after setRateLimit', () => {
+		setRateLimit(30);
+		expect(getRateLimitAvailable()).toBe(30);
+		setRateLimit(120);
+		expect(getRateLimitAvailable()).toBe(120);
 	});
 });
 
@@ -99,8 +87,6 @@ describe('rate limiter', () => {
 
 describe('publish error handling', () => {
 	it('throws when all relays reject', async () => {
-		// Use mockImplementation (lazy) so the rejected promise is created when
-		// publish() calls mockPublish — avoiding unhandled rejection warnings.
 		mockPublish.mockImplementation(() => [Promise.reject(new Error('auth-required'))]);
 		await expect(publish(makeEvent())).rejects.toThrow('publish failed');
 	});
@@ -122,17 +108,14 @@ describe('getPublishRate', () => {
 		expect(getPublishRate().last60s).toBe(0);
 	});
 
-	it('last60s increments after each successful publish', async () => {
-		await publish(makeEvent());
-		await publish(makeEvent());
-		await publish(makeEvent());
-		expect(getPublishRate().last60s).toBe(3);
+	it('max reflects the configured rate', () => {
+		setRateLimit(42);
+		expect(getPublishRate().max).toBe(42);
 	});
 
-	it('last60s does not increment when rate-limited', async () => {
-		setRateLimit(0.001);
-		await publish(makeEvent()).catch(() => {});
-		expect(getPublishRate().last60s).toBe(0);
+	it('last60s increments after a successful publish', async () => {
+		await publish(makeEvent());
+		expect(getPublishRate().last60s).toBe(1);
 	});
 });
 
@@ -156,12 +139,9 @@ describe('subscribe', () => {
 	it('delivers events to the onEvent callback', () => {
 		const handler = vi.fn();
 		subscribe({ kinds: [1] }, handler);
-
-		// Grab the onevent callback that was passed to subscribeMany
 		const [, , { onevent }] = mockSubscribeMany.mock.calls[0];
 		const ev = makeEvent();
 		onevent(ev);
-
 		expect(handler).toHaveBeenCalledWith(ev);
 	});
 });
@@ -171,55 +151,75 @@ describe('subscribe', () => {
 describe('publish cooldownKey', () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
-		// Set a fixed point in time AFTER the outer beforeEach ran (real time ≈ May 2026),
-		// then call _resetForTest() so the token bucket's lastRefill aligns with fake time.
 		vi.setSystemTime(new Date('2026-07-01T00:00:00Z'));
 		_resetForTest();
+		_idSeq = 0;
 		setRelays([RELAY]);
-		setRateLimit(200);
+		setRateLimit(200); // interval = 300ms
 	});
 
 	afterEach(() => {
 		vi.useRealTimers();
 	});
 
+	// Helper: publish and flush microtasks (first event always sends immediately
+	// since _lastSentAt=0 → wait=max(0, 300 - large_now)=0)
+	async function publishNow(opts?: Parameters<typeof publish>[1]) {
+		const p = publish(makeEvent(), opts);
+		await vi.advanceTimersByTimeAsync(0);
+		return p;
+	}
+
+	// Helper: advance past the drain interval so a queued item can send
+	async function drainNext() {
+		await vi.advanceTimersByTimeAsync(300);
+	}
+
 	it('getCooldownRemaining returns 0 when no cooldown is active', () => {
 		expect(getCooldownRemaining('key-a')).toBe(0);
 	});
 
 	it('first publish with cooldownKey succeeds and sets cooldown', async () => {
-		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 })).resolves.toBeUndefined();
+		await publishNow({ cooldownKey: 'k', cooldownMs: 10_000 });
 		expect(getCooldownRemaining('k')).toBeGreaterThan(0);
 	});
 
 	it('second publish within cooldown throws "cooldown" and does not call relay', async () => {
-		await publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 });
+		await publishNow({ cooldownKey: 'k', cooldownMs: 10_000 });
 		mockPublish.mockClear();
+		// Cooldown rejection happens synchronously (before drain), no timer needed
 		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 })).rejects.toThrow('cooldown');
 		expect(mockPublish).not.toHaveBeenCalled();
 	});
 
 	it('publish succeeds again after cooldown expires', async () => {
-		await publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 });
+		await publishNow({ cooldownKey: 'k', cooldownMs: 10_000 });
 		vi.advanceTimersByTime(10_001);
-		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 })).resolves.toBeUndefined();
+		// Need to drain interval too since _lastSentAt was just set
+		const p = publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 10_000 });
+		await drainNext();
+		await expect(p).resolves.toBeUndefined();
 	});
 
 	it('clearCooldown removes an active cooldown', async () => {
-		await publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 60_000 });
+		await publishNow({ cooldownKey: 'k', cooldownMs: 60_000 });
 		clearCooldown('k');
 		expect(getCooldownRemaining('k')).toBe(0);
-		await expect(publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 60_000 })).resolves.toBeUndefined();
+		const p = publish(makeEvent(), { cooldownKey: 'k', cooldownMs: 60_000 });
+		await drainNext();
+		await expect(p).resolves.toBeUndefined();
 	});
 
 	it('cooldownMs=0 / undefined does not set a cooldown after publish', async () => {
-		await publish(makeEvent(), { cooldownKey: 'k' }); // no cooldownMs
+		await publishNow({ cooldownKey: 'k' }); // no cooldownMs
 		expect(getCooldownRemaining('k')).toBe(0);
 	});
 
 	it('independent cooldown keys do not interfere', async () => {
-		await publish(makeEvent(), { cooldownKey: 'a', cooldownMs: 10_000 });
-		// 'b' has no cooldown — should publish fine
-		await expect(publish(makeEvent(), { cooldownKey: 'b', cooldownMs: 10_000 })).resolves.toBeUndefined();
+		await publishNow({ cooldownKey: 'a', cooldownMs: 10_000 });
+		// 'b' has no cooldown — should publish fine after interval elapses
+		const p = publish(makeEvent(), { cooldownKey: 'b', cooldownMs: 10_000 });
+		await drainNext();
+		await expect(p).resolves.toBeUndefined();
 	});
 });

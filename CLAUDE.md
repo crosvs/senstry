@@ -41,15 +41,17 @@ src/
       peer.ts                 ← RTCPeerConnection helpers, non-trickle ICE
       signaling.ts            ← NIP-59 gift-wrap send/receive
       signal-router.ts        ← single global kind-1059 subscription
-      viewer-peer.ts          ← viewer session management, data channel client
-      monitor-peer.ts         ← monitor session management, data channel server
+      viewer-peer.ts          ← viewer session management, live upgrade, data channel client
+      viewer-peer.test.ts     ← unit tests for viewer-peer
+      monitor-peer.ts         ← monitor session management, live renegotiation, data channel server
+      monitor-peer.test.ts    ← unit tests for monitor-peer
     nostr/
       client.ts               ← SimplePool wrapper, rate limiter, publish/subscribe
       crypto.ts               ← NIP-44 encrypt/decrypt, NIP-59 gift-wrap/unwrap
       events.ts               ← event builder functions, kind constants
       keys.ts                 ← keypair load/create/import
     db/
-      idb.ts                  ← IDB schema (v7), openDB
+      idb.ts                  ← IDB schema (v8), openDB
       segments.ts             ← segment save/query/evict/thin/pin; OPFS blob storage
       footage.ts              ← footage ref CRUD
     store/
@@ -90,7 +92,12 @@ docs/
 The codebase uses Svelte 5 runes throughout. Use `$state`, `$derived`, `$effect`, `untrack()`. Do not use Svelte 4 syntax (`$:`, `let x = ...` as reactive).
 
 ### Non-trickle ICE
-`peer.ts:waitForIceGathering()` waits for all ICE candidates before sending SDP. This compresses signaling from ~15 Nostr events to 3 (offer-request → offer → answer). The 5s timeout guards against STUN failure.
+`peer.ts:waitForIceGathering()` waits for all ICE candidates before sending SDP. This compresses signaling from ~15 Nostr events to 3 (offer-request → offer → answer) for a fresh connection, and to 2 (renegotiation offer + answer) for a live upgrade. The 5s timeout guards against STUN failure.
+
+### Live Upgrade Path (data → live, in-band)
+When a viewer already has an open data connection, "Watch Live" sends `{ type: 'live-request', channelId }` over the existing `controlChannel` instead of closing and reopening. The monitor adds media tracks and sends a renegotiation offer (1 Nostr event); the viewer answers (1 Nostr event). This avoids the full 3-event handshake and stays within relay rate limits when both devices recently connected.
+
+`pendingLiveUpgrades` in `viewer-peer.ts` tracks the in-flight upgrade promise. `closeSession` rejects it on disconnect. The `onTrack` handler in `ensureConnection` reads `session.mode` dynamically so it resolves the upgrade when the renegotiated stream arrives.
 
 ### Pipeline: Links + Actions (not the old per-type links)
 The pipeline uses a two-layer model:
@@ -134,8 +141,18 @@ When a `RecordAction` activates, `SentrySection._updateChannelActiveSources()` p
 - `0` — pinned forever
 - `N > 0` — pinned until unix timestamp N
 
-### IDB Schema (v7)
+### Device-Scoped Segment Filtering
+Fetched segments and stored segments are tagged with `originMonitor: string` (source device pubkey) to support multi-device viewers. In `ContentViewerSection`:
+- **Player and Fetcher are independent UIs**: the player has its own time range, type filters, channel filters, and loads from local IDB; the fetcher has separate controls for RTC/remote fetching
+- **Fetched segments list**—shown as a browsable table below the player—filters automatically by `selectedMonitorPubkey` (set in `DevicesSection`). When no device is selected, all fetched segments appear; when a device is selected, only that device's segments show
+- **Dedup key format**: `${source}-${originMonitor}-${segmentId}` prevents cross-device ID collisions
+- **Player segment index** (`_playerIdx` derived): pre-splits `playerSegs` into `videoByChannel`, `audioByChannel`, `photos`, `allVideo`, `allAudio` for O(1) access; updated only when `playerSegs` changes, not per tick
+- **Mobile perf**: player tick uses binary search O(log n) to find segment at playback time; IDB queries use `originMonitor` index for O(1) device-scoped lookups
+
+### IDB Schema (v8)
 Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, `photos`, `outbox`, `segments`. Segment blobs live in OPFS (`recordings/<segmentId>`), only metadata in IDB.
+
+**v8 migration**: added `originMonitor` index on segments store for device-scoped queries (`getAllFromIndex('segments', 'originMonitor', pubkey)`), enabling O(1) lookup instead of full-table scan when filtering by source device.
 
 ## Common Patterns
 
@@ -162,6 +179,7 @@ Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, 
 - **Never call `saveSegment` with a blob still backed by OPFS** — call `materializeBlob()` first to copy into a pure ArrayBuffer-backed Blob
 - **Don't trickle ICE** — always go through `waitForIceGathering` before sending SDP
 - **Don't use Svelte 4 reactivity** — no `$:`, no `export let` for bindable state (use `$props()` with `$bindable()`)
-- **Don't add the same segment twice** — use `backupOf` to track canonical origin IDs across viewer chains
+- **Don't add the same segment twice** — use `backupOf` to track canonical origin IDs across viewer chains; also check `originMonitor` to prevent cross-device ID collisions
 - **Never send Nostr events when `nostrOnline` is false** — check `get(nostrOnline)` before any `publish()` call not already inside `outboxFlusher`
 - **RecordAction source selection uses `cap.sourceId`** — not `ChannelConfig.videoSourceId`/`audioSourceId` (those are live-RTC fallbacks only)
+- **Fetched segments list filters by `selectedMonitorPubkey` automatically** — don't add manual filtering; `ContentViewerSection.svelte` derives `browsedSegsWithIdx` from `$props.selectedMonitorPubkey`

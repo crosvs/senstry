@@ -76,45 +76,55 @@ On receive: `giftUnwrap(event, privkey)` decrypts to get the inner rumor. The in
 
 ### Session Management
 
-Sessions are keyed by `monitorPubkey`. One session = one `RTCPeerConnection` + optional `RTCDataChannel`.
+Sessions are keyed by `monitorPubkey`. One session = one `RTCPeerConnection` + two `RTCDataChannel`s.
 
 ```typescript
 sessions: Map<monitorPubkey, {
   pc: RTCPeerConnection;
   sessionId: string;
-  dataChannel: RTCDataChannel | null;
+  controlChannel: RTCDataChannel | null;  // JSON messages: requests, metadata, small responses
+  dataChannel: RTCDataChannel | null;     // segment chunk payloads (binary/base64)
   mode: 'live' | 'data';
 }>
 ```
 
 `connectPromises` prevents concurrent duplicate connection attempts to the same monitor.
 
+`pendingLiveUpgrades` tracks in-flight live-upgrade promises (one per monitorPubkey), resolved when the renegotiation offer's `ontrack` fires.
+
 ### Connection Flow
 
 ```
-ensureConnection(privkey, myPubkey, monitorPubkey, mode)
+connectToMonitor / startLiveView → ensureConnection(privkey, myPubkey, monitorPubkey, mode)
   │
   ├─ check sessions.has(monitorPubkey) → already connected? return
   ├─ check connectPromises.has(monitorPubkey) → in progress? return same Promise
   │
   └─ new Promise:
        sendOfferRequest(...)          → monitor triggers handleOfferRequest
-       wait for pc.ondatachannel      → monitor's data channel arrives
+       wait for pc.ondatachannel      → monitor's 'control' channel arrives
        channel.onopen                 → resolve
        30s timeout → fail() + closeSession
        ICE 'failed'/'closed' → fail()
        ICE 'disconnected' → 8s grace timer → fail()
 ```
 
-### Session ID Adoption
+### Live Upgrade Path (data → live)
 
-If a prior connection attempt timed out, it may leave a stale session in `sessions` with the old `sessionId`. When a new offer arrives (always direct response to an offer-request), `handleViewerSignal` adopts the new `sessionId` if the session has no open data channel yet:
+When a viewer already has an open data connection and clicks "Watch Live", `startLiveView` takes an in-band path that avoids a new `offer-request` Nostr event:
 
-```typescript
-if (session.sessionId !== msg.sessionId && msg.type === 'offer' && !session.dataChannel) {
-  session.sessionId = msg.sessionId; // adopt incoming session ID
-}
 ```
+startLiveView (existing data session)
+  │
+  ├─ session.mode = 'live'
+  ├─ controlChannel.send({ type: 'live-request', channelId })
+  │     → monitor adds tracks + sends renegotiation offer (1 Nostr event)
+  ├─ handleViewerSignal receives 'offer'
+  │     → setRemoteDescription + createAnswer + sendAnswer (1 Nostr event)
+  └─ onTrack fires → resolve pendingLiveUpgrades promise
+```
+
+Total Nostr events for the live upgrade: **2** (renegotiation offer + answer), vs **4** if the connection were closed and reopened (offer-request + offer + answer + answer). The initial data connection costs 3 events (offer-request + offer + answer).
 
 ### Request API
 
@@ -161,15 +171,25 @@ handleOfferRequest(privkey, monitorPubkey, msg, fromViewerPubkey)
   │
   ├─ close any existing session for this viewer
   ├─ createPeer()
-  ├─ if mode === 'live': add tracks from activeStreams
+  ├─ if mode === 'live': add tracks from activeStreams (via buildCompositeStream)
   │    channelId → channelActiveSources override or ChannelConfig default
-  │    sourceId  → legacy single-source path
   │    neither   → composite all open sources
-  ├─ createDataChannel('data')
+  ├─ createDataChannel('control')   ← JSON messages
+  ├─ createDataChannel('data')      ← segment chunk payloads
+  ├─ controlDc.onmessage → handleDataMessage (+ live-request handler inline)
   ├─ createOffer → setLocalDescription
   ├─ waitForIceGathering()
   └─ sendOffer(...)
 ```
+
+### Live Upgrade (Renegotiation)
+
+When the monitor receives `{ type: 'live-request', channelId }` on the control channel:
+1. `buildCompositeStream(channelId)` selects tracks (same priority order as initial live mode)
+2. `pc.addTrack(...)` for each track
+3. `createOffer` → `setLocalDescription` → `waitForIceGathering` → `sendOffer`
+
+This is a WebRTC renegotiation over the existing `RTCPeerConnection` — no new Nostr `offer-request` is needed.
 
 ### Live Stream Track Selection
 
@@ -184,6 +204,7 @@ All messages are JSON strings. The monitor handles:
 
 | Request type | Response type(s) | Description |
 |---|---|---|
+| `live-request` | *(renegotiation offer via Nostr)* | Upgrade data session to live stream; monitor adds tracks and renegotiates |
 | `source-list-request` | `source-list` | List of open sourceIds |
 | `coverage-request` | `coverage-map` | `[[startTime, endTime], ...]` ranges |
 | `segment-request` | `segment-meta` + N×`segment-chunk` or `segment-error` | Segment at timestamp |

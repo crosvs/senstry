@@ -1,7 +1,7 @@
 import { openDB as idbOpenDB, type IDBPDatabase } from 'idb';
 
 export const DB_NAME = 'senstry';
-export const DB_VERSION = 7;
+export const DB_VERSION = 8;
 
 let _db: IDBPDatabase | null = null;
 
@@ -68,6 +68,11 @@ export async function openDB(): Promise<IDBPDatabase> {
 				// v7 renames sourceId → channelId on segments and footageRefs.
 				// The sourceId concept is replaced by channelId (channel is the recording unit).
 				// Existing records without channelId get channelId='default-channel'.
+			}
+			if (oldVersion < 8) {
+				// v8 adds originMonitor index to segments for efficient per-device queries.
+				// Previously all device-filtered queries did full table scans.
+				tx.objectStore('segments').createIndex('originMonitor', 'originMonitor');
 			}
 		}
 	});

@@ -101,10 +101,19 @@ describe('reportPublishError', () => {
 
 	it('nostrOfflineReason contains the relay error message', async () => {
 		nostrOnline.set(true);
-		const msg = 'publish failed: rate-limited: you are noting too much';
+		const msg = 'publish failed: auth-required';
 		for (let i = 0; i < 3; i++) reportPublishError(new Error(msg));
 		await flush();
 		expect(get(nostrOfflineReason)).toContain('publish failed');
+	});
+
+	it('ignores relay-imposed rate-limit errors (message starts with "publish failed: rate-limited")', async () => {
+		nostrOnline.set(true);
+		const msg = 'publish failed: rate-limited: you are noting too much';
+		for (let i = 0; i < 5; i++) reportPublishError(new Error(msg));
+		await flush();
+		expect(get(nostrOnline)).toBe(true);
+		expect(get(nostrOfflineReason)).toBeNull();
 	});
 
 	it('ignores unrecognised error formats', async () => {

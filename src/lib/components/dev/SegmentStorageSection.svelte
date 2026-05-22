@@ -245,10 +245,10 @@
           }
           alertsStatus = `Listening… (${fetchedAlerts.filter(a => a.source !== 'idb').length} from Nostr)`;
         } catch (e) {
-          dbg('warn', 'nostr', `alert decrypt failed: ${e instanceof Error ? e.message : String(e)}`);
+          dbg('warn', 'nostr', `alert decrypt failed from:${event.pubkey.slice(0, 8)} event:${event.id.slice(0, 8)}: ${e instanceof Error ? e.message : String(e)}`);
         }
       },
-      () => dbg('info', 'nostr', 'alerts EOSE')
+      () => dbg('info', 'nostr', `alerts EOSE — ${fetchedAlerts.length} alert(s) so far from:${selectedMonitorPubkey?.slice(0, 8) ?? 'paired'}`)
     );
     nostrSub = thisSub;
     return new Promise((resolve) => {

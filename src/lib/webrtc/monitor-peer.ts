@@ -89,6 +89,31 @@ function resetIdleTimer(
 	}, idleTimeoutMs);
 }
 
+function buildCompositeStream(channelId?: string, sourceId?: string): MediaStream {
+	const composite = new MediaStream();
+	if (channelId && activeChannels.has(channelId)) {
+		const ch = activeChannels.get(channelId)!;
+		const override = channelActiveSources.get(channelId);
+		const videoSrcId = override?.videoSourceId !== undefined ? override.videoSourceId : ch.videoSourceId;
+		const audioSrcId = override?.audioSourceId !== undefined ? override.audioSourceId : ch.audioSourceId;
+		if (videoSrcId) {
+			const vStream = activeStreams.get(videoSrcId);
+			if (vStream) for (const t of vStream.getVideoTracks()) composite.addTrack(t);
+		}
+		if (audioSrcId) {
+			const aStream = activeStreams.get(audioSrcId);
+			if (aStream) for (const t of aStream.getAudioTracks()) composite.addTrack(t);
+		}
+	} else if (sourceId && activeStreams.has(sourceId)) {
+		for (const t of activeStreams.get(sourceId)!.getTracks()) composite.addTrack(t);
+	} else {
+		for (const stream of activeStreams.values()) {
+			for (const t of stream.getTracks()) composite.addTrack(t);
+		}
+	}
+	return composite;
+}
+
 export async function handleOfferRequest(
 	privkey: Uint8Array,
 	monitorPubkey: string,
@@ -126,37 +151,10 @@ export async function handleOfferRequest(
 	// Data-mode connections (segment/coverage fetch) skip this to avoid
 	// unintended live stream side-effects and unnecessary bandwidth.
 	if (activeStreams.size > 0 && msg.mode === 'live') {
-		const requestedChannel = msg.channelId as string | undefined;
-		const requestedSource  = msg.sourceId  as string | undefined;
-		// Combine selected tracks into a single composite MediaStream.
-		// Using separate per-source streams causes the viewer's ontrack events to fire
-		// once per source, each overwriting remoteStream — last one wins, dropping prior tracks.
-		const composite = new MediaStream();
-		if (requestedChannel && activeChannels.has(requestedChannel)) {
-			// Channel-based compositing.
-			// Active RecordAction sources (pushed by SentrySection) take priority over
-			// the channel's default videoSourceId/audioSourceId fallbacks.
-			const ch = activeChannels.get(requestedChannel)!;
-			const override = channelActiveSources.get(requestedChannel);
-			const videoSrcId = override?.videoSourceId !== undefined ? override.videoSourceId : ch.videoSourceId;
-			const audioSrcId = override?.audioSourceId !== undefined ? override.audioSourceId : ch.audioSourceId;
-			if (videoSrcId) {
-				const vStream = activeStreams.get(videoSrcId);
-				if (vStream) for (const t of vStream.getVideoTracks()) composite.addTrack(t);
-			}
-			if (audioSrcId) {
-				const aStream = activeStreams.get(audioSrcId);
-				if (aStream) for (const t of aStream.getAudioTracks()) composite.addTrack(t);
-			}
-		} else if (requestedSource && activeStreams.has(requestedSource)) {
-			// Legacy sourceId path — all tracks from one source.
-			for (const t of activeStreams.get(requestedSource)!.getTracks()) composite.addTrack(t);
-		} else {
-			// No filter — composite all open sources.
-			for (const stream of activeStreams.values()) {
-				for (const t of stream.getTracks()) composite.addTrack(t);
-			}
-		}
+		const composite = buildCompositeStream(
+			msg.channelId as string | undefined,
+			msg.sourceId  as string | undefined
+		);
 		for (const track of composite.getTracks()) pc.addTrack(track, composite);
 	}
 
@@ -164,9 +162,26 @@ export async function handleOfferRequest(
 	const dataDc    = pc.createDataChannel('data');
 	session.controlChannel = controlDc;
 	session.dataChannel    = dataDc;
-	controlDc.onmessage = (e) => {
+	controlDc.onmessage = async (e) => {
 		if (sessions.get(fromPubkey)?.generation !== myGeneration) return;
 		resetIdleTimer(privkey, monitorPubkey, session);
+
+		// live-request upgrades a data session to live by adding tracks + renegotiating.
+		// Handled inline so it has access to privkey, monitorPubkey, session, and pc.
+		let req: { type: string } & Record<string, unknown>;
+		try { req = JSON.parse(e.data); } catch { return; }
+		if (req.type === 'live-request') {
+			if (activeStreams.size > 0) {
+				const composite = buildCompositeStream(req.channelId as string | undefined);
+				for (const track of composite.getTracks()) pc.addTrack(track, composite);
+				const offer = await pc.createOffer();
+				await pc.setLocalDescription(offer);
+				await waitForIceGathering(pc);
+				await sendOffer(privkey, monitorPubkey, fromPubkey, pc.localDescription!.sdp!, session.sessionId);
+			}
+			return;
+		}
+
 		handleDataMessage(controlDc, dataDc, e.data, monitorPubkey);
 	};
 
@@ -192,7 +207,7 @@ export async function handleOfferRequest(
 			const errMsg = e instanceof Error ? e.message : String(e);
 			const delay = OFFER_RETRY_DELAYS_MS[attempt];
 			if (delay !== undefined && (errMsg.includes('rate-limited') || errMsg.includes('publish failed'))) {
-				dbg('warn', 'rtc', `monitor: offer rate-limited, retrying in ${delay / 1000}s…`);
+				dbg('warn', 'rtc', `monitor: offer rate-limited sess:${msg.sessionId.slice(0, 8)} to:${fromPubkey.slice(0, 8)} attempt:${attempt + 1}/${OFFER_RETRY_DELAYS_MS.length + 1}, retrying in ${delay / 1000}s`);
 				await new Promise(r => setTimeout(r, delay));
 			} else {
 				closeSession(fromPubkey);
@@ -249,7 +264,8 @@ async function handleDataMessage(
 
 	if (req.type === 'coverage-request') {
 		const mimePrefix = req.mimePrefix as string | undefined;
-		const segments = await getCoverageMap(originMonitor, mimePrefix);
+		const channelId  = req.channelId  as string | undefined;
+		const segments = await getCoverageMap(originMonitor, mimePrefix, channelId);
 		controlDc.send(JSON.stringify({ type: 'coverage-map', segments, mimePrefix: mimePrefix ?? null }));
 		return;
 	}
@@ -299,10 +315,44 @@ async function handleDataMessage(
 		return;
 	}
 
+	if (req.type === 'segments-in-range-request') {
+		const from      = req.from as number;
+		const to        = req.to   as number;
+		const limit     = Math.min((req.limit as number | undefined) ?? 20, 50);
+		const order     = (req.order as string | undefined) === 'desc' ? 'desc' : 'asc';
+		const knownIds  = (req.knownIds as string[] | undefined) ?? [];
+		const mimePrefix = req.mimePrefix as string | undefined;
+		const channelId  = req.channelId  as string | undefined;
+
+		const allSegs = await getSegmentsInRange(from, to, originMonitor, channelId);
+		let segs = allSegs
+			.filter(s => !knownIds.includes(s.backupOf ?? s.segmentId))
+			.filter(s => mimePrefix == null || s.mimeType.startsWith(mimePrefix));
+
+		segs.sort((a, b) => order === 'desc' ? b.startTime - a.startTime : a.startTime - b.startTime);
+		segs = segs.slice(0, limit);
+
+		controlDc.send(JSON.stringify({
+			type: 'segments-in-range',
+			from,
+			to,
+			segments: segs.map(s => ({
+				segmentId: s.backupOf ?? s.segmentId,
+				startTime: s.startTime,
+				endTime: s.endTime,
+				mimeType: s.mimeType,
+				sizeBytes: s.sizeBytes,
+				contentHash: (s as { contentHash?: string }).contentHash ?? '',
+			})),
+		}));
+		return;
+	}
+
 	if (req.type === 'segment-request') {
 		const requestTime = req.time as number;
 		const mimePrefix = req.mimePrefix as string | undefined;
-		const candidates = await getSegmentsInRange(requestTime, requestTime, originMonitor);
+		const channelId  = req.channelId  as string | undefined;
+		const candidates = await getSegmentsInRange(requestTime, requestTime, originMonitor, channelId);
 		const meta = candidates.find((s) =>
 			s.startTime <= requestTime && s.endTime > requestTime &&
 			(mimePrefix == null || s.mimeType.startsWith(mimePrefix))
@@ -418,4 +468,13 @@ export function getMonitorSessionInfos(): MonitorSessionInfo[] {
 
 export async function getMonitorRTCStats(viewerPubkey: string): Promise<RTCStatsReport | null> {
 	return sessions.get(viewerPubkey)?.pc.getStats() ?? null;
+}
+
+export function _resetForTest(): void {
+	sessions.clear();
+	globalGeneration = 0;
+	offerRequestTimes.clear();
+	activeStreams.clear();
+	activeChannels.clear();
+	channelActiveSources.clear();
 }

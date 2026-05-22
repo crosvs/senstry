@@ -18,8 +18,9 @@ const FAILURE_THRESHOLD = 3;
 export function reportPublishError(err: Error): void {
 	if (!get(nostrOnline)) return;
 	const msg = err.message ?? '';
-	// Token-bucket rate-limiting is local throttling, not a relay error — ignore.
+	// Local token-bucket throttle and relay-imposed rate limits are transient — ignore both.
 	if (msg === 'rate-limited') return;
+	if (msg.startsWith('publish failed: rate-limited')) return;
 	if (msg.startsWith('publish failed:') || msg === 'no relays configured') {
 		_consecutiveFailures++;
 		if (_consecutiveFailures >= FAILURE_THRESHOLD) {

@@ -23,6 +23,8 @@
   // ── Shared page-level state ───────────────────────────────────────────────
   let selectedMonitorPubkey = $state<string | null>(null);
   let autoAccept = $state(true);
+  let fetchedCountByMonitor = $state<Record<string, number>>({});
+  let clearFetchedForMonitorFn = $state<((pk: string) => void) | null>(null);
   let activeAlerts = $state<AlertSession[]>([]);
 
   interface PendingOffer { fromPubkey: string; msg: SignalMessage; }
@@ -120,9 +122,15 @@
       <span class="scope-line"></span>
     </div>
 
-    <DevicesSection bind:selectedMonitorPubkey />
+    <DevicesSection bind:selectedMonitorPubkey
+      {fetchedCountByMonitor}
+      onClearFetchedForMonitor={(pk) => clearFetchedForMonitorFn?.(pk)}
+    />
     <LiveViewSection {selectedMonitorPubkey} />
-    <ContentViewerSection {selectedMonitorPubkey} />
+    <ContentViewerSection {selectedMonitorPubkey}
+      bind:fetchedCountByMonitor
+      onRegisterClear={(fn) => { clearFetchedForMonitorFn = fn; }}
+    />
     <SegmentStorageSection {selectedMonitorPubkey} />
   </div>
 </div>

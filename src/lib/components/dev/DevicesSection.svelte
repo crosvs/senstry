@@ -11,14 +11,22 @@
   import { sendSignal } from '$lib/webrtc/signaling';
   import { peerStatuses } from '$lib/store/peer-status';
   import { nostrOnline, nostrOfflineReason, goOnline, goOffline } from '$lib/store/nostr-online';
+  import { relayRateLimits, clearExpiredRateLimits } from '$lib/nostr/client';
   import { viewerConnection } from '$lib/store/viewer-connection';
   import DevSection from './DevSection.svelte';
+  import NostrQueuePanel from './NostrQueuePanel.svelte';
   import { onDestroy } from 'svelte';
 
   interface Props {
     selectedMonitorPubkey?: string | null;
+    fetchedCountByMonitor?: Record<string, number>;
+    onClearFetchedForMonitor?: (pubkey: string) => void;
   }
-  let { selectedMonitorPubkey = $bindable(null) }: Props = $props();
+  let {
+    selectedMonitorPubkey = $bindable(null),
+    fetchedCountByMonitor = {},
+    onClearFetchedForMonitor,
+  }: Props = $props();
 
   interface DevStats {
     storageBytes: number;
@@ -31,10 +39,19 @@
   let orphanedPubkeys = $state<string[]>([]);
   let loading = $state(false);
 
-  // ── RTC polling ───────────────────────────────────────────────────────────
+  // ── RTC polling + rate-limit countdown ───────────────────────────────────
   let rtcTick = $state(0);
-  const rtcInterval = setInterval(() => rtcTick++, 2000);
+  const rtcInterval = setInterval(() => { rtcTick++; clearExpiredRateLimits(); }, 2000);
   onDestroy(() => clearInterval(rtcInterval));
+
+  // Active rate-limits with seconds-remaining, refreshed on each tick.
+  const activeRateLimits = $derived((() => {
+    void rtcTick; // re-evaluate every tick
+    const now = Date.now();
+    return $relayRateLimits
+      .filter(r => r.until > now)
+      .map(r => ({ relay: r.relay, reason: r.reason, secsLeft: Math.ceil((r.until - now) / 1000) }));
+  })());
 
   const viewerSessions = $derived(rtcTick >= 0 ? getViewerSessionInfos() : []);
   const monitorSessions = $derived(rtcTick >= 0 ? getMonitorSessionInfos() : []);
@@ -195,6 +212,8 @@
     </button>
   {/snippet}
 
+  <NostrQueuePanel />
+
   <div class="device-list">
 
     <!-- ── Own Device ──────────────────────────────────────────────────── -->
@@ -227,7 +246,16 @@
             <button class="act-btn accent" onclick={() => goOnline().catch(() => {})}
               disabled={!$settings.relayUrl}>Go Online</button>
           {/if}
+          {#each activeRateLimits as rl (rl.relay)}
+            <span class="rl-badge" title={rl.reason}>⏱ {rl.relay} {rl.secsLeft}s</span>
+          {/each}
           <span class="spacer"></span>
+          {#if (fetchedCountByMonitor[ownPk] ?? 0) > 0}
+            <button class="act-btn danger-soft" onclick={() => onClearFetchedForMonitor?.(ownPk)}
+              title="Clear {fetchedCountByMonitor[ownPk]} in-memory fetched segment{fetchedCountByMonitor[ownPk] !== 1 ? 's' : ''} for this device">
+              Clear Fetched ({fetchedCountByMonitor[ownPk]})
+            </button>
+          {/if}
           <button
             class="act-btn"
             class:accent={!ownSelected}
@@ -286,7 +314,14 @@
           >
             {isSelected ? '▶ Viewing' : 'View'}
           </button>
-          <!-- Clear data -->
+          <!-- Clear fetched (in-memory) -->
+          {#if (fetchedCountByMonitor[pk] ?? 0) > 0}
+            <button class="act-btn danger-soft" onclick={() => onClearFetchedForMonitor?.(pk)}
+              title="Clear {fetchedCountByMonitor[pk]} in-memory fetched segment{fetchedCountByMonitor[pk] !== 1 ? 's' : ''}">
+              Clear Fetched ({fetchedCountByMonitor[pk]})
+            </button>
+          {/if}
+          <!-- Clear data (IDB + OPFS) -->
           {#if stats[pk] && (stats[pk].storageBytes > 0 || stats[pk].alertCount > 0)}
             <button class="act-btn danger-soft" onclick={() => clearData(pk)}>Clear</button>
           {/if}
@@ -351,6 +386,12 @@
           >
             {isSelected ? '▶ Viewing' : 'View'}
           </button>
+          {#if (fetchedCountByMonitor[pk] ?? 0) > 0}
+            <button class="act-btn danger-soft" onclick={() => onClearFetchedForMonitor?.(pk)}
+              title="Clear {fetchedCountByMonitor[pk]} in-memory fetched segment{fetchedCountByMonitor[pk] !== 1 ? 's' : ''}">
+              Clear Fetched ({fetchedCountByMonitor[pk]})
+            </button>
+          {/if}
           {#if hasData}
             <button class="act-btn danger-soft" onclick={() => clearData(pk)}>Clear data</button>
           {/if}
@@ -468,6 +509,7 @@
   .status-age { font-size: 9px; color: var(--color-muted); white-space: nowrap; }
   .online-pill { color: var(--color-success); border-color: rgba(34,197,94,0.35); font-weight: 600; }
   .online-pill:hover:not(:disabled) { background: rgba(34,197,94,0.08); }
+  .rl-badge { font-size: 9px; font-family: ui-monospace, monospace; color: var(--color-warning, #f59e0b); background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); border-radius: 4px; padding: 1px 5px; white-space: nowrap; cursor: default; }
 
   .empty { font-size: 11px; color: var(--color-muted); text-align: center; padding: 10px 0; }
 

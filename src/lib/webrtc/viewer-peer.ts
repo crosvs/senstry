@@ -35,6 +35,8 @@ interface PendingSegment {
 const sessions = new Map<string, ViewerSession>();
 const connectPromises = new Map<string, Promise<void>>();
 const lastConnectAttempts = new Map<string, number>();
+// In-flight live-upgrade promises (renegotiation path from data→live).
+const pendingLiveUpgrades = new Map<string, { resolve: () => void; reject: (e: Error) => void }>();
 
 let generation = 0;
 const MIN_CONNECT_INTERVAL_MS = 4_000;
@@ -59,8 +61,10 @@ let channelListTimer: ReturnType<typeof setTimeout> | null = null;
 let segmentChannelsTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingSegmentsAfter: ((segs: RemoteSegmentMeta[]) => void) | null = null;
 let pendingSegmentsBefore: ((segs: RemoteSegmentMeta[]) => void) | null = null;
+let pendingSegmentsInRange: ((segs: RemoteSegmentMeta[]) => void) | null = null;
 let segmentsAfterTimer: ReturnType<typeof setTimeout> | null = null;
 let segmentsBeforeTimer: ReturnType<typeof setTimeout> | null = null;
+let segmentsInRangeTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingSegments = new Map<number, PendingSegment>();
 const pendingSegmentsById = new Map<string, PendingSegment>();
 const channelListCache = new Map<string, ChannelConfig[]>();
@@ -74,6 +78,8 @@ function closeSession(monitorPubkey: string): void {
 	connectPromises.delete(monitorPubkey);
 	const abort = connectAborts.get(monitorPubkey);
 	if (abort) { connectAborts.delete(monitorPubkey); abort(); }
+	const liveUpgrade = pendingLiveUpgrades.get(monitorPubkey);
+	if (liveUpgrade) { pendingLiveUpgrades.delete(monitorPubkey); liveUpgrade.reject(new Error('session closed')); }
 	remoteStream.set(null);
 	streamState.set('idle');
 	viewerConnection.update(st =>
@@ -87,24 +93,16 @@ function closeSession(monitorPubkey: string): void {
 export async function handleViewerSignal(msg: SignalMessage, fromPubkey: string): Promise<void> {
 	const session = sessions.get(fromPubkey);
 	if (!session) {
-		dbg('warn', 'rtc', `viewer: no session for ${fromPubkey.slice(0, 8)} — dropping ${msg.type}`);
+		dbg('warn', 'rtc', `viewer: no session for ${fromPubkey.slice(0, 8)} — dropping ${msg.type} sess:${msg.sessionId?.slice(0, 8)}`);
 		return;
 	}
 	if (session.sessionId !== msg.sessionId) {
-		dbg('warn', 'rtc', `viewer: session id mismatch for ${msg.type} (expected ${session.sessionId.slice(0, 8)}, got ${msg.sessionId.slice(0, 8)})`);
+		dbg('warn', 'rtc', `viewer: session id mismatch for ${msg.type} from:${fromPubkey.slice(0, 8)} (expected:${session.sessionId.slice(0, 8)} got:${msg.sessionId.slice(0, 8)}) mode:${session.mode}`);
 		return;
 	}
 
-	if (session.sessionId !== msg.sessionId && msg.type === 'offer' && !session.controlChannel) {
-		// A prior timed-out attempt can leave a stale session in the map.  An offer is
-		// always sent in direct response to an offer-request from this viewer, so if the
-		// session has no open data channel yet, accept it and adopt the incoming session ID.
-		dbg('warn', 'rtc', `viewer: stale session id ${session.sessionId.slice(0, 8)} → adopting offer session ${msg.sessionId.slice(0, 8)} from ${fromPubkey.slice(0, 8)}`);
-		session.sessionId = msg.sessionId;
-	}
-
 	if (msg.type === 'offer' && msg.sdp) {
-		dbg('info', 'rtc', `viewer: processing offer from ${fromPubkey.slice(0, 8)}`);
+		dbg('info', 'rtc', `viewer: processing offer from:${fromPubkey.slice(0, 8)} sess:${msg.sessionId.slice(0, 8)} mode:${session.mode}`);
 		try {
 			await session.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
 			const answer = await session.pc.createAnswer();
@@ -119,13 +117,13 @@ export async function handleViewerSignal(msg: SignalMessage, fromPubkey: string)
 				for (let attempt = 0; attempt <= ANSWER_RETRY_DELAYS_MS.length; attempt++) {
 					try {
 						await sendAnswer(privkey, viewerPubkey, fromPubkey, sdp, msg.sessionId);
-						dbg('info', 'rtc', `viewer: answer sent to ${fromPubkey.slice(0, 8)}`);
+						dbg('info', 'rtc', `viewer: answer sent to:${fromPubkey.slice(0, 8)} sess:${msg.sessionId.slice(0, 8)} attempt:${attempt + 1}`);
 						break;
 					} catch (e) {
 						const msg2 = e instanceof Error ? e.message : String(e);
 						const delay = ANSWER_RETRY_DELAYS_MS[attempt];
 						if (delay !== undefined && (msg2.includes('rate-limited') || msg2.includes('publish failed'))) {
-							dbg('warn', 'rtc', `viewer: answer rate-limited, retrying in ${delay / 1000}s…`);
+							dbg('warn', 'rtc', `viewer: answer rate-limited sess:${msg.sessionId.slice(0, 8)} to:${fromPubkey.slice(0, 8)} attempt:${attempt + 1}/${ANSWER_RETRY_DELAYS_MS.length + 1}, retrying in ${delay / 1000}s`);
 							await new Promise(r => setTimeout(r, delay));
 						} else {
 							throw e;
@@ -133,13 +131,13 @@ export async function handleViewerSignal(msg: SignalMessage, fromPubkey: string)
 					}
 				}
 			} else {
-				dbg('warn', 'rtc', 'viewer: no answer context — cannot send answer');
+				dbg('warn', 'rtc', `viewer: no answer context — cannot send answer for sess:${msg.sessionId.slice(0, 8)} from:${fromPubkey.slice(0, 8)}`);
 			}
 		} catch (e) {
-			dbg('warn', 'rtc', `viewer: offer processing failed: ${e instanceof Error ? e.message : e}`);
+			dbg('warn', 'rtc', `viewer: offer processing failed sess:${msg.sessionId.slice(0, 8)} from:${fromPubkey.slice(0, 8)}: ${e instanceof Error ? e.message : e}`);
 		}
 	} else if (msg.type === 'hangup') {
-		dbg('info', 'rtc', `viewer: hangup from ${fromPubkey.slice(0, 8)}`);
+		dbg('info', 'rtc', `viewer: hangup from:${fromPubkey.slice(0, 8)} sess:${msg.sessionId.slice(0, 8)} mode:${session.mode}`);
 		closeSession(fromPubkey);
 	}
 }
@@ -234,10 +232,13 @@ async function ensureConnection(
 
 		onTrack(pc, (stream) => {
 			if (generation !== myGeneration) return;
-			// Only surface the remote stream for live-mode connections.
-			if (mode === 'live') {
+			// Read mode from the session so live-upgrades (renegotiation) also surface the stream.
+			const currentSession = sessions.get(monitorPubkey);
+			if (currentSession?.mode === 'live') {
 				remoteStream.set(stream);
 				streamState.set('connected');
+				const cb = pendingLiveUpgrades.get(monitorPubkey);
+				if (cb) { pendingLiveUpgrades.delete(monitorPubkey); cb.resolve(); }
 			}
 		});
 
@@ -357,17 +358,52 @@ export async function startLiveView(
 	monitorPubkey: string,
 	channelId: string
 ): Promise<void> {
+	const existing = sessions.get(monitorPubkey);
+
+	// Upgrade path: if a data connection is already open, request live tracks via the
+	// control channel (one data-channel message + one renegotiation offer/answer = 2 Nostr
+	// events total instead of 3 for a full close+reopen).
+	if (existing?.controlChannel?.readyState === 'open') {
+		existing.mode = 'live';
+		_pendingAnswerContext = { privkey, viewerPubkey };
+		viewerConnection.update(s => ({ ...s, monitorPubkey, status: 'connecting', mode: 'live', error: null }));
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(() => {
+					pendingLiveUpgrades.delete(monitorPubkey);
+					if (existing) existing.mode = 'data';
+					reject(new Error('Live upgrade timed out'));
+				}, 30_000);
+				pendingLiveUpgrades.set(monitorPubkey, {
+					resolve: () => { clearTimeout(timer); resolve(); },
+					reject: (e: Error) => { clearTimeout(timer); reject(e); },
+				});
+				existing.controlChannel!.send(JSON.stringify({ type: 'live-request', channelId }));
+			});
+			viewerConnection.update(s =>
+				s.monitorPubkey === monitorPubkey ? { ...s, status: 'online', mode: 'live', error: null } : s
+			);
+		} catch (e) {
+			existing.mode = 'data';
+			pendingLiveUpgrades.delete(monitorPubkey);
+			viewerConnection.update(s =>
+				s.monitorPubkey === monitorPubkey
+					? { ...s, status: 'online', mode: 'data', error: e instanceof Error ? e.message : 'Live upgrade failed' }
+					: s
+			);
+			throw e;
+		}
+		return;
+	}
+
+	// No existing connection — full connect flow (3 Nostr events).
 	closeSession(monitorPubkey);
 	lastConnectAttempts.delete(monitorPubkey);
-	viewerConnection.update(s => ({
-		...s, monitorPubkey, status: 'connecting', mode: 'live', error: null,
-	}));
+	viewerConnection.update(s => ({ ...s, monitorPubkey, status: 'connecting', mode: 'live', error: null }));
 	try {
 		await ensureConnection(privkey, viewerPubkey, monitorPubkey, 'live', undefined, channelId);
 		viewerConnection.update(s =>
-			s.monitorPubkey === monitorPubkey
-				? { ...s, status: 'online', mode: 'live', error: null }
-				: s
+			s.monitorPubkey === monitorPubkey ? { ...s, status: 'online', mode: 'live', error: null } : s
 		);
 	} catch (e) {
 		viewerConnection.update(s =>
@@ -410,7 +446,8 @@ export async function requestCoverageMap(
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string,
-	mimePrefix?: string
+	mimePrefix?: string,
+	channelId?: string
 ): Promise<[number, number][]> {
 	const session = sessions.get(monitorPubkey);
 	if (!session?.controlChannel || session.controlChannel.readyState !== 'open') throw new Error('offline');
@@ -427,7 +464,8 @@ export async function requestCoverageMap(
 			resolve(segments);
 		};
 		const msg: Record<string, unknown> = { type: 'coverage-request' };
-		if (mimePrefix) msg.mimePrefix = mimePrefix;
+		if (mimePrefix)  msg.mimePrefix  = mimePrefix;
+		if (channelId)   msg.channelId   = channelId;
 		session.controlChannel!.send(JSON.stringify(msg));
 	});
 }
@@ -463,7 +501,8 @@ export async function requestSegment(
 	privkey: Uint8Array,
 	viewerPubkey: string,
 	monitorPubkey: string,
-	mimePrefix?: string
+	mimePrefix?: string,
+	channelId?: string
 ): Promise<{ mimeType: string; blob: Blob; startTime: number; endTime: number; originMonitor: string; segmentId: string; channelId?: string }> {
 	const session = sessions.get(monitorPubkey);
 	if (!session?.controlChannel || session.controlChannel.readyState !== 'open') throw new Error('offline');
@@ -481,6 +520,7 @@ export async function requestSegment(
 		});
 		const msg: Record<string, unknown> = { type: 'segment-request', time };
 		if (mimePrefix) msg.mimePrefix = mimePrefix;
+		if (channelId)  msg.channelId  = channelId;
 		session.controlChannel!.send(JSON.stringify(msg));
 	});
 }
@@ -557,6 +597,38 @@ export async function requestSegmentsBefore(
 	});
 }
 
+export async function requestSegmentsInRange(
+	from: number,
+	to: number,
+	limit: number,
+	order: 'asc' | 'desc',
+	knownIds: string[],
+	privkey: Uint8Array,
+	viewerPubkey: string,
+	monitorPubkey: string,
+	mimePrefix?: string,
+	channelId?: string
+): Promise<RemoteSegmentMeta[]> {
+	const session = sessions.get(monitorPubkey);
+	if (!session?.controlChannel || session.controlChannel.readyState !== 'open') throw new Error('offline');
+
+	return new Promise<RemoteSegmentMeta[]>((resolve, reject) => {
+		if (segmentsInRangeTimer !== null) { clearTimeout(segmentsInRangeTimer); segmentsInRangeTimer = null; pendingSegmentsInRange = null; }
+		segmentsInRangeTimer = setTimeout(() => {
+			segmentsInRangeTimer = null; pendingSegmentsInRange = null;
+			reject(new Error('segments-in-range timeout'));
+		}, 15_000);
+		pendingSegmentsInRange = (segs) => {
+			if (segmentsInRangeTimer !== null) { clearTimeout(segmentsInRangeTimer); segmentsInRangeTimer = null; }
+			resolve(segs);
+		};
+		const msg: Record<string, unknown> = { type: 'segments-in-range-request', from, to, limit, order, knownIds };
+		if (mimePrefix) msg.mimePrefix = mimePrefix;
+		if (channelId)  msg.channelId  = channelId;
+		session.controlChannel!.send(JSON.stringify(msg));
+	});
+}
+
 function _fetchChannelList(monitorPubkey: string): Promise<ChannelConfig[]> {
 	const session = sessions.get(monitorPubkey);
 	if (!session?.controlChannel || session.controlChannel.readyState !== 'open') {
@@ -622,6 +694,12 @@ function handleControlMessage(raw: string): void {
 
 	if (msg.type === 'segments-before') {
 		const cb = pendingSegmentsBefore; pendingSegmentsBefore = null;
+		cb?.(msg.segments as RemoteSegmentMeta[]);
+		return;
+	}
+
+	if (msg.type === 'segments-in-range') {
+		const cb = pendingSegmentsInRange; pendingSegmentsInRange = null;
 		cb?.(msg.segments as RemoteSegmentMeta[]);
 		return;
 	}
@@ -761,4 +839,28 @@ export function disconnectViewer(monitorPubkey?: string): void {
 
 export function stopViewer(monitorPubkey?: string): void {
 	disconnectViewer(monitorPubkey);
+}
+
+export function _resetForTest(): void {
+	sessions.clear();
+	connectPromises.clear();
+	lastConnectAttempts.clear();
+	pendingLiveUpgrades.clear();
+	connectAborts.clear();
+	generation = 0;
+	_pendingAnswerContext = null;
+}
+
+export function _setSessionForTest(
+	monitorPubkey: string,
+	pc: RTCPeerConnection,
+	controlDc: RTCDataChannel | null,
+	sessionId: string,
+	mode: 'live' | 'data' = 'data'
+): void {
+	sessions.set(monitorPubkey, { pc, monitorPubkey, sessionId, controlChannel: controlDc, dataChannel: null, mode });
+}
+
+export function _setPendingAnswerContextForTest(ctx: { privkey: Uint8Array; viewerPubkey: string } | null): void {
+	_pendingAnswerContext = ctx;
 }

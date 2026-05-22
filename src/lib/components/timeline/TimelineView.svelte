@@ -23,7 +23,7 @@
 	} = $props();
 
 	async function localFetch(time: number) {
-		const seg = await getSegmentAt(time);
+		const seg = await getSegmentAt(time, $identity?.pubkey);
 		if (!seg) throw new Error('not-stored');
 		return { mimeType: seg.mimeType, blob: seg.blob, startTime: seg.startTime, endTime: seg.endTime };
 	}
@@ -97,7 +97,7 @@
 		fetchingCoverage = true;
 		try {
 			coverage = localMode
-				? await getCoverageMap()
+				? await getCoverageMap($identity?.pubkey)
 				: await requestCoverageMap($identity!.privkey, $identity!.pubkey, $pairedDevices[0]!.pubkey);
 			coverageError = false;
 		} catch {
