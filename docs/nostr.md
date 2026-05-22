@@ -131,7 +131,13 @@ Wraps `nostr-tools` `SimplePool` with:
 
 ### Rate Limiting
 
-Token bucket: default 200 events/minute. Refills at `nostrRateLimit / 60` tokens/second. When the bucket is empty, `publish()` is queued (not dropped).
+**Burst spacing**: Default 200 events/minute with minimum 300ms spacing between publishes. This ensures a burst of 200 events is spread evenly across exactly 1 minute, preventing relay rate-limit rejections.
+
+- `setRateLimit(eventsPerMin)` — configure max events/minute (default 200)
+- `getRateLimitAvailable()` — query current budget (floor of 60_000 / intervalMs)
+- `getPublishRate()` — returns `{ last60s: number, max: number }` — publishes in the last 60 seconds and the configured max
+
+Events that arrive while another publish is in-flight are queued and sent at the next available time slot. The queue is exposed as `publishQueue` store (see UI patterns below).
 
 Per-semantic-key cooldown: prevents duplicate events being published for the same logical action within a short window (e.g. publishing the same arm-state twice).
 
@@ -145,6 +151,75 @@ getRelayUrl(): string
 ```
 
 Subscriptions are tracked. Calling `.close()` removes the subscription from the pool. On relay URL change, all active subscriptions are re-opened on the new relay.
+
+### `publishQueue` Store
+
+The `publishQueue` writable store tracks all pending publishes:
+
+```typescript
+export interface PendingPublish {
+  id: string;       // nostr event id
+  label: string;    // human description e.g. "signal:status"
+  queuedAt: number; // Date.now() when enqueued
+  estimatedAt: number; // best-guess epoch ms for actual send
+}
+```
+
+Used by the `useNostrAction` hook to display queue position and ETA to the user.
+
+## UI Pattern: `useNostrAction` Hook
+
+Any button that publishes a Nostr event should use the `useNostrAction` hook to provide visual feedback and cancellation:
+
+```typescript
+import { useNostrAction } from '$lib/nostr/use-nostr-action.svelte';
+
+const statusAction = useNostrAction();
+
+async function handleStatusClick() {
+  await statusAction.run(onQueued =>
+    sendSignal(privkey, pubkey, targetPubkey, { type: 'status-request' }, { onQueued })
+  );
+}
+```
+
+In the template, show the button state and provide a cancel option:
+
+```svelte
+<button onclick={handleStatusClick} disabled={statusAction.pending}>
+  {statusAction.pending ? `⏳ ${statusAction.etaLabel}` : 'Status?'}
+</button>
+{#if statusAction.pending}
+  <button onclick={statusAction.cancel} title="Cancel" class="cancel-btn">✕</button>
+{/if}
+```
+
+### Properties
+
+- `pending` (boolean) — true while the publish is queued or in-flight
+- `etaLabel` (string) — human-readable ETA (e.g. "2s", "sending…", empty when idle)
+- `run(fn)` — execute async function; passes `onQueued(id, cancelFn)` callback for the publish helper to call
+- `cancel()` — cancel the queued publish (no-op when not pending)
+
+### Passing `onQueued` to publish helpers
+
+Any helper that publishes (e.g. `sendSignal`, `publishEvent`) should accept an optional `onQueued` callback:
+
+```typescript
+export async function sendSignal(
+  privkey: Uint8Array,
+  pubkey: string,
+  targetPubkey: string,
+  msg: SignalMessage,
+  opts?: { onQueued?: (id: string, cancel: () => void) => void }
+): Promise<void> {
+  const event = buildSignal(privkey, pubkey, targetPubkey, msg);
+  const { cancel } = await client.publish(event);
+  opts?.onQueued?.(event.id, cancel);
+}
+```
+
+The `cancel` function returned by `client.publish()` removes the event from the queue if it hasn't sent yet.
 
 ## Trigger Event Content
 

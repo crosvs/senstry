@@ -173,6 +173,16 @@ Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, 
 ### Fresh-install defaults
 `loadPipeline()` in `pipeline.ts` checks for legacy IDB keys first; if truly fresh, it writes `DEFAULT_*` constants directly. Reset from SettingsSection also uses these constants. Keep them in sync.
 
+### Adding a Nostr action button
+Any button that publishes a Nostr event must use the `useNostrAction` hook to handle rate-limiting queue display and cancellation:
+
+1. Import and create at component init: `const myAction = useNostrAction();`
+2. Wrap the publish call: `await myAction.run(onQueued => publishMyEvent(..., { onQueued }))`
+3. Update button state: show `⏳ ${myAction.etaLabel}` while pending, disable button
+4. Show cancel button: `{#if myAction.pending}<button onclick={myAction.cancel}>✕</button>{/if}`
+
+This surfaces rate-limit queue position to the user and allows cancellation before send. See `docs/nostr.md` for full API and example usage.
+
 ## Things to Avoid
 
 - **Never store raw privkey in component state** — only pass `$identity.privkey` directly into function calls
@@ -181,5 +191,6 @@ Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, 
 - **Don't use Svelte 4 reactivity** — no `$:`, no `export let` for bindable state (use `$props()` with `$bindable()`)
 - **Don't add the same segment twice** — use `backupOf` to track canonical origin IDs across viewer chains; also check `originMonitor` to prevent cross-device ID collisions
 - **Never send Nostr events when `nostrOnline` is false** — check `get(nostrOnline)` before any `publish()` call not already inside `outboxFlusher`
+- **Every Nostr button must use `useNostrAction`** — direct publish calls without the hook skip rate-limit queue feedback and cancel support; use the hook to show ETA and allow cancellation
 - **RecordAction source selection uses `cap.sourceId`** — not `ChannelConfig.videoSourceId`/`audioSourceId` (those are live-RTC fallbacks only)
 - **Fetched segments list filters by `selectedMonitorPubkey` automatically** — don't add manual filtering; `ContentViewerSection.svelte` derives `browsedSegsWithIdx` from `$props.selectedMonitorPubkey`
