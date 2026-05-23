@@ -1,5 +1,5 @@
 import { subscribe, publish } from '$lib/nostr/client';
-import { giftWrap, giftUnwrap } from '$lib/nostr/crypto';
+import { giftWrap, giftUnwrap, WRAP_MAX_OFFSET_S } from '$lib/nostr/crypto';
 import { finalizeEvent } from 'nostr-tools/pure';
 import { KIND_SIGNAL } from '$lib/nostr/events';
 import { dbg } from '$lib/store/debug';
@@ -28,11 +28,11 @@ const STATUS_TTL_S = 3600;      // status presence signals are valid for 1 h
 
 // Relay `since` filter: guarantees no valid event is skipped while avoiding
 // the full historical replay.  Derived from:
-//   max outer offset (TWO_DAYS = 172800 s)  +  max inner TTL (STATUS_TTL_S)  +  clock-drift buffer
+//   max outer offset (WRAP_MAX_OFFSET_S)  +  max inner TTL (STATUS_TTL_S)  +  clock-drift buffer
 // Any event older than this would be TTL-dropped by our inner-timestamp check anyway.
-const TWO_DAYS_S = 172800;
+// WRAP_MAX_OFFSET_S is 30 min (reduced from NIP-59 default 2 days) — see crypto.ts.
 const CLOCK_DRIFT_S = 300;
-const SUBSCRIPTION_WINDOW_S = STATUS_TTL_S + TWO_DAYS_S + CLOCK_DRIFT_S; // ≈ 2.05 days
+const SUBSCRIPTION_WINDOW_S = STATUS_TTL_S + WRAP_MAX_OFFSET_S + CLOCK_DRIFT_S; // ≈ 1.6 h
 
 // Deduplicate events by outer event ID — relays may replay the same event
 // on reconnect. Cleared every 60s (longer than SIGNAL_TTL_S) to prevent relay
@@ -69,7 +69,7 @@ export function listenForSignals(
 ): { close: () => void } {
 	const since = Math.floor(Date.now() / 1000) - SUBSCRIPTION_WINDOW_S;
 	return subscribe(
-		{ kinds: [1059], '#p': [pubkey], since },
+		{ kinds: [1059], '#p': [pubkey], since, limit: 200 },
 		(event: NostrEvent) => {
 			if (seenEventIds.has(event.id)) return;
 			seenEventIds.add(event.id);
