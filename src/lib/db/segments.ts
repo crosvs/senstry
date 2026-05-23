@@ -334,42 +334,45 @@ export async function getSegmentAt(time: number, originMonitor?: string): Promis
 	return getSegmentById(meta.segmentId);
 }
 
-export async function getSegmentsAfter(after: number, count: number, originMonitor?: string, mimePrefix?: string, channelId?: string): Promise<Segment[]> {
+export async function getSegmentsAfter(after: number, count: number, originMonitor?: string, mimePrefix?: string, channelId?: string | string[]): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await _getSegmentsForMonitor(db, originMonitor);
 	return all
-		.filter(s =>
-			s.startTime >= after &&
-			(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+		.filter(s => {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
-		)
+			const ch = (s as any).channelId ?? (s as any).sourceId ?? 'default-channel';
+			return s.startTime >= after &&
+				(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+				(channelId == null || (Array.isArray(channelId) ? channelId.includes(ch) : ch === channelId));
+		})
 		.slice(0, count);
 }
 
-export async function getSegmentsBefore(before: number, count: number, originMonitor?: string, mimePrefix?: string, channelId?: string): Promise<Segment[]> {
+export async function getSegmentsBefore(before: number, count: number, originMonitor?: string, mimePrefix?: string, channelId?: string | string[]): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await _getSegmentsForMonitor(db, originMonitor);
 	const filtered = all
-		.filter(s =>
-			s.endTime <= before &&
-			(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+		.filter(s => {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
-		);
+			const ch = (s as any).channelId ?? (s as any).sourceId ?? 'default-channel';
+			return s.endTime <= before &&
+				(mimePrefix == null || s.mimeType.startsWith(mimePrefix)) &&
+				(channelId == null || (Array.isArray(channelId) ? channelId.includes(ch) : ch === channelId));
+		});
 	filtered.reverse(); // already sorted asc; reverse for newest-first
 	return filtered.slice(0, count);
 }
 
-export async function getSegmentsInRange(from: number, to: number, originMonitor?: string, channelId?: string): Promise<Segment[]> {
+export async function getSegmentsInRange(from: number, to: number, originMonitor?: string, channelId?: string | string[]): Promise<Segment[]> {
 	const db = await openDB();
 	const all = await _getSegmentsForMonitor(db, originMonitor);
-	return all.filter((s) =>
-		s.endTime >= from &&
-		s.startTime <= to &&
+	return all.filter((s) => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(channelId == null || ((s as any).channelId ?? (s as any).sourceId ?? 'default-channel') === channelId)
-	);
+		const ch = (s as any).channelId ?? (s as any).sourceId ?? 'default-channel';
+		return s.endTime >= from &&
+			s.startTime <= to &&
+			(channelId == null || (Array.isArray(channelId) ? channelId.includes(ch) : ch === channelId));
+	});
 }
 
 export async function getCoverageMap(originMonitor?: string, mimePrefix?: string, channelId?: string): Promise<[number, number][]> {

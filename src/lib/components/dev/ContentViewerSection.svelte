@@ -13,7 +13,9 @@
   import { untrack } from 'svelte';
   import DevSection from './DevSection.svelte';
   import LogPanel from './LogPanel.svelte';
+  import TimelineSection from './TimelineSection.svelte';
   import { onDestroy } from 'svelte';
+  import { covEarlierRange, covLaterRange, covFirstRange, covLastRange, covFirstTime, covLastTime } from './coverage-utils';
 
   interface Props {
     selectedMonitorPubkey?: string | null;
@@ -27,7 +29,7 @@
   }: Props = $props();
 
   // ── Shared utilities ──────────────────────────────────────────────────────
-  function fmtTs(unix: number) { return new Date(unix * 1000).toLocaleTimeString(); }
+  function fmtTs(unix: number) { return new Date(unix * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }); }
   function fmtDur(s: number) {
     if (s < 60) return `${s}s`;
     const m = Math.floor(s / 60), sec = s % 60;
@@ -70,6 +72,18 @@
     return null;
   }
 
+  // ── Timeline state (controller owns these, passed as $bindable to TimelineSection) ──
+  const _nowSec = () => Math.floor(Date.now() / 1000);
+  let viewCenter = $state(_nowSec());
+  let viewSpan   = $state(2 * 3600);
+  let mode       = $state<'live' | 'view'>('live');
+  let liveTime   = $state(_nowSec());
+  let viewStart  = $derived(viewCenter - viewSpan / 2);
+  let viewEnd    = $derived(viewCenter + viewSpan / 2);
+
+  // Buffer: fixed window in seconds around the cursor used for auto-load/fetch.
+  const BUFFER_SEC = 60;
+
   // ── General Player ────────────────────────────────────────────────────────
   interface PlayerSeg {
     key: string;
@@ -83,17 +97,15 @@
 
   let channelPriority = $state<string[]>([]);
 
-  // Per-channel coverage map — populated by coverage fetch (local IDB or RTC).
-  // Keys are channel names; values are merged [startTime, endTime] intervals.
   let coverageByChannel = $state<Record<string, [number, number][]>>({});
 
   // Channel IDs discovered from local IDB before any coverage fetch.
   let localChannelIds = $state<string[]>([]);
 
-  // '' = all channels; non-empty = filter fetch/IDB queries to this channel
-  let fetchChannelFilter = $state('');
-  // '' = all channels/devices; non-empty = restrict player to that value only
-  let playerChannelFilter = $state('');
+  // empty Set = all channels; non-empty = filter fetch/IDB queries to these channels
+  let fetchChannelFilter = $state(new Set<string>());
+  // empty Set = all channels; non-empty = restrict player to these channels only
+  let playerChannelFilter = $state(new Set<string>());
   let playerDeviceFilter  = $state('');
 
   let playerSegs = $state<PlayerSeg[]>([]);
@@ -111,6 +123,7 @@
 
   let playerVolume = $state(1);
 
+  // ── External seek (from timeline) ─────────────────────────────────────────
   // Pre-split playerSegs by type and channel once per segment-list change.
   // All per-channel arrays and allVideo/allAudio/photos are sorted by startTime
   // (playerSegs itself is always sorted ascending).
@@ -255,7 +268,10 @@
   function playerSeekTo(pos: number) {
     const wasPlaying = playerPlaying;
     if (wasPlaying) { _stopTimer(); playerPlaying = false; }
-    playerPosition = Math.max(playerRangeFrom, Math.min(playerRangeTo, pos));
+    // When no range is set yet (playerRangeTo === 0), don't clamp — controller will set range later.
+    playerPosition = playerRangeTo > 0
+      ? Math.max(playerRangeFrom, Math.min(playerRangeTo, pos))
+      : pos;
     // Seek media elements within the current segment
     if (playerVideoEl && playerCurVideo) {
       playerVideoEl.currentTime = Math.max(0, playerPosition - playerCurVideo.startTime);
@@ -269,6 +285,49 @@
       playerPlaying = true;
       playerTimer = setInterval(_playerTick, 100);
     }
+  }
+
+  // ── Player buffer primitives ─────────────────────────────────────────────
+  // Hard-set the player range and evict any segment that now falls outside it.
+  function playerSetRange(from: number, to: number) {
+    const evicted = playerSegs.filter(s => s.endTime <= from || s.startTime >= to);
+    for (const s of evicted) URL.revokeObjectURL(s.url);
+    playerSegs = playerSegs.filter(s => s.endTime > from && s.startTime < to);
+    playerRangeFrom = from;
+    playerRangeTo   = to;
+    playerRangeTs   = `${from}-${to}`;
+  }
+  // Expand the range without evicting — used during scrubbing where we never want to shrink.
+  function playerExpandRange(from: number, to: number) {
+    playerRangeFrom = playerRangeFrom > 0 ? Math.min(playerRangeFrom, from) : from;
+    playerRangeTo   = playerRangeTo   > 0 ? Math.max(playerRangeTo,   to)   : to;
+    playerRangeTs   = `${playerRangeFrom}-${playerRangeTo}`;
+  }
+  // Add segments from `candidates` that pass the range gate, type gate, and dedup check.
+  // Never clears existing playerSegs — safe to call incrementally.
+  function playerAddSegs(candidates: FetchedSeg[]) {
+    if (playerRangeTo === 0) return;
+    const existingKeys = new Set(playerSegs.map(s => s.key));
+    const toAdd = candidates
+      .filter(s =>
+        !existingKeys.has(s.key) &&
+        s.startTime < playerRangeTo &&
+        s.endTime   > playerRangeFrom &&
+        (!playerDeviceFilter  || s.originMonitor === playerDeviceFilter) &&
+        (playerChannelFilter.size === 0 || playerChannelFilter.has(s.channelId ?? '')) &&
+        [...playerTypeFilter].some(p => s.mimeType.startsWith(p))
+      )
+      .map(s => ({
+        key: s.key, mimeType: s.mimeType, startTime: s.startTime,
+        endTime: s.endTime, blob: s.blob, url: URL.createObjectURL(s.blob),
+        channelId: s.channelId,
+      }));
+    if (toAdd.length === 0) return;
+    playerSegs = [...playerSegs, ...toAdd].sort((a, b) => a.startTime - b.startTime);
+    const vCount = playerSegs.filter(s => s.mimeType.startsWith('video/')).length;
+    const aCount = playerSegs.filter(s => s.mimeType.startsWith('audio/')).length;
+    const pCount = playerSegs.filter(s => s.mimeType.startsWith('image/')).length;
+    playerStatus = `✓ ${playerSegs.length} seg${playerSegs.length !== 1 ? 's' : ''} — ${vCount}v ${aCount}a ${pCount}p`;
   }
 
   // Load new video segment when playerCurVideo changes; play/pause when playerPlaying changes.
@@ -315,53 +374,36 @@
     if (playerAudioEl) playerAudioEl.volume = playerVolume;
   });
 
+  // Manual full reload: clears existing player content and rebuilds from fetchedSegs.
+  // The controller uses playerSetRange + playerAddSegs incrementally instead.
   function loadPlayerSegments() {
     const parsed = parseRangeInput(playerRangeTs);
     if (!parsed) { playerStatus = '✗ Set a time range first'; return; }
     const [from, to] = parsed;
-
-    for (const s of playerSegs) URL.revokeObjectURL(s.url);
     playerPause();
+    for (const s of playerSegs) URL.revokeObjectURL(s.url);
     playerSegs = [];
     playerPosition = from;
     playerRangeFrom = from;
-    playerRangeTo = to;
+    playerRangeTo   = to;
     if (playerVideoEl) { playerVideoEl.removeAttribute('data-seg-key'); playerVideoEl.removeAttribute('src'); }
     if (playerAudioEl) { playerAudioEl.removeAttribute('data-seg-key'); playerAudioEl.removeAttribute('src'); }
-    if (playerImgEl)   { playerImgEl.removeAttribute('data-seg-key'); playerImgEl.removeAttribute('src'); }
-
-    const inRange = fetchedSegs.filter(s =>
-      s.startTime < to && s.endTime > from &&
-      (!playerDeviceFilter  || s.originMonitor === playerDeviceFilter) &&
-      (!playerChannelFilter || s.channelId === playerChannelFilter) &&
-      [...playerTypeFilter].some(p => s.mimeType.startsWith(p))
-    );
-    if (inRange.length === 0) {
+    if (playerImgEl)   { playerImgEl.removeAttribute('data-seg-key');   playerImgEl.removeAttribute('src'); }
+    playerAddSegs(fetchedSegs);
+    if (playerSegs.length === 0) {
       playerStatus = fetchedSegs.length === 0
         ? '✗ Use Fetch Content below to load segments first'
         : '✗ No fetched segments match the selected range, types, and channel';
-      return;
     }
-
-    const loaded: PlayerSeg[] = inRange.map(s => ({
-      key: s.key,
-      mimeType: s.mimeType,
-      startTime: s.startTime,
-      endTime: s.endTime,
-      blob: s.blob,
-      url: URL.createObjectURL(s.blob),
-      channelId: s.channelId,
-    }));
-    loaded.sort((a, b) => a.startTime - b.startTime);
-    playerSegs = loaded;
-    const vCount = loaded.filter(s => s.mimeType.startsWith('video/')).length;
-    const aCount = loaded.filter(s => s.mimeType.startsWith('audio/')).length;
-    const pCount = loaded.filter(s => s.mimeType.startsWith('image/')).length;
-    playerStatus = `✓ ${loaded.length} segment${loaded.length !== 1 ? 's' : ''} — ${vCount}v ${aCount}a ${pCount}p`;
   }
 
   const vc = $derived($viewerConnection);
   const isOnline = $derived(vc.status === 'online');
+  const isLiveConnected = $derived(
+    vc.monitorPubkey === selectedMonitorPubkey &&
+    vc.status === 'online' &&
+    vc.mode === 'live'
+  );
 
   // ── Segment Viewer (in fetched-segments area) ────────────────────────────
   interface FetchedSeg {
@@ -422,18 +464,17 @@
     const effectivePubkey = selectedMonitorPubkey ?? $identity?.pubkey;
     localChannelIds = [];
     coverageByChannel = {};
-    fetchChannelFilter = '';
-    playerChannelFilter = '';
+    fetchChannelFilter = new Set();
+    playerChannelFilter = new Set();
+    _ctrlActiveChannels = [];
     if (effectivePubkey) {
       getDistinctChannels(effectivePubkey).then(ids => { localChannelIds = ids; });
     }
   });
 
-  // Auto-clear filters when the selected value leaves the available set.
+  // Auto-clear device filter when the selected device leaves the available set.
   $effect(() => {
-    if (fetchChannelFilter && !knownChannelIds.includes(fetchChannelFilter)) fetchChannelFilter = '';
-    if (playerChannelFilter && !fetchedChannelIds.includes(playerChannelFilter)) playerChannelFilter = '';
-    if (playerDeviceFilter  && !fetchedDeviceIds.includes(playerDeviceFilter))  playerDeviceFilter  = '';
+    if (playerDeviceFilter && !fetchedDeviceIds.includes(playerDeviceFilter)) playerDeviceFilter = '';
   });
 
   // Sync channelPriority when the player's loaded channels change (preserve existing order).
@@ -603,7 +644,7 @@
     try {
       if (fetchSourceLocal && effectivePubkey) {
         fetchStatus = 'Querying local IDB…';
-        const metas = await getSegmentsInRange(from, to, effectivePubkey, fetchChannelFilter || undefined);
+        const metas = await getSegmentsInRange(from, to, effectivePubkey, fetchChannelFilter.size > 0 ? [...fetchChannelFilter] : undefined);
         const sorted = metas
           .filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)))
           .sort((a, b) => order === 'desc' ? b.startTime - a.startTime : a.startTime - b.startTime);
@@ -638,7 +679,7 @@
           const remoteMetas = await requestSegmentsInRange(
             from, to, rtcLimit, order, knownIds,
             $identity.privkey, $identity.pubkey, selectedMonitorPubkey,
-            undefined, fetchChannelFilter || undefined
+            undefined, fetchChannelFilter.size === 1 ? [...fetchChannelFilter][0] : undefined
           );
           const filtered = remoteMetas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
           for (const meta of filtered) {
@@ -692,8 +733,8 @@
 
       if (useLocal && effectivePubkey) {
         const metas = dir === 'after'
-          ? await getSegmentsAfter(refTime, count, effectivePubkey, undefined, fetchChannelFilter || undefined)
-          : await getSegmentsBefore(refTime, count, effectivePubkey, undefined, fetchChannelFilter || undefined);
+          ? await getSegmentsAfter(refTime, count, effectivePubkey, undefined, fetchChannelFilter.size > 0 ? [...fetchChannelFilter] : undefined)
+          : await getSegmentsBefore(refTime, count, effectivePubkey, undefined, fetchChannelFilter.size > 0 ? [...fetchChannelFilter] : undefined);
 
         const filtered = metas.filter(m => [...fetchTypeFilter].some(p => m.mimeType.startsWith(p)));
         for (const meta of filtered) {
@@ -813,7 +854,7 @@
     localCoverageLoading = true; localCoverageStatus = 'Reading IDB…'; localCoverage = null;
     try {
       const [map, byChannel] = await Promise.all([
-        getCoverageMap(effectivePubkey, undefined, fetchChannelFilter || undefined),
+        getCoverageMap(effectivePubkey, undefined),
         getCoverageByChannel(effectivePubkey),
       ]);
       localCoverage = map;
@@ -828,6 +869,49 @@
 
   async function fetchBothCoverage() {
     await Promise.all([requestRemoteCoverage(), loadLocalCoverage()]);
+  }
+
+  // ── Coverage nav (derived from loaded coverageByChannel) ─────────────────
+  const _covFirstTime = $derived(covFirstTime(coverageByChannel));
+  const _covLastTime  = $derived(covLastTime(coverageByChannel));
+
+  async function fetchCoverage() {
+    if (fetchSourceLocal) await loadLocalCoverage();
+    if (fetchSourceRtc)   await requestRemoteCoverage();
+  }
+
+  function covEarlier() {
+    const r = parseRangeInput(fetchRangeTs);
+    if (!r || r[0] === r[1]) return;
+    const [s, e] = covEarlierRange(r[0], r[1]);
+    fetchRangeTs = `${s}-${e}`;
+    void fetchCoverage();
+  }
+
+  function covLater() {
+    const r = parseRangeInput(fetchRangeTs);
+    if (!r || r[0] === r[1]) return;
+    const [s, e] = covLaterRange(r[0], r[1]);
+    fetchRangeTs = `${s}-${e}`;
+    void fetchCoverage();
+  }
+
+  function covJumpFirst() {
+    if (_covFirstTime === null) return;
+    const r = parseRangeInput(fetchRangeTs);
+    const span = r && r[0] !== r[1] ? r[1] - r[0] : 86400;
+    const [s, e] = covFirstRange(_covFirstTime, span);
+    fetchRangeTs = `${s}-${e}`;
+    void fetchCoverage();
+  }
+
+  function covJumpLast() {
+    if (_covLastTime === null) return;
+    const r = parseRangeInput(fetchRangeTs);
+    const span = r && r[0] !== r[1] ? r[1] - r[0] : 86400;
+    const [s, e] = covLastRange(_covLastTime, span);
+    fetchRangeTs = `${s}-${e}`;
+    void fetchCoverage();
   }
 
   // ── Type Filters ─────────────────────────────────────────────────────────
@@ -846,6 +930,19 @@
   }
   function toggleFetchType(t: MimePrefix)  { fetchTypeFilter  = _toggleType(fetchTypeFilter,  t); }
   function togglePlayerType(t: MimePrefix) { playerTypeFilter = _toggleType(playerTypeFilter, t); }
+
+  function toggleFetchChannel(ch: string) {
+    const allIds = knownChannelIds;
+    const current = fetchChannelFilter.size === 0 ? new Set(allIds) : new Set(fetchChannelFilter);
+    if (current.has(ch) && current.size > 1) current.delete(ch); else current.add(ch);
+    fetchChannelFilter = allIds.length > 0 && allIds.every(id => current.has(id)) ? new Set() : current;
+  }
+  function togglePlayerChannel(ch: string) {
+    const allIds = playerFilterOptions;
+    const current = playerChannelFilter.size === 0 ? new Set(allIds) : new Set(playerChannelFilter);
+    if (current.has(ch) && current.size > 1) current.delete(ch); else current.add(ch);
+    playerChannelFilter = allIds.length > 0 && allIds.every(id => current.has(id)) ? new Set() : current;
+  }
 
   // ── Fetch Segments in Range ──────────────────────────────────────────────
   let fetchStatus = $state('');
@@ -961,10 +1058,281 @@
   // Register the per-device clear function with the parent once on mount.
   $effect(() => { onRegisterClear?.(clearFetchedForMonitor); });
 
+  // ── Timeline controller ───────────────────────────────────────────────────
+  let _ctrlEnabled        = $state(true);
+  // Remembered user channel chip selection — updated only by chip clicks, never by coverage refreshes.
+  let _ctrlActiveChannels = $state<string[]>([]);
+  // Bound to TimelineSection.activeChannels — controller writes here to push chip state to timeline.
+  let _tlActiveChannels   = $state<string[]>([]);
+
+  // Assert controller's channel selection to Content Fetcher, Content Player, and Timeline.
+  // Called at the start of each state operation so all three stay in sync.
+  function _ctrlApplyChannels() {
+    if (!_ctrlEnabled) return;
+    fetchChannelFilter  = new Set(_ctrlActiveChannels);
+    playerChannelFilter = new Set(_ctrlActiveChannels);
+    if (_ctrlActiveChannels.length > 0) {
+      const available = new Set(Object.keys(coverageByChannel));
+      const valid = _ctrlActiveChannels.filter(ch => available.has(ch));
+      if (valid.length > 0) _tlActiveChannels = valid;
+    }
+  }
+
+  // Called by TimelineSection when the user clicks a channel chip.
+  function _ctrlOnChannelToggle(active: string[]) {
+    _ctrlActiveChannels = active;
+    _ctrlApplyChannels();
+    // Evict player — segments from the previous filter won't match the new one.
+    for (const s of playerSegs) URL.revokeObjectURL(s.url);
+    playerSegs = [];
+    playerStatus = '';
+    void _ctrlAfterScrub();
+  }
+  let _isScrubbing  = $state(false);  // true while user has pointer down on scrubber
+  let _ctrlStatus   = $state('idle');
+  let _ctrlLog      = $state<{ ts: number; msg: string }[]>([]);
+
+  // Saved player type filter — restored when scrubbing ends.
+  let _savedPlayerTypeFilter: Set<MimePrefix> | null = null;
+
+  // Plain vars — no reactivity needed.
+  let _userWantsToPlay   = false;  // user's explicit play/pause intent, survives scrubbing
+  let _ctrlFetching      = false;  // prevents concurrent content-fetch operations
+  let _scrubFetching     = false;  // guard for scrubbing photo fetch
+  let _lastScrubFetchPos = NaN;    // last cursor position a scrub-fetch was triggered for
+  let _scrubCheckTimer: ReturnType<typeof setInterval> | null = null;
+  let _covAutoFetching   = false;
+  let _lastPlayerPlaying = false;  // for end-of-play edge detection
+
+  function _ctrlLog1(msg: string) {
+    _ctrlLog = [{ ts: Date.now(), msg }, ..._ctrlLog].slice(0, 20);
+  }
+
+  // ── User-facing play/pause/stop — track intent separately from scrub state ──
+  function ctrlPlay() { _userWantsToPlay = true;  playerPlay();  }
+  function ctrlPause() { _userWantsToPlay = false; playerPause(); }
+  function ctrlStop()  { _userWantsToPlay = false; playerStop();  }
+
+  // ── Scrub state machine ───────────────────────────────────────────────────
+  function _stopScrubCheck() {
+    if (_scrubCheckTimer) { clearInterval(_scrubCheckTimer); _scrubCheckTimer = null; }
+  }
+
+  // Runs every 300ms while scrubbing: sync player position, expand range, maybe fetch preview.
+  function _ctrlScrubTick() {
+    _ctrlApplyChannels();
+    const cursor = viewCenter;
+    playerPosition = cursor; // lock to cursor, bypassing clamping
+    playerExpandRange(cursor - SCRUB_PREVIEW_LOOKBACK_S, cursor + BUFFER_SEC);
+    if (!_ctrlEnabled || _ctrlFetching || _scrubFetching) return;
+    if (cursor === _lastScrubFetchPos) return;
+    if (!_ctrlInCoverage(cursor)) { _lastScrubFetchPos = cursor; return; }
+    if (_ctrlHasNearbyPreview(cursor)) { _lastScrubFetchPos = cursor; return; }
+    _lastScrubFetchPos = cursor;
+    void _ctrlFetchScrubPreview(cursor);
+  }
+
+  // Called by TimelineSection when pointer goes down on the scrubber.
+  function _ctrlOnScrubStart() {
+    if (_isScrubbing) return;
+    _isScrubbing = true;
+    _ctrlStatus = 'scrubbing';
+    _lastScrubFetchPos = NaN;
+    if (_ctrlEnabled) {
+      if (playerPlaying) playerPause();
+      _savedPlayerTypeFilter = new Set(playerTypeFilter);
+      playerTypeFilter = new Set<MimePrefix>(['video/', 'image/']);
+    }
+    _stopScrubCheck();
+    _scrubCheckTimer = setInterval(_ctrlScrubTick, 300);
+  }
+
+  // Called by TimelineSection when pointer goes up.
+  function _ctrlOnScrubEnd() {
+    if (!_isScrubbing) return;
+    _isScrubbing = false;
+    _stopScrubCheck();
+    void _ctrlAfterScrub();
+  }
+
+  // Restore state and fetch buffer after scrub ends.
+  async function _ctrlAfterScrub() {
+    if (_ctrlEnabled) {
+      playerTypeFilter = _savedPlayerTypeFilter ?? new Set<MimePrefix>(ALL_MIME_PREFIXES);
+    }
+    _savedPlayerTypeFilter = null;
+
+    if (!_ctrlEnabled) { _ctrlStatus = 'idle'; return; }
+
+    _ctrlApplyChannels();
+    const cursor = viewCenter;
+
+    if (!_covAutoFetching) {
+      _covAutoFetching = true;
+      _ctrlStatus = 'fetching coverage…';
+      _ctrlLog1('coverage fetch');
+      try { await fetchCoverage(); } finally { _covAutoFetching = false; }
+    }
+
+    if (!_ctrlInCoverage(cursor)) {
+      _ctrlStatus = 'idle — no coverage at cursor';
+      return;
+    }
+
+    if (_ctrlPlayerHasContent(cursor)) {
+      playerSeekTo(cursor);
+      if (_userWantsToPlay) playerPlay();
+      _ctrlStatus = 'idle';
+      return;
+    }
+
+    // No content at cursor — sparse-fetch 3 anchors: cursor-30, cursor, cursor+30.
+    // Uses getSegmentsInRange(t,t) to find straddling segments, with getSegmentsBefore fallback.
+    if (_ctrlFetching) { _ctrlStatus = 'idle'; return; }
+    _ctrlFetching = true;
+    _ctrlStatus = 'fetching content…';
+    const effectivePubkey = selectedMonitorPubkey ?? $identity?.pubkey;
+    const ch = fetchChannelFilter.size > 0 ? [...fetchChannelFilter] : undefined;
+    _ctrlLog1(`sparse fetch @ ${fmtTs(cursor)} ±30s`);
+    try {
+      if (effectivePubkey) {
+        const seen = new Set(fetchedSegs.map(s => s.key));
+
+        async function _loadAnchor(t: number) {
+          // Prefer segment covering t (handles straddling); fall back to last ended before t.
+          const covering = await getSegmentsInRange(t, t, effectivePubkey!, ch);
+          const metas = covering.length > 0
+            ? [covering[0]]
+            : await getSegmentsBefore(t + 1, 1, effectivePubkey!, undefined, ch);
+          const m = metas[0];
+          if (!m) return;
+          const key = `idb-${effectivePubkey}-${m.segmentId}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          const withBlob = await getSegmentById(m.segmentId);
+          if (!withBlob) return;
+          const blob = await materializeBlob(withBlob.blob, withBlob.mimeType);
+          pushSeg({ key, source: 'idb', originMonitor: effectivePubkey!, mimeType: withBlob.mimeType,
+            startTime: withBlob.startTime, endTime: withBlob.endTime, blob,
+            segmentId: withBlob.segmentId, backupOf: withBlob.backupOf, channelId: withBlob.channelId });
+        }
+
+        await _loadAnchor(cursor - 30);
+        await _loadAnchor(cursor);
+        await _loadAnchor(cursor + 30);
+      }
+    } finally { _ctrlFetching = false; }
+    const bStart = Math.round(cursor - 60);
+    const bEnd   = Math.round(cursor + 60);
+    playerSetRange(bStart, bEnd);
+    playerAddSegs(fetchedSegs);
+    if (playerSegs.length > 0) {
+      playerSeekTo(cursor);
+      _ctrlLog1(`loaded ${playerSegs.length} seg${playerSegs.length !== 1 ? 's' : ''}`);
+      if (_userWantsToPlay) playerPlay();
+    } else {
+      _ctrlLog1('no segments in buffer');
+    }
+    _ctrlStatus = 'idle';
+  }
+
+  // 200ms ticker: liveTime, timeline-follows-player, end-of-play detection.
+  $effect(() => {
+    const iv = setInterval(() => {
+      liveTime = _nowSec();
+      if (mode === 'live') viewCenter = liveTime;
+
+      // While playing (not scrubbing), timeline follows the player position.
+      if (playerPlaying && !_isScrubbing && mode !== 'live') {
+        viewCenter = Math.min(playerPosition, liveTime);
+      }
+
+      // End-of-play detection: player just stopped at the end of its loaded range.
+      const nowPlaying = playerPlaying;
+      const justStopped = _lastPlayerPlaying && !nowPlaying;
+      _lastPlayerPlaying = nowPlaying;
+
+      if (_ctrlEnabled && justStopped && playerPosition >= playerRangeTo && playerRangeTo > 0) {
+        const nextCenter = playerRangeTo + BUFFER_SEC / 2;
+        void (async () => {
+          _ctrlApplyChannels();
+          if (_ctrlFetching) return;
+          _ctrlFetching = true;
+          const bStart = Math.round(nextCenter - BUFFER_SEC / 2);
+          const bEnd   = Math.round(nextCenter + BUFFER_SEC / 2);
+          fetchRangeTs = `${bStart}-${bEnd}`;
+          _ctrlStatus = 'fetching content…';
+          _ctrlLog1(`end-of-play extend [${bStart}–${bEnd}]`);
+          try { await fetchInRange('asc'); } finally { _ctrlFetching = false; }
+          playerSetRange(bStart, bEnd);
+          playerAddSegs(fetchedSegs);
+          if (playerSegs.length > 0 && _userWantsToPlay) { playerSeekTo(bStart); playerPlay(); }
+          _ctrlStatus = 'idle';
+        })();
+      }
+    }, 200);
+    return () => clearInterval(iv);
+  });
+
+  function _ctrlInCoverage(pos: number): boolean {
+    const channelsToCheck = _ctrlActiveChannels.length > 0
+      ? _ctrlActiveChannels
+      : Object.keys(coverageByChannel);
+    for (const ch of channelsToCheck) {
+      const ranges = coverageByChannel[ch];
+      if (ranges && ranges.some(([s, e]) => s <= pos && pos <= e)) return true;
+    }
+    return false;
+  }
+
+  function _ctrlPlayerHasContent(pos: number): boolean {
+    return playerSegs.some(s => s.startTime <= pos + 30 && s.endTime >= pos - 30);
+  }
+
+  const SCRUB_PREVIEW_LOOKBACK_S = 5 * 60;
+  function _ctrlHasNearbyPreview(pos: number): boolean {
+    const { photos, allVideo } = _playerIdx;
+    return (
+      photos.some(s => s.startTime <= pos && s.startTime > pos - SCRUB_PREVIEW_LOOKBACK_S) ||
+      allVideo.some(s => s.startTime <= pos && s.endTime  > pos - SCRUB_PREVIEW_LOOKBACK_S)
+    );
+  }
+
+  async function _ctrlFetchScrubPreview(cursor: number) {
+    if (_scrubFetching) return;
+    _scrubFetching = true;
+    const effectivePubkey = selectedMonitorPubkey ?? $identity?.pubkey;
+    if (!effectivePubkey) { _scrubFetching = false; return; }
+    try {
+      const metas = await getSegmentsBefore(cursor, 3, effectivePubkey, undefined, fetchChannelFilter.size > 0 ? [...fetchChannelFilter] : undefined);
+      const candidate = metas.find(m =>
+        !m.mimeType.startsWith('audio/') &&
+        m.startTime > cursor - SCRUB_PREVIEW_LOOKBACK_S
+      );
+      if (!candidate) return;
+      const key = `idb-${effectivePubkey}-${candidate.segmentId}`;
+      if (!fetchedSegs.some(s => s.key === key)) {
+        const withBlob = await getSegmentById(candidate.segmentId);
+        if (withBlob) {
+          const blob = await materializeBlob(withBlob.blob, withBlob.mimeType);
+          pushSeg({ key, source: 'idb', originMonitor: effectivePubkey, mimeType: withBlob.mimeType,
+            startTime: withBlob.startTime, endTime: withBlob.endTime, blob,
+            segmentId: withBlob.segmentId, backupOf: withBlob.backupOf, channelId: withBlob.channelId });
+        }
+      }
+      playerExpandRange(cursor - SCRUB_PREVIEW_LOOKBACK_S, cursor + BUFFER_SEC);
+      playerAddSegs(fetchedSegs);
+      if (playerSegs.length > 0) _ctrlLog1(`scrub preview: ${candidate.mimeType.split('/')[0]} @ ${fmtTs(candidate.startTime)}`);
+    } finally {
+      _scrubFetching = false;
+    }
+  }
+
   onDestroy(() => {
     clearAutoPlayTimer();
     if (navStatusTimer) clearTimeout(navStatusTimer);
     _stopTimer();
+    _stopScrubCheck();
     for (const s of playerSegs) URL.revokeObjectURL(s.url);
   });
 </script>
@@ -1013,16 +1381,17 @@
         {/each}
       </select>
     {/if}
-    <span class="ctrl-divider">|</span>
-    <select class="source-select"
-      onchange={(e) => { playerChannelFilter = (e.target as HTMLSelectElement).value; }}
-      disabled={playerFilterOptions.length === 0}
-      title={playerFilterOptions.length === 0 ? 'Fetch segments below to discover channels' : 'Filter player to a specific channel — populated from fetched segments'}>
-      <option value="" selected={playerChannelFilter === ''}>All channels</option>
+    {#if playerFilterOptions.length > 0}
+      <span class="ctrl-divider">|</span>
+      <span class="muted-sep">Ch:</span>
       {#each playerFilterOptions as chId (chId)}
-        <option value={chId} selected={chId === playerChannelFilter}>{chId}</option>
+        <button class="type-filter-btn"
+          class:active={playerChannelFilter.size === 0 || playerChannelFilter.has(chId)}
+          onclick={() => togglePlayerChannel(chId)}>
+          {chId}
+        </button>
       {/each}
-    </select>
+    {/if}
     <span class="ctrl-divider">|</span>
     <button class="act-btn accent-soft" onclick={loadPlayerSegments} title="Load segments from local IDB for the given time range">
       Load
@@ -1063,11 +1432,11 @@
   {/if}
 
   <div class="row" style="gap:6px">
-    <button class="act-btn accent" onclick={playerPlaying ? playerPause : playerPlay}
+    <button class="act-btn accent" onclick={playerPlaying ? ctrlPause : ctrlPlay}
       disabled={!playerSegs.length}>
       {playerPlaying ? '⏸ Pause' : '▶ Play'}
     </button>
-    <button class="act-btn" onclick={playerStop} disabled={!playerSegs.length} title="Stop and return to start">
+    <button class="act-btn" onclick={ctrlStop} disabled={!playerSegs.length} title="Stop and return to start">
       ■ Stop
     </button>
     {#if playerSegs.length > 0}
@@ -1093,75 +1462,60 @@
 
 </DevSection>
 
+<TimelineSection
+  {selectedMonitorPubkey}
+  {coverageByChannel}
+  bind:viewCenter
+  bind:viewSpan
+  bind:mode
+  onChannelToggle={_ctrlOnChannelToggle}
+  bind:activeChannels={_tlActiveChannels}
+  {liveTime}
+  {isLiveConnected}
+  onSeekChange={(t) => playerSeekTo(t)}
+  onScrubStart={_ctrlOnScrubStart}
+  onScrubEnd={_ctrlOnScrubEnd}
+/>
+
+<!-- ── Timeline Controller strip ─────────────────────────────────────────── -->
+<div class="tctrl-strip">
+  <label class="tctrl-toggle" title="Enable/disable automatic coverage fetch, content load, and type filter management">
+    <input type="checkbox" bind:checked={_ctrlEnabled} />
+    <span class="tctrl-label">Timeline Controller</span>
+  </label>
+  <span class="tctrl-state"
+    class:tctrl-scrubbing={_isScrubbing}
+    class:tctrl-busy={_ctrlStatus.endsWith('…')}
+  >{_ctrlStatus}</span>
+  {#if _ctrlEnabled}
+    <span class="tctrl-meta">buf {BUFFER_SEC}s · {_isScrubbing ? '📷 photo' : '🎬 all'}</span>
+  {/if}
+  {#if _ctrlLog.length > 0}
+    <button class="tctrl-clear" onclick={() => _ctrlLog = []}>✕</button>
+  {/if}
+</div>
+{#if _ctrlLog.length > 0}
+  <div class="tctrl-log">
+    {#each _ctrlLog as entry (entry.ts)}
+      <div class="tctrl-log-row">
+        <span class="tctrl-log-ts">{new Date(entry.ts).toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+        {entry.msg}
+      </div>
+    {/each}
+  </div>
+{/if}
+
 <DevSection title="Fetch Content">
-  <!-- ── Time Range + Coverage ────────────────────────────────────────────── -->
+  <!-- ── Time Range ─────────────────────────────────────────────────────────── -->
   <div class="subsec-title">Time Range</div>
   <div class="range-row">
     <input type="date" class="date-input" bind:value={fetchRangeDate} onchange={applyFetchDate} />
     <span class="muted-sep">or manually:</span>
     <input class="ts-input" bind:value={fetchRangeTs} placeholder="unix or start-end" style="width:200px" />
   </div>
-  <div class="row" style="margin-top:4px">
-    <button class="act-btn accent" onclick={requestRemoteCoverage} disabled={remoteCoverageLoading || !selectedMonitorPubkey || !isOnline}>
-      {remoteCoverageLoading ? 'Requesting…' : 'Remote Coverage'}
-    </button>
-    <button class="act-btn" onclick={loadLocalCoverage} disabled={localCoverageLoading}>
-      {localCoverageLoading ? 'Reading…' : 'Local Coverage'}
-    </button>
-    <button class="act-btn accent-soft" onclick={fetchBothCoverage} disabled={bothCoverageLoading || !selectedMonitorPubkey || !isOnline}>
-      {bothCoverageLoading ? 'Loading…' : 'Local + Remote'}
-    </button>
-    {#if remoteCoverageStatus}
-      <span class="status" class:ok={remoteCoverageStatus.startsWith('✓')} class:err={remoteCoverageStatus.startsWith('✗')}>{remoteCoverageStatus}</span>
-    {/if}
-    {#if localCoverageStatus}
-      <span class="status" class:ok={localCoverageStatus.startsWith('✓')} class:err={localCoverageStatus.startsWith('✗')}>{localCoverageStatus}</span>
-    {/if}
-  </div>
 
-  {#if remoteCoverage !== null}
-    <div class="cov-source-label">Remote</div>
-    {#if remoteCoverage.length === 0}
-      <div class="empty">Monitor has no stored footage</div>
-    {:else}
-      <div class="coverage-list">
-        {#each remoteCoverage as [start, end] (start)}
-          <div class="cov-row">
-            <span class="cov-range">{fmtTs(start)} — {fmtTs(end)}</span>
-            <span class="cov-dur">{fmtDur(end - start)}</span>
-            <button class="ts-chip" onclick={() => { fetchRangeTs = `${start}-${end}`; copyText(`${start}-${end}`); }} title="Insert range into fetch time range input">{start}-{end}</button>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  {/if}
-
-  {#if localCoverage !== null}
-    <div class="cov-source-label">Local</div>
-    {#if localCoverage.length === 0}
-      <div class="empty">Nothing stored locally for this device</div>
-    {:else}
-      <div class="coverage-list">
-        {#each localCoverage as [start, end] (start)}
-          <div class="cov-row">
-            <span class="cov-range">{fmtTs(start)} — {fmtTs(end)}</span>
-            <span class="cov-dur">{fmtDur(end - start)}</span>
-            <button class="ts-chip" onclick={() => { fetchRangeTs = `${start}-${end}`; copyText(`${start}-${end}`); }} title="Insert range into fetch time range input">{start}-{end}</button>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  {/if}
-
-  <!-- Filters + sources row: types · sources · channel -->
-  <div class="row" style="margin-top:4px; gap:4px; flex-wrap:wrap;">
-    <span class="muted-sep">Types</span>
-    {#each (['video/', 'audio/', 'image/'] as MimePrefix[]) as prefix}
-      <button class="type-filter-btn" class:active={fetchTypeFilter.has(prefix)} onclick={() => toggleFetchType(prefix)}>
-        {TYPE_LABELS[prefix]}
-      </button>
-    {/each}
-    <span class="ctrl-divider">|</span>
+  <!-- Sources -->
+  <div class="row" style="margin-top:4px; gap:4px;">
     <span class="muted-sep">Sources</span>
     <button class="type-filter-btn" class:active={fetchSourceLocal} onclick={() => toggleFetchSource('local')}
       title="Include locally stored segments (IndexedDB)">
@@ -1171,17 +1525,79 @@
       title="Include segments from the monitor over WebRTC">
       WebRTC
     </button>
-    <span class="ctrl-divider">|</span>
-    <select class="source-select"
-      onchange={(e) => { fetchChannelFilter = (e.target as HTMLSelectElement).value; }}
-      disabled={knownChannelIds.length === 0}
-      title={knownChannelIds.length === 0 ? 'Load coverage to discover channels' : 'Filter fetch by channel — channels from coverage data'}>
-      <option value="" selected={fetchChannelFilter === ''}>All channels</option>
-      {#each knownChannelIds as chId (chId)}
-        <option value={chId} selected={chId === fetchChannelFilter}>{chId}</option>
+  </div>
+
+  <!-- Coverage nav + fetch -->
+  <div class="row" style="margin-top:4px; gap:4px; flex-wrap:wrap;">
+    <button class="act-btn adj-arrow" onclick={covEarlier} disabled={bothCoverageLoading}
+      title="Shift range earlier by one span and fetch coverage">
+      ← Earlier
+    </button>
+    <button class="act-btn" onclick={covJumpFirst} disabled={bothCoverageLoading || _covFirstTime === null}
+      title="Jump to first known coverage time and fetch">
+      First
+    </button>
+    <button class="act-btn accent-soft" onclick={() => void fetchCoverage()} disabled={bothCoverageLoading}
+      title="Fetch coverage for the current time range from selected sources">
+      {bothCoverageLoading ? 'Loading…' : 'Fetch Coverage'}
+    </button>
+    <button class="act-btn" onclick={covJumpLast} disabled={bothCoverageLoading || _covLastTime === null}
+      title="Jump to last known coverage time and fetch">
+      Last
+    </button>
+    <button class="act-btn adj-arrow" onclick={covLater} disabled={bothCoverageLoading}
+      title="Shift range later by one span and fetch coverage">
+      Later →
+    </button>
+    {#if remoteCoverageStatus}
+      <span class="status" class:ok={remoteCoverageStatus.startsWith('✓')} class:err={remoteCoverageStatus.startsWith('✗')}>{remoteCoverageStatus}</span>
+    {/if}
+    {#if localCoverageStatus}
+      <span class="status" class:ok={localCoverageStatus.startsWith('✓')} class:err={localCoverageStatus.startsWith('✗')}>{localCoverageStatus}</span>
+    {/if}
+  </div>
+
+  <!-- Per-channel coverage list (height-constrained) -->
+  {#if Object.keys(coverageByChannel).length > 0}
+    <div class="cov-scroll">
+      {#each Object.entries(coverageByChannel) as [ch, ranges] (ch)}
+        <div class="cov-channel-label">{ch || 'default'}</div>
+        {#if ranges.length === 0}
+          <div class="empty" style="padding-left:6px; padding-top:2px;">No ranges</div>
+        {:else}
+          <div class="coverage-list">
+            {#each ranges as [start, end] (start)}
+              <div class="cov-row">
+                <span class="cov-range">{fmtTs(start)} — {fmtTs(end)}</span>
+                <span class="cov-dur">{fmtDur(end - start)}</span>
+                <button class="ts-chip" onclick={() => { fetchRangeTs = `${start}-${end}`; void copyText(`${start}-${end}`); }} title="Insert range into fetch time range input">{start}-{end}</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/each}
-    </select>
-    {#if knownChannelIds.length === 0}
+    </div>
+  {/if}
+
+  <!-- Filters row: types · channel -->
+  <div class="row" style="margin-top:4px; gap:4px; flex-wrap:wrap;">
+    <span class="muted-sep">Types</span>
+    {#each (['video/', 'audio/', 'image/'] as MimePrefix[]) as prefix}
+      <button class="type-filter-btn" class:active={fetchTypeFilter.has(prefix)} onclick={() => toggleFetchType(prefix)}>
+        {TYPE_LABELS[prefix]}
+      </button>
+    {/each}
+    {#if knownChannelIds.length > 0}
+      <span class="ctrl-divider">|</span>
+      <span class="muted-sep">Ch:</span>
+      {#each knownChannelIds as chId (chId)}
+        <button class="type-filter-btn"
+          class:active={fetchChannelFilter.size === 0 || fetchChannelFilter.has(chId)}
+          onclick={() => toggleFetchChannel(chId)}>
+          {chId}
+        </button>
+      {/each}
+    {:else}
       <span class="hint-inline">load coverage to filter by channel</span>
     {/if}
   </div>
@@ -1407,7 +1823,9 @@
   .type-filter-btn.active { background: rgba(139,92,246,0.15); color: var(--color-accent); border-color: var(--color-accent); font-weight: 600; }
 
   /* Coverage */
-  .cov-source-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-muted); margin-top: 6px; margin-bottom: 2px; }
+  .cov-scroll { max-height: 200px; overflow-y: auto; border: 1px solid var(--color-border); border-radius: 5px; padding: 4px 6px; margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
+  .cov-channel-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-accent); margin-top: 4px; }
+  .cov-channel-label:first-child { margin-top: 0; }
   .coverage-list { display: flex; flex-direction: column; gap: 2px; }
   .cov-row { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; background: var(--color-surface); font-size: 11px; }
   .cov-range { font-family: ui-monospace, monospace; color: var(--color-text); }
@@ -1472,4 +1890,50 @@
 
   /* Device chip in segment table — only visible when multiple monitors are loaded */
   .dev-chip { color: var(--color-warning, #f59e0b); }
+
+  /* Timeline controller strip */
+  .tctrl-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 4px 8px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+    margin: 4px 0;
+    font-size: 10px;
+  }
+  .tctrl-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .tctrl-label { font-size: 10px; font-weight: 600; color: var(--color-text); }
+  .tctrl-state {
+    font-size: 9px;
+    font-family: ui-monospace, monospace;
+    color: var(--color-muted);
+    padding: 1px 6px;
+    border-radius: 8px;
+    border: 1px solid var(--color-border);
+    background: var(--color-bg);
+  }
+  .tctrl-state.tctrl-scrubbing { color: #f59e0b; border-color: #f59e0b; background: rgba(245,158,11,0.08); }
+  .tctrl-state.tctrl-busy      { color: var(--color-accent); border-color: var(--color-accent); background: rgba(139,92,246,0.08); }
+  .tctrl-meta { font-size: 9px; color: var(--color-muted); font-family: ui-monospace, monospace; }
+  .tctrl-clear { font-size: 9px; padding: 1px 5px; border: 1px solid var(--color-border); background: none; color: var(--color-muted); border-radius: 3px; cursor: pointer; margin-left: auto; }
+  .tctrl-clear:hover { color: var(--color-danger); border-color: var(--color-danger); }
+  .tctrl-log {
+    font-size: 9px;
+    font-family: ui-monospace, monospace;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    margin-bottom: 4px;
+    max-height: 120px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .tctrl-log-row { display: flex; gap: 8px; color: var(--color-muted); }
+  .tctrl-log-ts { color: var(--color-border); flex-shrink: 0; }
 </style>

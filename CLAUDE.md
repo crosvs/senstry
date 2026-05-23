@@ -73,10 +73,13 @@ src/
       SentrySection.svelte    ← arm/disarm, detector loop, action state machine, signal router lifecycle
       SettingsSection.svelte  ← full pipeline UI (sources, sensors, captures, channels, links, actions)
       LiveViewSection.svelte  ← WebRTC live stream viewer
-      ContentViewerSection.svelte ← segment player + fetch UI
+      ContentViewerSection.svelte ← controller: drives player + timeline + fetcher (see docs/content-viewer.md)
+      TimelineSection.svelte  ← timeline toolbar + channel chips + scrubber wrapper (see docs/timeline.md)
       SegmentStorageSection.svelte ← quota/eviction stats
       AlertsSection.svelte    ← incoming trigger notifications
       DevicesSection.svelte   ← paired device list
+    components/timeline/
+      TimelineScrubber.svelte ← canvas scrubber: coverage lanes, alert markers, pointer input
 docs/
   architecture.md
   pipeline.md
@@ -84,6 +87,8 @@ docs/
   storage.md
   nostr.md
   detectors.md
+  timeline.md          ← TimelineSection + TimelineScrubber UI components
+  content-viewer.md    ← ContentViewerSection controller state machine
 ```
 
 ## Key Architectural Decisions
@@ -149,6 +154,15 @@ Fetched segments and stored segments are tagged with `originMonitor: string` (so
 - **Player segment index** (`_playerIdx` derived): pre-splits `playerSegs` into `videoByChannel`, `audioByChannel`, `photos`, `allVideo`, `allAudio` for O(1) access; updated only when `playerSegs` changes, not per tick
 - **Mobile perf**: player tick uses binary search O(log n) to find segment at playback time; IDB queries use `originMonitor` index for O(1) device-scoped lookups
 
+### ContentViewerSection: Controller + Dumb Components
+`ContentViewerSection` acts as a controller for three dumb UIs: `TimelineSection`, the inline Player, and the inline Fetch Content panel. The controller holds all application state; the UIs expose user gestures upward via callbacks.
+
+- **`_ctrlActiveChannels`** — remembered chip selection, written only by user chip clicks (via `onChannelToggle`). Never reset by coverage refreshes.
+- **`fetchChannelFilter` / `playerChannelFilter`** — `Set<string>` (empty = all channels). Asserted from `_ctrlActiveChannels` by `_ctrlApplyChannels()` at the start of every state transition.
+- **Coverage vs. active channels**: `coverageByChannel` is always fetched for all channels (full scrubber display). `_ctrlInCoverage(pos)` checks only `_ctrlActiveChannels` channels when non-empty.
+- **`_ctrlApplyChannels()`** — the sync point; call it first in every state handler to keep timeline chips, fetch filter, and player filter consistent.
+- See `docs/content-viewer.md` for the full state machine and `docs/timeline.md` for the UI components.
+
 ### IDB Schema (v8)
 Stores: `settings`, `pairedDevices`, `events`, `pendingInvites`, `footageRefs`, `photos`, `outbox`, `segments`. Segment blobs live in OPFS (`recordings/<segmentId>`), only metadata in IDB.
 
@@ -205,3 +219,7 @@ For subscriptions that need cleanup (clear UI state), implement state cleanup in
 - **Every Nostr button must use `useNostrAction` with single-button toggle** — implement as `onclick={action.pending ? action.cancel : handleClick}` with text toggling between action and pending state. Never use separate cancel buttons. Never use "⏳ ETA" on subscription buttons (only on publishes). See "Adding a Nostr action button" section above.
 - **RecordAction source selection uses `cap.sourceId`** — not `ChannelConfig.videoSourceId`/`audioSourceId` (those are live-RTC fallbacks only)
 - **Fetched segments list filters by `selectedMonitorPubkey` automatically** — don't add manual filtering; `ContentViewerSection.svelte` derives `browsedSegsWithIdx` from `$props.selectedMonitorPubkey`
+- **Never reset `_ctrlActiveChannels` on coverage refresh** — coverage loading must not touch channel chip state; only `_ctrlOnChannelToggle` and device-switch should write `_ctrlActiveChannels`
+- **Always call `_ctrlApplyChannels()` first in every controller state handler** — ensures fetch/player/timeline filters are consistent before any fetch or seek operation
+- **Coverage fetch is always unfiltered** — `loadLocalCoverage` calls `getCoverageByChannel` without a channel filter; filtering coverage would hide lanes from the scrubber
+- **Pass `Set<string>` channel filters as arrays to IDB functions** — `getSegmentsInRange` etc. accept `string | string[] | undefined`; convert with `fetchChannelFilter.size > 0 ? [...fetchChannelFilter] : undefined`

@@ -52,9 +52,9 @@ Each file is named by the segment's UUID. There is no subdirectory structure. Th
 
 `getSegmentById(segmentId)` → reads OPFS file → returns `SegmentWithBlob { ...meta, blob }`.
 
-`getSegmentsInRange(from, to, originMonitor?, channelId?)` → IDB index query on `startTime`; filters by `originMonitor` and `channelId` if provided. Returns metadata only (no blobs).
+`getSegmentsInRange(from, to, originMonitor?, channelId?)` → IDB index query on `startTime`; filters by `originMonitor` and `channelId` if provided. `channelId` accepts `string | string[]` — pass an array for multi-channel queries. Returns metadata only (no blobs).
 
-`getSegmentsAfter(after, count, ...)` and `getSegmentsBefore(before, count, ...)` — boundary navigation, returns up to `count` metas (capped at 20 for remote requests).
+`getSegmentsAfter(after, count, ...)` and `getSegmentsBefore(before, count, ...)` — boundary navigation, returns up to `count` metas (capped at 20 for remote requests). Both also accept `channelId?: string | string[]`.
 
 `getCoverageMap(originMonitor?, mimePrefix?, channelId?)` — merges overlapping segments into continuous `[start, end]` intervals.
 
