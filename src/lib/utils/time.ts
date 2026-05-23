@@ -52,11 +52,11 @@ export function formatRelative(ts: number): string {
 }
 
 export function formatAbsolute(ts: number): string {
-	return new Date(ts * 1000).toLocaleString();
+	return new Date(ts * 1000).toLocaleString(undefined, { hour12: false });
 }
 
 export function formatTime(ts: number): string {
-	return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+	return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 export function isSameDay(a: Date, b: Date): boolean {

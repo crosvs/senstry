@@ -36,7 +36,7 @@
 
   // ── Formatting ────────────────────────────────────────────────────────────
   function fmtTs(unix: number) {
-    return new Date(unix * 1000).toLocaleTimeString();
+    return new Date(unix * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
   }
 
   function fmtData(data: Record<string, unknown> | undefined): string {
