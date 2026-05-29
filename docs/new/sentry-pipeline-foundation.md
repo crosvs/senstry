@@ -882,15 +882,14 @@ Actions are **independent**; no synchronization, no ordering. Each owns its own 
 
 ### RecordSegmentsAction Priority
 
-RecordSegmentsActions have a numeric `priority` field. On the same channel, only one RecordSegmentsAction can record at a time:
+RecordSegmentsActions have a numeric `priority` field. Priority arbitration is **per-track**: video and audio compete independently. A lower-priority action is **blocked** on a track (not stopped) when a higher-priority action is also active on that track. Blocking is silent — the blocked action never fires `onActivate` for that track.
 
-- If RecordSegmentsAction A (priority 5) is active and RecordSegmentsAction B (priority 10) is triggered:
-  1. B immediately starts recording
-  2. A's recording is stopped, and its final segment is saved
-  3. B takes control of the channel
+- If RecordSegmentsAction A (priority 10) and B (priority 5) are both linked-active on the same channel:
+  - On each track, A wins; B is blocked on that track
+  - If B requests a track that A does not (e.g. B has audio, A has none), B is active on that track uncontested
+- When A deactivates, RecordingController awakens the highest-priority blocked request on each affected track independently
 
-- If B later deactivates, and A's link is still active:
-  1. A resumes recording on the channel at its current priority
+See sections 7 and 15 for full per-track arbitration detail and examples.
 
 ### PinSegmentsAction & CapturePhotosAction
 
@@ -913,7 +912,7 @@ All pipeline components are explicitly created and connected. No auto-discovery,
 - **Sensors** own their runtime state (SensorState)
 - **Actions** own their runtime state (ActionState)
 - **Links** own nothing (stateless evaluators)
-- **Channels** own nothing (loose labels)
+- **Channels** own no runtime state; source selection and rolling buffer are static configuration
 - **Segments** are immutable once saved
 
 ### Immutable Events
@@ -1162,7 +1161,7 @@ Many triggers are instantaneous (audio spike, motion detection). Post-roll captu
 
 ## 15. State Management: Per-Track Arbitration
 
-Per-track arbitration and awakening for RecordSegmentsActions and SourceOverrideActions is managed by **RecordingController** (see `docs/plans/sentry-controller.md` § RecordingController).
+Per-track arbitration and awakening for RecordSegmentsActions and SourceOverrideActions is managed by **RecordingController** (see `docs/new/sentry-controller.md` § RecordingController).
 
 Key responsibilities:
 

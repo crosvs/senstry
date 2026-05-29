@@ -583,27 +583,7 @@ Modules that need "the most recent X" break on first match. Modules that need "a
 
 ---
 
-### Pattern 4: Request-Response over Nostr (e.g., viewer requests segment from monitor)
-
-```typescript
-// Viewer side: send request, wait for response via signal router
-const requestEvent = buildSegmentRequestSignal({ segmentId });
-const responsePromise = listenForResponse('segment-meta', requestId, timeoutMs);
-
-publish(requestEvent);  // via signal-router subscription
-
-const response = await responsePromise;
-```
-
-**Rules:**
-- Use request-response ONLY for critical queries (coverage maps, segment metadata)
-- Always have a timeout (don't wait forever)
-- Include `requestTime` or `requestId` in request for correlation
-- Response handler filters by ID/timestamp to match request
-
----
-
-### Pattern 5: Signal Router (Long-Lived Subscription)
+### Pattern 4: Signal Router (Long-Lived Subscription)
 
 The signal router is managed entirely inside `NostrClient`. Modules start it with a callback and receive decoded, decrypted signals — no relay or channel key management required.
 
@@ -611,7 +591,7 @@ The signal router is managed entirely inside `NostrClient`. Modules start it wit
 // Start the signal router — all relay subscriptions managed internally
 nostrController.startSignalRouter((contactId, kind, payload) => {
   // contactId: UUID identifying which contact sent this (paired or temp)
-  // kind: 5001–5005
+  // kind: 5001–5005 (connection/presence) or 5010–5011 (action notifications)
   // payload: already decrypted and parsed
   routeSignal(contactId, kind, payload);
 });
@@ -633,7 +613,7 @@ onDestroy(() => nostrController.stopSignalRouter());
 
 ---
 
-### Pattern 6: Full-Range History Fetch (e.g., catch up on missed actions)
+### Pattern 5: Full-Range History Fetch (e.g., catch up on missed actions)
 
 For collecting all events in a window rather than stopping at the first match, iterate the full generator without breaking. The contact's relay list and channel key are resolved internally — the caller only passes `contactId` and `kind`.
 
@@ -798,17 +778,18 @@ describe('SubscriptionManager', () => {
 ```typescript
 describe('NostrClient (integration)', () => {
   it('publishes event and subscriber receives it', async () => {
-    const client = new NostrClient(relayUrls, privkey, pubkey);
+    const client = new NostrClient(privkey, pubkey, vi.fn());
     
     const received: string[] = [];
-    const sub = client.subscribe([{ kinds: [5001] }]);
-    sub.on('event', (e) => received.push(e.content));
+    client.startSignalRouter((contactId, kind, payload) => {
+      received.push(JSON.stringify(payload));
+    });
     
-    const event = buildTestEvent({ kinds: [5001], content: 'hello' });
-    await client.publish(event);
+    const event = buildTestEvent({ kind: 5004, content: 'hello' });
+    await client.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: false });
     
-    await waitFor(() => received.includes('hello'));
-    expect(received).toContain('hello');
+    await waitFor(() => received.length > 0);
+    expect(received[0]).toContain('online');
   });
 });
 ```

@@ -119,7 +119,6 @@ Defines event format, signing, relay protocol, and canonical JSON serialization.
 Events with kind ≥ 30000 are replaceable. Relay deduplicates by `(pubkey, kind, d-tag)`.
 - **Status:** Stable
 - **Used by:** Not currently used in Senstry. Footage metadata is exchanged over RTC data channels, not Nostr.
-  - Efficient metadata updates without event explosion
 
 ### NIP-44: Encrypted Payloads (ChaCha20-Poly1305)
 Standard encryption for Nostr content.
@@ -147,7 +146,7 @@ Three-layer wrapping scheme for obscuring sender, recipient, and content from re
 2. **Seal** (kind 13) — rumor encrypted with sender's real key to recipient's pubkey; signed by sender's real key; no `p` tag
 3. **Gift Wrap** (kind 1059) — seal encrypted with a random one-time key; `p` tag = recipient pubkey for relay routing; signed by the random key
 
-**Timestamps:** the seal and gift wrap layers use randomized timestamps (±2 days) to protect against time-analysis. Only the rumor's `created_at` is honest. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
+**Timestamps:** the seal and gift wrap layers use randomized timestamps (±30 minutes) to protect against time-analysis. Only the rumor's `created_at` is honest. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
 
 **Status in Senstry:**
 - **Not used** for signals between paired devices — replaced by ECDH channel keys (more efficient, supports `since` filtering)
@@ -158,7 +157,7 @@ Three-layer wrapping scheme for obscuring sender, recipient, and content from re
 
 ### Model 1: NIP-44 over ECDH Channel Keys – All Post-Pairing Events
 
-Used for all events sent between paired devices: signals (5001–5005), action signals (5010, 5011), and pairing acks (5000).
+Used for all events sent between paired devices: signals (5001–5005) and action signals (5010, 5011).
 
 ```
 Event sender: Monitor (outbound channel privkey — not identity key)
@@ -327,7 +326,7 @@ Every device has one **identity keypair:**
 - **Privkey:** 32-byte random value (Uint8Array), stored in IndexedDB (browser sandbox provides encryption at rest)
 - **Pubkey:** 64-character hex string, derived via secp256k1 from privkey
 
-This keypair is used only for pairing events (5000, 5100, 5200) and as input to ECDH shared secret derivation. It never appears as the `pubkey` field on any post-pairing Nostr event.
+This keypair is used only for pairing events (5100, 5200) and as input to ECDH shared secret derivation. It never appears as the `pubkey` field on any post-pairing Nostr event.
 
 ### ECDH Shared Secret
 
@@ -390,10 +389,7 @@ Tags are optional metadata attached to events. Format is an array of arrays: `["
 **Trigger event (kind 5010):**
 ```json
 {
-  "tags": [
-    ["p", "viewer-pubkey"],
-    ["t", "audio-detection"]
-  ]
+  "tags": []
 }
 ```
 
@@ -433,7 +429,7 @@ if (now - event.created_at > TTL_SECONDS) {
 
 ### Standard Events (Immutable)
 
-Kinds 5000, 5001, 5010, 5011 are standard (non-replaceable) events:
+All signal and action signal kinds (5001–5005, 5010, 5011) and pairing kinds (5100, 5200) are standard (non-replaceable) events:
 - Once published, content cannot change
 - Multiple events with the same `(pubkey, kind)` can coexist
 - Relay returns all matching events unless further filtered

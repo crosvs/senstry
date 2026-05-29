@@ -742,7 +742,7 @@ Gift Wrap (kind 1059)
               }
 ```
 
-**Timestamp handling:** the seal and gift wrap layers use randomized `created_at` (within ±2 days) to protect against time-analysis. The rumor's `created_at` is honest. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
+**Timestamp handling:** the seal and gift wrap layers use randomized `created_at` (within ±30 minutes) to protect against time-analysis. The rumor's `created_at` is honest. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
 
 ### Temp Contact Creation on Gift Wrap Receipt
 
@@ -1053,17 +1053,18 @@ const payload: RemoteInstructionPayload = {
   created_at: Math.floor(Date.now() / 1000)
 };
 
-// Pre-pairing: encrypt with real identity keys (no channel keys exist yet)
-const sharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
-const encrypted = nip44Encrypt(JSON.stringify(payload), sharedSecret);
-
-// Publish as Nostr event (kind 5200 for pairing invites)
-await publish({
+// In practice, this payload is the Rumor inside a NIP-59 gift wrap (kind 1059).
+// The gift wrap encrypts with a random one-time key; the Seal inside encrypts with
+// the monitor's real identity key. The published event is kind 1059, not kind 5200 directly.
+// Kind 5200 is the unsigned Rumor nested inside; it is never published bare.
+const rumor = {
   kind: 5200,
-  content: encrypted,
-  tags: [['p', viewerPubkey]],
-  created_at: payload.created_at
-});
+  content: JSON.stringify(payload),
+  tags: [],
+  created_at: payload.created_at,
+  pubkey: monitorPubkey,
+};
+await sendGiftWrap(rumor, viewerPubkey, monitorPrivkey, [viewerRelay]);
 ```
 
 **Viewer side (recipient):**
@@ -1647,7 +1648,7 @@ async function resumePendingRelayMigrations() {
     // it's the same migration proposal regardless of timing. Compare createdAt only for tie-breaking: if older,
     // use stored proposal; if newer, update and re-send ack.
     
-    const recentProposalHistory = await getRecentRelayProposals(contact.pubkey, since: proposedAt - 60000);
+    const recentProposalHistory = await getRecentRelayProposals(contact.pubkey, { since: proposedAt - 60000 });
     const existingProposal = recentProposalHistory.find(p => p.sessionId === sessionId && p.initiatorPubkey === contact.pubkey);
     
     if (existingProposal) {
@@ -1736,31 +1737,6 @@ interface PairedDevice {
   // ... other fields ...
 }
 ```
-
----
-
-## Resilience Properties
-
-**Communications never fail:**
-- Initiator proposes over peer's inbound (unchanged throughout migration)
-- Acknowledger dual-listens to old+new inbound (catches ack anywhere)
-- All proposals reach destination; all acks reach source
-
-**Concurrent proposals are safe:**
-- Each proposal has unique `sessionId`
-- Initiator waits for latest proposal's sessionId
-- Latest proposal implicitly wins (no explicit "resolve conflict" logic needed)
-- Both devices can independently propose inbound changes without interference
-
-**Graceful failure and recovery:**
-- If ack lost: initiator checks for other signals; if peer sending anything, retry proposal
-- If app crashes mid-migration: `relayProposal` stored in IDB; resume by checking for matching ack
-- If peer offline: keep proposal persisted; retry on each startup until ack found
-
-**Single source of truth per device:**
-- Each device controls only its own inbound (where it listens)
-- Peer's inbound is read-only (updated via peer's proposals only)
-- No "agreement needed"—proposal + proof of listening is sufficient
 
 ### Relay List for Signals
 
@@ -1974,27 +1950,14 @@ When a device wants to migrate its listening relays (e.g., relay shutting down, 
 
 ---
 
-## Nostr Online State (Auto-Managed)
+## Nostr Online State
 
-The system is **online only when there's something to do:**
+The Nostr stack is online only when there is something to do. `NostrClient.goOnline()` is called by the system (monitor arm, invite listener start) when at least one paired device exists or an active invite listener is open. `NostrClient.goOffline()` is called on disarm, on explicit user disconnect, or automatically after three consecutive all-relay failures.
 
-```typescript
-const nostrOnline = $derived(
-  $pairedDevices.length > 0 || hasActiveInviteListeners()
-);
+- **Online:** armed + at least one paired device, OR an active invite listener
+- **Offline:** disarmed, relay failure threshold reached, or all paired devices removed and no invite listeners
 
-$effect(() => {
-  if ($nostrOnline) {
-    startSignalRouter();
-  } else {
-    stopSignalRouter();
-  }
-});
-```
-
-- **Online:** At least one paired device OR an active invite listener
-- **Offline:** Zero paired devices AND no invite listeners
-- **No user toggle:** Automatic based on pairing/invite state
+`goOnline()` announces presence to all registered contacts via kind 5004 and starts the signal router. `goOffline()` announces offline to all contacts before shutting down, then clears the publish queue. Signal router start/stop is managed internally by `NostrClient`.
 
 ---
 
