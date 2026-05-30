@@ -87,7 +87,6 @@ Kinds: 5001–5005 (one per signal type)
 Pubkey: ECDH-derived channel key (not real identity)
 Content: NIP-44 encrypted kind-specific payload
 created_at: honest timestamp (not randomized)
-Relays: all relays in pairedDevices[contact].relays[]
 Subscription: T+0 only (since: now) — no history replay in subscribe
 ```
 
@@ -121,7 +120,7 @@ const viewerOutbound = deriveChannelKey(sharedSecret, viewerPubkey, monitorPubke
 - RTC handshake (kinds 5001, 5002, 5003): `SIGNAL_TTL_S = 10` — stale offers, answers, hangups are discarded
 - Presence (kind 5004): `STATUS_TTL_S = 3600` (1 hour) — status is meaningful for up to 1 hour
 
-`status-request` no longer exists as a separate concept — kind 5004 with `isResponse: false` acts as both announcement and solicitation. `ping`/`pong` are not signal kinds; connectivity checks happen at the WebRTC or relay-connection layer, not via Nostr signals.
+Kind 5004 with `isResponse: false` acts as both announcement and solicitation — there is no separate status-request kind. `ping`/`pong` are not signal kinds; connectivity checks happen at the WebRTC or relay-connection layer, not via Nostr signals.
 
 TTL is checked against the event's honest `created_at` (not randomized like gift-wrap).
 
@@ -496,7 +495,7 @@ for (let attempt = 0; attempt <= ANSWER_RETRY_DELAYS_MS.length; attempt++) {
 
 ## 9. Signal Router (`signal-router.ts`)
 
-A single global subscription to all signal kinds (5001–5005) handles incoming signals and routes them by kind:
+A single global subscription to all signal kinds (5001–5005, 5010, 5011) handles incoming signals and routes them by kind:
 
 | Kind | isResponse | Handler |
 |------|-----------|---------|
@@ -508,6 +507,8 @@ A single global subscription to all signal kinds (5001–5005) handles incoming 
 | 5004 | true (reply) | `updatePeerStatus()` only (no further reply — prevents loops) |
 | 5005 | false (relay proposal) | `handleRelayMigrationProposal()` |
 | 5005 | true (relay ack) | `handleRelayMigrationAck()` |
+| 5010 | — | Delivered to caller via `onSignal(contactId, 5010, payload)` — viewer handles as trigger notification |
+| 5011 | — | Delivered to caller via `onSignal(contactId, 5011, payload)` — viewer handles as arm state update |
 
 **Startup Grace Period** (`AWARENESS_STARTUP_GRACE_MS = 20_000`): After the signal router starts, awareness replies are suppressed for 20s. This prevents relay rate-limit budget from being consumed by awareness reply bursts when both devices come online simultaneously. Allows WebRTC handshake (offer-request + answer) to complete without relay rate-limit pressure.
 

@@ -436,6 +436,23 @@ When B deactivates:
 
 **Purpose:** protect segments of selected types within a time window from rolling buffer eviction.
 
+**Configuration:**
+```typescript
+interface PinSegmentsAction {
+  id: string;
+  name: string;
+  type: 'pin-segments';
+  channelId: string;               // which channel's segments to pin
+  mimePrefix?: string;             // 'video/', 'audio/', 'image/' (omit = all types)
+  preRollSec: number;              // include segments this many seconds before trigger time
+  postRollSec: number;             // extend pin window this long after trigger ends
+  pinLifetimeSec: number | null;   // seconds to keep pinned (null = pin forever)
+  onRetrigger: 'extend' | 'ignore' | 'restart';
+}
+```
+
+No per-track arbitration. Multiple PinSegmentsActions on the same channel coexist independently — each pins its own window without blocking the other.
+
 #### Example: Motion-Triggered Hi-Res Recording
 
 ```
@@ -753,6 +770,7 @@ interface Segment {
   backupOf: string | null;         // dedup key: null = canonical (originated here); <id> = remote copy
   contentHash: string;             // SHA-256 hex of blob ('' for pre-v6 records)
 }
+```
 
 **backupOf semantics (segment deduplication):**
 - **Layer 1 (Canonical)**: `backupOf = null` — segment originated on this device (recorded locally or fetched from peer and saved)

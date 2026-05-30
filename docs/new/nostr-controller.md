@@ -21,7 +21,7 @@ NostrController (peer-centric API)
   │     global — shared across all peers and all operation types
   │
   ├── PublishQueue                     ← rate-safe outbox; re-enqueues when all relays cooled
-  ├── SubscriptionManager              ← subscription lifecycle + dedup, T+0 enforced
+  ├── SubscriptionManager              ← subscription lifecycle + kind multiplexing + dedup, T+0 enforced
   ├── RelayPool (SimplePool)           ← actual WebSocket connections
   └── NostrGate ($nostrOnline)         ← on/off switch
 ```
@@ -31,7 +31,7 @@ Each subsystem is independently testable:
 - **ContactManager** — unified registry for paired devices (permanent, ECDH keys, IDB) and temp contacts (ephemeral keys, memory-only TTL, giftwrap-derived). Source of truth for all relay and key lookups.
 - **RelayStateController** — per relay URL: cooldown, rate limit, failure count. Selects relay for publish; provides eligible set for fan-fetch.
 - **PublishQueue** — queue events with relay-safe re-enqueue on cooldown
-- **SubscriptionManager** — manage active subscriptions with auto-cleanup, dedup, T+0 enforced
+- **SubscriptionManager** — manage active subscriptions with kind multiplexing, dedup, T+0 enforced
 - **RelayPool** — low-level relay connections (SimplePool)
 - **NostrGate** — guard all Nostr activity on online/offline state
 
@@ -52,62 +52,105 @@ class NostrClient {
   ) {}
 
   // Contact registry — both paired and temp use the same UUID-based contactId
-  registerPaired(device: PairedDevice): string           // returns UUID contactId
-  unregisterPaired(contactId: string): void
-  updatePairedRelays(contactId: string, newRelays: string[]): void  // relay migration commit
+  registerPaired(device: PairedDevice): string; // returns UUID contactId
+  unregisterPaired(contactId: string): void;
+  updatePairedRelays(contactId: string, newRelays: string[]): void; // updates stored inbound relay list; signal router re-subscribes to new list automatically
 
-  registerTempContact(rumor: GiftwrapRumor, ttlSeconds: number): string  // returns UUID contactId
-  expireTemp(contactId: string): void                    // immediately discard a temp contact
-  findContactsByPubkey(pubkey: string): ContactEntry[]   // check for existing contacts; used during pairing
-  allContactIds(): string[]                              // all registered contact UUIDs (paired + temp)
+  // Relay migration — temporarily extends the contact's inbound relay list to include newRelays for dual-listening.
+  // onReady fires when the new relay subscription is confirmed active on the relay.
+  // Dual-listening remains active until updatePairedRelays(contactId, newRelays) is called,
+  // at which point ContactManager commits the new list and the old relay subscription closes automatically.
+  requestRelayMigrationListening(
+    contactId: string,
+    newRelays: string[],
+    onReady: (since: number) => void,
+  ): void;
+
+  registerTempContact(rumor: GiftwrapRumor, ttlSeconds: number): string; // returns UUID contactId
+  expireTemp(contactId: string): void; // immediately discard a temp contact
+  findContactsByPubkey(pubkey: string): ContactEntry[]; // check for existing contacts; used during pairing
+  allContactIds(): string[]; // all registered contact UUIDs (paired + temp)
 
   // Signals — contactId only; relay selection, key lookup, and encryption are all internal
-  publishSignal(contactId: string, kind: number, payload: object): void           // queued, rate-safe
-  publishSignalDirect(contactId: string, kind: number, payload: object): Promise<void>  // time-sensitive
-  sendGiftWrap(contactId: string, payload: object): Promise<void>  // NIP-59 wrap; for temp contacts
+  publishSignal(contactId: string, kind: number, payload: object): void; // queued, rate-safe
+  publishSignalDirect(
+    contactId: string,
+    kind: number,
+    payload: object,
+  ): Promise<void>; // time-sensitive
+  sendGiftWrap(contactId: string, payload: object): Promise<void>; // NIP-59 double-wrap applied automatically; payload is the plaintext rumor content
 
   // Signal router — T+0 across all contacts; decrypts before delivery
-  startSignalRouter(onSignal: (contactId: string, kind: number, payload: object) => void): void
-  stopSignalRouter(): void
+  startSignalRouter(
+    onSignal: (contactId: string, kind: number, payload: object) => void,
+  ): void;
+  stopSignalRouter(): void;
+
+  // One-off subscription — for pre-pairing flows where no contactId exists yet (e.g. QR acceptance).
+  // Subscribes T+0 on the monitor's own inbound relays. Returns a handle to unsubscribe.
+  requestSubscription(
+    filters: Filter[],
+    onEvent: (event: NostrEvent) => void,
+    onReady: (since: number) => void,
+  ): SubscriptionHandle;
+
+  // Resolves when a signal from contactId matching filter arrives, or null on timeout.
+  // Relies on the signal router's T+0 subscriptions — no separate subscription opened.
+  // Caller must ensure relevant relays are already covered (e.g. via requestRelayMigrationListening)
+  // before calling, otherwise the signal may arrive before the router is listening.
+  waitForSignal(
+    contactId: string,
+    opts: {
+      kind: number;
+      filter: (payload: object) => boolean;
+      timeoutMs: number;
+    },
+  ): Promise<object | null>;
 
   // History — contactId only; relay list and keys resolved internally
   fetchKindHistory(
     contactId: string,
     kind: number,
-    opts?: { windowStart?: number; windowEnd?: number }
-  ): AsyncGenerator<NostrEvent>
+    opts?: { windowStart?: number; windowEnd?: number },
+  ): AsyncGenerator<NostrEvent>;
 
   // State
-  get isOnline(): boolean
-  get queueDepth(): number
+  get isOnline(): boolean;
+  get queueDepth(): number;
 
   // Lifecycle
-  goOnline(): void
-  goOffline(reason?: string): void
-  destroy(): void
+  goOnline(): void;
+  goOffline(reason?: string): void;
+  destroy(): void;
 }
 ```
 
 **Publishing patterns:**
+
 - `publishSignal(contactId, kind, payload)` — queued; relay selected by `RelayStateController` (LRU-eligible)
 - `publishSignalDirect(contactId, kind, payload)` — immediate; for time-sensitive signals
 - `sendGiftWrap(contactId, payload)` — NIP-59 layers; uses `outboundChannelPubkey` if set, else addresses to `pubkey`
 - Relay selection, key lookup, and encryption are always internal
 
 **Subscribing:**
+
 - `startSignalRouter(onSignal)` — T+0 subscriptions across all contacts; `onSignal` receives `(contactId, kind, payload)`
 - Signal router re-subscribes automatically when contacts are added, updated, or expired
 
 **History:**
+
 - `fetchKindHistory(contactId, kind, opts)` — fan-fetches `limit:1` per round; relay list and keys resolved internally
 
 **Pairing with existing temp contact:**
+
 ```typescript
 const existing = nostrClient.findContactsByPubkey(incomingPubkey);
 // existing may include a temp contact from an in-progress TOTP session
 // controller decides: expire temp entry, carry over state, or let both coexist until TTL
 const pairedId = nostrClient.registerPaired(device);
-existing.filter(e => e.expiresAt).forEach(e => nostrClient.expireTemp(e.contactId));
+existing
+  .filter((e) => e.expiresAt)
+  .forEach((e) => nostrClient.expireTemp(e.contactId));
 ```
 
 ---
@@ -121,47 +164,49 @@ Internal registry for all contacts — both permanent paired devices and tempora
 ```typescript
 // Shared interface — NostrClient sees no difference between paired and temp contacts
 interface ContactEntry {
-  contactId: string;                     // UUID — generated at creation, stable for lifetime of contact
+  contactId: string; // UUID — generated at creation, stable for lifetime of contact
 
-  pubkey: string;                        // real identity; used to detect duplicates across paired/temp
+  pubkey: string; // real identity; used to detect duplicates across paired/temp
 
-  inboundChannelPubkey: string;          // paired: ECDH-derived; temp: freshly generated ephemeral
-  inboundChannelPrivkey: Uint8Array;     // held in memory; used to decrypt incoming events
-  outboundChannelPubkey: string | null;  // null → address to pubkey directly (initial contact)
+  inboundChannelPubkey: string; // paired: ECDH-derived; temp: freshly generated ephemeral
+  inboundChannelPrivkey: Uint8Array; // held in memory; used to decrypt incoming events
+  outboundChannelPubkey: string | null; // null → address to pubkey directly (initial contact)
 
-  inboundRelayList: string[];            // relays WE listen on for this contact
-  outboundRelayList: string[];           // relays WE send to in order to reach this contact
+  inboundRelayList: string[]; // relays WE listen on for this contact
+  outboundRelayList: string[]; // relays WE send to in order to reach this contact
 
   addedAt: number;
-  expiresAt?: number;                    // absent = permanent (paired); set = temp (giftwrap-derived)
+  expiresAt?: number; // absent = permanent (paired); set = temp (giftwrap-derived)
 }
 
 class ContactManager {
   // Paired device management (persistent, IDB-backed)
-  registerPaired(device: PairedDevice): string      // returns new UUID contactId
-  unregisterPaired(contactId: string): void
-  updatePairedRelays(contactId: string, newInboundRelays: string[]): void  // relay migration commit
+  registerPaired(device: PairedDevice): string; // returns new UUID contactId
+  unregisterPaired(contactId: string): void;
+  updatePairedRelays(contactId: string, newInboundRelays: string[]): void; // relay migration commit
 
   // Temp contact management (memory-only, TTL)
-  registerTemp(entry: Omit<ContactEntry, 'contactId'>): string  // returns new UUID contactId
-  expireTemp(contactId: string): void
-  purgeExpired(): void                                           // called periodically
+  registerTemp(entry: Omit<ContactEntry, "contactId">): string; // returns new UUID contactId
+  expireTemp(contactId: string): void;
+  purgeExpired(): void; // called periodically
 
   // Lookup
-  get(contactId: string): ContactEntry
-  findByPubkey(pubkey: string): ContactEntry[]         // find all contacts (paired or temp) for a real identity
-  findByInboundKey(inboundChannelPubkey: string): ContactEntry | null  // for signal routing
-  allMyInboundRelays(): string[]                       // union of inboundRelayList across all contacts
+  get(contactId: string): ContactEntry;
+  findByPubkey(pubkey: string): ContactEntry[]; // find all contacts (paired or temp) for a real identity
+  findByInboundKey(inboundChannelPubkey: string): ContactEntry | null; // for signal routing
+  allMyInboundRelays(): string[]; // union of inboundRelayList across all contacts
 }
 ```
 
 **Paired entries:**
+
 - Registered from `PairedDevice` records on startup; each gets a UUID `contactId`
 - ECDH-derived channel keys, cached on register
 - No `expiresAt` — permanent until unpaired
 - Relay migration → `updatePairedRelays(contactId, ...)` → next operation picks up new list automatically
 
 **Temp entries (gift-wrap-derived):**
+
 - Created when a gift wrap is received and decrypted; each gets a UUID `contactId`
 - `inboundChannelPubkey/Privkey` freshly generated at creation
 - `outboundChannelPubkey` = `replyKey` from the gift wrap rumor; `null` if initiating without prior wrap
@@ -175,6 +220,7 @@ When pairing completes, `ContactManager.findByPubkey(pubkey)` checks whether a t
 Incoming events carry either an `authors` pubkey (paired signals) or a `#p` tag (gift wraps) that matches an `inboundChannelPubkey`. `findByInboundKey()` maps that back to a `contactId`, which is what the signal router delivers to `onSignal`.
 
 **Signal router coverage:**
+
 - `allMyInboundRelays()` includes relay lists from all contacts (paired and temp)
 - Signal router subscribes across all of them, filtering by all active `inboundChannelPubkey` values
 - Re-subscribes automatically when any contact is registered, updated, or expired
@@ -190,18 +236,23 @@ export async function getPool(): Promise<SimplePool> {
   // returns singleton SimplePool
 }
 
-export async function publish(event: NostrEvent, relays?: string[]): Promise<void>
+export async function publish(
+  event: NostrEvent,
+  relays?: string[],
+): Promise<void>;
 
 export async function subscribe(
   filters: Filter[],
-  options?: SubscriptionOptions
-): Promise<Subscription>
+  relays: string[],
+): Promise<Subscription>;
 ```
 
 **Rules:**
+
 - Pool is a singleton (one per app)
 - All publishes go through the pool (no direct relay writes)
 - All subscriptions go through the pool (enables dedup + filtering)
+- `subscribe()` is an internal primitive used only by `SubscriptionManager`. Modules never call it directly — they call `nostrClient.requestSubscription()` instead.
 
 ---
 
@@ -212,15 +263,19 @@ Events destined for Nostr are queued and flushed on a timer, respecting rate lim
 ```typescript
 interface QueuedEvent {
   event: NostrEvent;
-  label: string;                    // e.g. "signal-offer", "trigger-notify"
+  label: string; // e.g. "signal-offer", "trigger-notify"
   createdAt: number;
   onQueued?: (estimatedEtaMs: number) => void;
   onPublished?: () => void;
   onError?: (reason: string) => void;
 }
 
-export function publishQueued(event: NostrEvent, label: string, opts?: PublishOptions): void
-export async function flushQueue(): Promise<void>
+export function publishQueued(
+  event: NostrEvent,
+  label: string,
+  opts?: PublishOptions,
+): void;
+export async function flushQueue(): Promise<void>;
 ```
 
 ```typescript
@@ -231,12 +286,13 @@ export async function outboxFlusher(): Promise<void> {
       await publish(item.event);
       item.onPublished?.();
     }
-    await delay(msPerEvent);  // paced by rate limit
+    await delay(msPerEvent); // paced by rate limit
   }
 }
 ```
 
 **Rules:**
+
 - `publishQueued()` is the default for everything (not time-sensitive)
 - Only `publish()` for responses or time-critical signals
 - Flusher returns immediately if `$nostrOnline` is false
@@ -246,37 +302,113 @@ export async function outboxFlusher(): Promise<void> {
 
 ### SubscriptionManager
 
-Manages the lifecycle of active subscriptions with dedup and cleanup.
+Manages the lifecycle of active subscriptions. Modules never open relay subscriptions directly — they request subscriptions and receive callbacks. The manager handles all relay REQ lifecycle, including grouping compatible subscriptions into a single relay REQ to stay within per-connection subscription limits.
 
 ```typescript
-interface ManagedSubscription {
-  filters: Filter[];
+// Returned to caller — stable across relay subscription churn
+interface SubscriptionHandle {
+  unsubscribe(): void;
+}
+
+// One per caller request
+interface LogicalSubscription {
+  filters: Filter[]; // original filters, including kinds
   onEvent: (event: NostrEvent) => void;
-  onEose: () => void;
-  dedup: Set<string>;        // event IDs seen, cleared every 60s
-  createdAt: number;
-  lastEventAt: number;
+  onReady: (since: number) => void;
+  dedup: Set<string>; // event IDs already dispatched to this callback; cleared every 60s
+}
+
+// One per active relay REQ — may back multiple logical subscriptions
+interface RelaySubscription {
+  relays: string[];
+  kinds: number[]; // merged union of all grouped logical subs
+  sub: Subscription; // raw relay sub handle
 }
 
 export class SubscriptionManager {
-  subscribe(filters: Filter[], opts?: SubscriptionOptions): Subscription
-  unsubscribe(sub: Subscription): void
-  get active(): ManagedSubscription[]
+  requestSubscription(
+    filters: Filter[],
+    onEvent: (event: NostrEvent) => void,
+    onReady: (since: number) => void,
+  ): SubscriptionHandle;
+
+  unsubscribe(handle: SubscriptionHandle): void;
+  get active(): LogicalSubscription[];
 }
 ```
 
-**Lifecycle:**
-1. `subscribe(filters)` opens a relay subscription and returns a handle
-2. Incoming events are deduped by ID (same ID within 60s is dropped)
-3. `onEose` fires when relay signals end-of-stored-events
-4. `close()` on subscription → sends `CLOSE` frame to relay
-5. Auto-cleanup: subscriptions without listeners after 30s are closed
+---
+
+#### Kind Multiplexing
+
+When a new logical subscription arrives, the manager checks whether an existing relay REQ covers the same filter shape — same relay set, same tag anchors (e.g. `#p`), same time constraints — differing only in `kinds`. If one exists, the new kinds are merged into it rather than opening a separate relay REQ.
+
+Incoming events are dispatched by kind: when a relay delivers an event, the manager checks each logical subscription's `kinds` filter and calls only the matching callbacks. A logical subscription for kind 5001 receives no callbacks when a kind 5010 event arrives.
+
+**Merge key:** relay set + tag anchors (e.g. `#p` values) + time constraints. The `kinds` array is excluded from the key — it is the dimension being merged.
+
+---
+
+#### Transition Lifecycle
+
+When a new logical subscription joins an existing relay REQ group, the manager opens the updated subscription before closing the old one. This prevents any gap in coverage.
+
+```
+1. LogicalSub A requests [5001]
+   → Manager opens relay REQ for [5001]
+   → onReady(since) fires for A
+
+2. LogicalSub B requests [5010] (same merge key)
+   → Manager opens a NEW relay REQ for [5001, 5010]
+   → Waits for relay acknowledgment (not EOSE — just REQ accepted, not rate-limited)
+   → onReady(since) fires for B
+   → Old [5001] REQ is closed
+
+3. Event kind 5010 arrives
+   → Manager dispatches to B's callback only
+   → A sees nothing
+
+4. LogicalSub B unsubscribes
+   → Manager opens a NEW relay REQ for [5001] (removing 5010 from the union)
+   → Waits for relay acknowledgment
+   → Old [5001, 5010] REQ is closed
+   → A continues uninterrupted
+```
+
+**During overlap:** while both the old and new REQ are briefly active, the same event can arrive from both. Dedup is per logical subscription — each `LogicalSubscription` tracks event IDs it has already dispatched to its own callback. An event delivered by the old REQ and then again by the new REQ is seen once by the callback regardless, because both deliveries check and update the same logical sub's dedup set.
+
+**Relay acknowledgment:** "verified" means the relay accepted the new REQ without a rate-limit rejection or cooldown response. It does not mean an event was received or EOSE was signaled. This ensures the manager never closes a working subscription before confirming the replacement is actually live.
+
+---
+
+#### `onReady` Callback
+
+`onReady(since: number)` fires once per logical subscription when the relay REQ backing it is confirmed active. `since` is `Math.floor(Date.now() / 1000)` at the moment of relay acknowledgment.
+
+Modules use `since` as the `until` ceiling for a history fetch (`fetchKindHistory`) immediately after subscription, ensuring no gap between the end of historical coverage and the start of live delivery.
+
+```typescript
+const handle = subscriptionManager.requestSubscription(
+  [{ kinds: [5010], "#p": [myInboundKey] }],
+  (event) => handleTrigger(event),
+  (since) => {
+    // Subscription is live — fetch history up to this exact timestamp
+    nostrClient.fetchKindHistory(contactId, 5010, { windowEnd: since });
+  },
+);
+```
+
+Without `onReady`, a module that fetches history up to "now" and then subscribes risks a gap between the two if the relay REQ is delayed by a cooldown or rate limit.
+
+---
 
 **Rules:**
-- All subscriptions use `since: Math.floor(Date.now() / 1000)` (T+0). Historical replay is never performed inside `subscribe()`. Any caller-supplied `since` value in the past is silently clamped to now.
-- One `Filter` array per subscription (not multiple filters in one sub)
-- Dedup is per-subscription, reset every 60s (prevents memory leaks)
-- Long-lived subscriptions (signal router) never close; one-shots close at EOSE or timeout
+
+- All relay REQs use `since: Math.floor(Date.now() / 1000)` (T+0). No historical replay. Any caller-supplied `since` in the past is silently clamped to now.
+- Dedup is per logical subscription, reset every 60s to prevent memory leaks. The 60s window is sufficient to cover transition overlap (where two relay REQs are briefly active) since that window is on the order of seconds. Relays re-delivering an event ID after 60s would be a relay anomaly, not a design gap.
+- The new relay REQ is always opened and verified before the old one is closed — no coverage gap.
+- A logical subscription's handle remains valid regardless of how many times the underlying relay REQ is rebuilt.
+- Long-lived subscriptions (signal router) never close autonomously; one-shots close at EOSE or timeout.
 
 ---
 
@@ -287,29 +419,30 @@ The central authority on relay availability. Tracks every relay's rate-limit sta
 ```typescript
 interface RelayState {
   url: string;
-  limitPerMinute: number;   // relay's declared rate limit (updated from relay hints)
-  cooldownUntil: number;    // unix ms; relay is eligible when now >= cooldownUntil
+  limitPerMinute: number; // relay's declared rate limit (updated from relay hints)
+  cooldownUntil: number; // unix ms; relay is eligible when now >= cooldownUntil
   consecutiveFailures: number;
-  lastUsedAt: number;       // unix ms; used for least-recently-used selection
+  lastUsedAt: number; // unix ms; used for least-recently-used selection
 }
 
 export class RelayStateController {
   // Selection — caller provides desired list, controller picks from it
-  selectRelay(desiredRelays: string[]): string | null   // next available (LRU among eligible); null = all in cooldown
-  nextAvailableAt(desiredRelays: string[]): number      // ms until soonest relay in list becomes eligible
+  selectRelay(desiredRelays: string[]): string | null; // next available (LRU among eligible); null = all in cooldown
+  nextAvailableAt(desiredRelays: string[]): number; // ms until soonest relay in list becomes eligible
 
   // State updates — called after each interaction
-  recordUse(relay: string): void                        // consume 1 token, update lastUsedAt + cooldownUntil
-  recordError(relay: string, resetAfterSec?: number): void  // extend cooldown from relay hint or default backoff
-  recordSuccess(relay: string): void                    // reset consecutiveFailures
+  recordUse(relay: string): void; // consume 1 token, update lastUsedAt + cooldownUntil
+  recordError(relay: string, resetAfterSec?: number): void; // extend cooldown from relay hint or default backoff
+  recordSuccess(relay: string): void; // reset consecutiveFailures
 
   // Inspection
-  isEligible(relay: string): boolean                    // now >= cooldownUntil
-  eligibleFrom(desiredRelays: string[]): string[]       // all currently eligible relays in a list
+  isEligible(relay: string): boolean; // now >= cooldownUntil
+  eligibleFrom(desiredRelays: string[]): string[]; // all currently eligible relays in a list
 }
 ```
 
 **Behavior:**
+
 - `cooldownUntil` after each use: `now + (60_000 / limitPerMinute)` ms — one token per minute budget
 - Each interaction (publish send, fetch REQ, fetch event received) calls `recordUse()` on the relay that handled it
 - **Received events during a fetch also consume a token.** Receiving 1 event from a relay sets `cooldownUntil` the same as if that relay had received a publish.
@@ -318,6 +451,7 @@ export class RelayStateController {
 - After 3 consecutive failures across all relays → auto-offline
 
 **Rules:**
+
 - Relay state is global and keyed by URL — two peers sharing a relay share its cooldown budget
 - Callers never select relays directly; they pass a desired list and the controller decides
 - A relay in cooldown is skipped immediately, never waited on by the caller
@@ -338,22 +472,29 @@ export function goOnline(): void {
   nostrOfflineReason = null;
   // Announce presence to all registered peers — relay selection is internal
   for (const contactId of nostrClient.allContactIds()) {
-    nostrClient.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: false });
+    nostrClient.publishSignalDirect(contactId, 5004, {
+      state: "online",
+      isResponse: false,
+    });
   }
 }
 
 export function goOffline(reason?: string): void {
   // Announce offline BEFORE gating
   for (const contactId of nostrClient.allContactIds()) {
-    nostrClient.publishSignalDirect(contactId, 5004, { state: 'offline', isResponse: false });
+    nostrClient.publishSignalDirect(contactId, 5004, {
+      state: "offline",
+      isResponse: false,
+    });
   }
   nostrClient.clearQueue();
   nostrOnline = false;
-  nostrOfflineReason = reason ?? 'manual';
+  nostrOfflineReason = reason ?? "manual";
 }
 ```
 
 **Rules:**
+
 - Check `get(nostrOnline)` before any `publish()` not inside `outboxFlusher`
 - Never send events when `nostrOnline = false` except:
   - Last `status: offline` announcement (broadcast BEFORE setting false)
@@ -371,10 +512,14 @@ export function goOffline(reason?: string): void {
 
 ```typescript
 // Direct publish for time-sensitive signals — contactId only, internals handled by NostrClient
-await nostrController.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: false });
+await nostrClient.publishSignalDirect(contactId, 5004, {
+  state: "online",
+  isResponse: false,
+});
 ```
 
 **Use cases:**
+
 - Status announcements (must go immediately)
 - Response to time-sensitive requests
 - Anything that's irrelevant if delayed >1s
@@ -385,7 +530,7 @@ await nostrController.publishSignalDirect(contactId, 5004, { state: 'online', is
 
 ```typescript
 // Queued publish — relay selection handled internally
-nostrController.publishSignal(contactId, 5010, {
+nostrClient.publishSignal(contactId, 5010, {
   actionId,
   footageRefId,
   detectedAt,
@@ -393,22 +538,25 @@ nostrController.publishSignal(contactId, 5010, {
 ```
 
 **Use cases:**
+
 - Trigger notifications
 - Arm/disarm announcements
 - Any non-urgent event
 
 ---
 
-### Pattern 2.5: Publish Relay Selection
+### Pattern 3: Publish Relay Selection
 
 Every publish targets **one relay** — the next available relay from the peer's desired list, selected by `RelayStateController.selectRelay()`. There is no broadcast or fanout on publish.
 
 **Why single-relay publish:**
+
 - The receiver subscribes T+0 on all their inbound relays. The event landing on any one of them is sufficient for delivery.
 - For history, `fetchKindHistory` fan-fetches from all relays — it finds the event regardless of which one the sender used.
 - Broadcasting to N relays multiplies rate-limit cost by N with no functional benefit.
 
 **Selection logic inside `publish()`:**
+
 1. Call `relayController.selectRelay(peer.relays)` — returns the eligible relay with the lowest `lastUsedAt` (LRU among relays not currently in cooldown)
 2. Send to that relay; call `relayController.recordUse(relay)` on attempt
 3. On success: `relayController.recordSuccess(relay)`
@@ -419,29 +567,33 @@ Every publish targets **one relay** — the next available relay from the peer's
 If peer A and peer B both list `wss://relay-x.com`, a publish to peer A that consumes a token on relay-x means relay-x's `cooldownUntil` is set. When selecting a relay for peer B's next publish, `selectRelay(peerB.relays)` sees relay-x as cooled and picks a different relay from peer B's list (if available). The controller has no concept of peer identity — only relay URL state.
 
 **Recovery:**
+
 - One relay in cooldown → `selectRelay()` picks another from the list
 - All relays in cooldown → publish re-enqueued; fired when `nextAvailableAt()` elapses
 - Relay hard-failure → `consecutiveFailures` increments; after threshold, relay excluded from selection until reset
 
 **Invariants:**
+
 - One relay per publish, always — chosen by the controller, never by the caller
 - Cooldown is per relay URL, global across all peers and all operation types (publish, fetch, subscribe REQ)
 - A cooled relay is never waited on inline — the publish is re-queued with an explicit delay
 
 ---
 
-### Pattern 3: T+0 Subscriptions and Progressive History Fetch
+### Pattern 4: T+0 Subscriptions and Progressive History Fetch
 
 Subscriptions open at T+0 — `since: Math.floor(Date.now() / 1000)` — and never replay historical events. When a module needs to look back in time, it calls `fetchKindHistory()` explicitly with a specific goal, iterates until it finds what it needs, then stops.
 
 This is the **only** model for consuming Nostr events in Senstry. No module implements its own fetch loop or time-window strategy. All of that logic lives in `NostrController`.
 
 **Why T+0 only subscriptions:**
+
 - A subscription's job is to deliver future events in real time. Historical replay is a separate concern with different semantics and cost.
 - Fetching history on every subscription burns relay rate limits and causes unpredictable startup latency under rapid reconnects.
 - Modules that need history call `fetchKindHistory()` intentionally with a defined goal and stop when they find it.
 
 **Why per-kind history fetching:**
+
 - Relays cannot filter by encrypted content. Without per-kind allocation, fetching "status events" for a peer means receiving all kind 5001 events and filtering client-side — wasting rate-limit tokens on irrelevant events.
 - With dedicated kinds (5001–5011), a fetch for kind 5004 returns only status events; a fetch for kind 5010 returns only trigger notifications. One request returns exactly what was sought.
 
@@ -517,7 +669,7 @@ At 30 events/minute: receiving 1 event → 2 second delay. Receiving 5 events �
 
 ```typescript
 // Caller knows the contactId only — relay list and channel key are internal
-for await (const event of nostrController.fetchKindHistory(contactId, 5005)) {
+for await (const event of nostrClient.fetchKindHistory(contactId, 5005)) {
   const msg = event.decryptedPayload as RelayMigrationPayload;
   if (!msg.isResponse) {
     applyPendingRelayMigration(msg);
@@ -531,9 +683,9 @@ for await (const event of nostrController.fetchKindHistory(contactId, 5005)) {
 ```typescript
 const lastOnlineSec = getLastOnlineTimestamp();
 
-for await (const event of nostrController.fetchKindHistory(contactId, 5004,
-  { windowStart: lastOnlineSec }
-)) {
+for await (const event of nostrClient.fetchKindHistory(contactId, 5004, {
+  windowStart: lastOnlineSec,
+})) {
   const msg = event.decryptedPayload as StatusPayload;
   if (!msg.isResponse) {
     setLastKnownStatus(contactId, msg.state, event.created_at);
@@ -545,9 +697,9 @@ for await (const event of nostrController.fetchKindHistory(contactId, 5004,
 **Example 3: Scan a range until a session is found**
 
 ```typescript
-for await (const event of nostrController.fetchKindHistory(contactId, 5001,
-  { windowStart: now() - 2 * 86400 }
-)) {
+for await (const event of nostrClient.fetchKindHistory(contactId, 5001, {
+  windowStart: now() - 2 * 86400,
+})) {
   const msg = event.decryptedPayload as RtcSessionPayload;
   if (msg.sessionId === activeSessionId) {
     restoreSession(msg);
@@ -560,12 +712,12 @@ for await (const event of nostrController.fetchKindHistory(contactId, 5001,
 
 #### Per-Kind Fetch Strategies
 
-| Kind | When to call fetchKindHistory | Goal | Stop condition |
-|------|------------------------------|------|----------------|
-| 5001 (RTC Session) | Reconnecting mid-session | Find active session offer | Found matching `sessionId` |
-| 5004 (Status) | Came online after absence | Last known peer state | First announcement (`isResponse=false`) found |
-| 5005 (Relay Migration) | Startup check | Pending relay migration | First unacknowledged proposal found |
-| 5010/5011 (Actions) | Came online after absence | All missed actions | `windowStart` reached (full range) |
+| Kind                   | When to call fetchKindHistory | Goal                      | Stop condition                                |
+| ---------------------- | ----------------------------- | ------------------------- | --------------------------------------------- |
+| 5001 (RTC Session)     | Reconnecting mid-session      | Find active session offer | Found matching `sessionId`                    |
+| 5004 (Status)          | Came online after absence     | Last known peer state     | First announcement (`isResponse=false`) found |
+| 5005 (Relay Migration) | Startup check                 | Pending relay migration   | First unacknowledged proposal found           |
+| 5010/5011 (Actions)    | Came online after absence     | All missed actions        | `windowStart` reached (full range)            |
 
 Modules that need "the most recent X" break on first match. Modules that need "all events in a range" iterate the full generator to `windowStart`. In both cases the fan-fetch behavior is invisible to the caller — events arrive one at a time, deduplicated.
 
@@ -573,7 +725,7 @@ Modules that need "the most recent X" break on first match. Modules that need "a
 
 #### Key Invariants
 
-- **Subscriptions are T+0 only** — `subscribe()` never replays history. `since: now` is always enforced.
+- **Subscriptions are T+0 only** — `requestSubscription()` never replays history. `since: now` is always enforced.
 - **One request per `next()` call** — `fetchKindHistory()` issues exactly one relay request per generator step. No parallel in-flight requests per kind.
 - **Received events consume rate-limit tokens** — Each received event delays the next request by `1 / ratePerMinute` minutes. Rate limits are shared between publishing and history fetching.
 - **Caller controls continuation** — `break` stops the generator immediately; no further requests are issued.
@@ -583,13 +735,13 @@ Modules that need "the most recent X" break on first match. Modules that need "a
 
 ---
 
-### Pattern 4: Signal Router (Long-Lived Subscription)
+### Pattern 5: Signal Router (Long-Lived Subscription)
 
 The signal router is managed entirely inside `NostrClient`. Modules start it with a callback and receive decoded, decrypted signals — no relay or channel key management required.
 
 ```typescript
 // Start the signal router — all relay subscriptions managed internally
-nostrController.startSignalRouter((contactId, kind, payload) => {
+nostrClient.startSignalRouter((contactId, kind, payload) => {
   // contactId: UUID identifying which contact sent this (paired or temp)
   // kind: 5001–5005 (connection/presence) or 5010–5011 (action notifications)
   // payload: already decrypted and parsed
@@ -597,23 +749,26 @@ nostrController.startSignalRouter((contactId, kind, payload) => {
 });
 
 // Stop on app shutdown
-onDestroy(() => nostrController.stopSignalRouter());
+onDestroy(() => nostrClient.stopSignalRouter());
 ```
 
 **What the router does internally:**
+
 - Subscribes T+0 on all relays in `ContactManager.allMyInboundRelays()` — covers both paired and temp contacts
 - Filters for all registered peers' inbound channel keys
 - Deduplicates by event ID
 - Decrypts and delivers to `onSignal` callback
-- When a peer is registered or updated (`updatePeerRelays`), the router re-subscribes automatically
+- When a peer is registered or updated (`updatePairedRelays`), the router re-subscribes using the transition lifecycle: a new REQ is opened and relay-verified before the old one closes, ensuring no coverage gap
+- The router's internal `requestSubscription` call does not use `onReady` — it is a long-lived subscription with no history alignment needed
 
 **Rules:**
+
 - Modules never manage subscriptions, relay lists, or channel keys
 - History catch-up happens via `fetchKindHistory()` — the router handles only T+0
 
 ---
 
-### Pattern 5: Full-Range History Fetch (e.g., catch up on missed actions)
+### Pattern 6: Full-Range History Fetch (e.g., catch up on missed actions)
 
 For collecting all events in a window rather than stopping at the first match, iterate the full generator without breaking. The contact's relay list and channel key are resolved internally — the caller only passes `contactId` and `kind`.
 
@@ -622,9 +777,9 @@ For collecting all events in a window rather than stopping at the first match, i
 const missedActions: NostrEvent[] = [];
 const lastOnlineSec = getLastOnlineTimestamp();
 
-for await (const event of nostrController.fetchKindHistory(monitorContactId, 5010,
-  { windowStart: lastOnlineSec }
-)) {
+for await (const event of nostrClient.fetchKindHistory(monitorContactId, 5010, {
+  windowStart: lastOnlineSec,
+})) {
   missedActions.push(event);
   // No break — collect everything in the window
 }
@@ -636,6 +791,7 @@ for (const event of missedActions.reverse()) {
 ```
 
 **Rules:**
+
 - Generator stops automatically when `windowStart` is reached or all relays return empty
 - Rate-limit cost and relay pacing are automatic via `RelayStateController`
 - Events arrive newest-first; reverse if chronological processing is needed
@@ -664,11 +820,12 @@ class TriggerPublisher {
   }
 
   private resolveTargets(config: ActionSignalConfig): string[] {
-    const paired = this.contactManager.allContactIds()
-      .filter(id => !this.contactManager.get(id).expiresAt);
+    const paired = this.contactManager
+      .allContactIds()
+      .filter((id) => !this.contactManager.get(id).expiresAt);
 
-    if (config.recipients === 'specific') {
-      return paired.filter(id => config.contactIds.includes(id));
+    if (config.recipients === "specific") {
+      return paired.filter((id) => config.contactIds.includes(id));
     }
     return paired; // 'all'
   }
@@ -681,10 +838,13 @@ class TriggerPublisher {
 
 ```typescript
 // Status announcement — time-sensitive, direct
-await nostrController.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: false });
+await nostrClient.publishSignalDirect(contactId, 5004, {
+  state: "online",
+  isResponse: false,
+});
 
 // Trigger notification — queued, rate-safe
-nostrController.publishSignal(contactId, 5010, { actionId, detectedAt });
+nostrClient.publishSignal(contactId, 5010, { actionId, detectedAt });
 ```
 
 ---
@@ -693,13 +853,20 @@ nostrController.publishSignal(contactId, 5010, { actionId, detectedAt });
 
 ```typescript
 // Viewer initiates — kind 5001, offer-request
-await nostrController.publishSignalDirect(monitorId, 5001, { mode: 'data', sessionId, isResponse: false });
+await nostrClient.publishSignalDirect(monitorId, 5001, {
+  mode: "data",
+  sessionId,
+  isResponse: false,
+});
 
 // Monitor responds via signal router callback — kind 5001 isResponse=true (SDP offer)
 // arrives in onSignal(monitorId, 5001, { sdp, sessionId, isResponse: true })
 
 // Viewer answers — kind 5002
-await nostrController.publishSignalDirect(monitorId, 5002, { sdp: answerSdp, isResponse: false });
+await nostrClient.publishSignalDirect(monitorId, 5002, {
+  sdp: answerSdp,
+  isResponse: false,
+});
 ```
 
 ---
@@ -709,37 +876,34 @@ await nostrController.publishSignalDirect(monitorId, 5002, { sdp: answerSdp, isR
 ### Unit Test: PublishQueue
 
 ```typescript
-import { describe, it, expect, vi } from 'vitest';
-import { PublishQueue } from '$lib/nostr/client';
+import { describe, it, expect, vi } from "vitest";
+import { PublishQueue } from "$lib/nostr/client";
 
-describe('PublishQueue', () => {
-  it('respects rate limits', async () => {
-    const queue = new PublishQueue(relayUrls, rateLimitMsPerEvent);
+describe("PublishQueue", () => {
+  it("respects rate limits", async () => {
     const published: string[] = [];
-    
-    queue.on('published', (event) => published.push(event.id));
-    
-    // Queue 10 events
-    for (let i = 0; i < 10; i++) {
-      queue.add({ ...mockEvent, content: `msg-${i}` });
-    }
-    
-    // Flush should space them out
+
+    publishQueued({ ...mockEvent, content: "msg-0" }, "test", {
+      onPublished: () => published.push("msg-0"),
+    });
+    publishQueued({ ...mockEvent, content: "msg-1" }, "test", {
+      onPublished: () => published.push("msg-1"),
+    });
+
     const startTime = Date.now();
-    await queue.flush();
+    await flushQueue();
     const elapsed = Date.now() - startTime;
-    
-    expect(published).toHaveLength(10);
-    expect(elapsed).toBeGreaterThan(rateLimitMsPerEvent * 9);
+
+    expect(published).toHaveLength(2);
+    expect(elapsed).toBeGreaterThan(rateLimitMsPerEvent);
   });
 
-  it('clears queue on goOffline', () => {
-    const queue = new PublishQueue(relayUrls);
-    queue.add(mockEvent);
-    queue.add(mockEvent);
-    
-    queue.clear();
-    expect(queue.pending).toHaveLength(0);
+  it("clears queue when going offline", () => {
+    publishQueued(mockEvent, "test");
+    publishQueued(mockEvent, "test");
+
+    goOffline("test");
+    expect(queueDepth()).toBe(0);
   });
 });
 ```
@@ -749,23 +913,29 @@ describe('PublishQueue', () => {
 ### Unit Test: SubscriptionManager
 
 ```typescript
-describe('SubscriptionManager', () => {
-  it('dedupes by event ID', () => {
+describe("SubscriptionManager", () => {
+  it("dedupes by event ID", () => {
     const received: string[] = [];
-    const sub = mgr.subscribe([{ kinds: [5001] }]);
-    sub.on('event', (e) => received.push(e.id));
-    
+    const handle = mgr.requestSubscription(
+      [{ kinds: [5001] }],
+      (event) => received.push(event.id),
+      (_since) => {},
+    );
+
     // Emit same event twice
-    sub._handleEvent(mockEvent);
-    sub._handleEvent(mockEvent);  // same ID
-    
+    mgr._simulateEvent(mockEvent);
+    mgr._simulateEvent(mockEvent); // same ID
+
     expect(received).toHaveLength(1);
   });
 
-  it('closes subscription after no activity', async () => {
-    const sub = mgr.subscribe([{ kinds: [999] }]);
-    // auto-cleanup fires after 30s idle; simulate by calling unsubscribe
-    mgr.unsubscribe(sub);
+  it("removes subscription on unsubscribe", () => {
+    const handle = mgr.requestSubscription(
+      [{ kinds: [999] }],
+      (_event) => {},
+      (_since) => {},
+    );
+    handle.unsubscribe();
     expect(mgr.active).toHaveLength(0);
   });
 });
@@ -776,24 +946,26 @@ describe('SubscriptionManager', () => {
 ### Integration Test: Publish + Subscribe
 
 ```typescript
-describe('NostrClient (integration)', () => {
-  it('publishes event and subscriber receives it', async () => {
+describe("NostrClient (integration)", () => {
+  it("publishes event and subscriber receives it", async () => {
     const client = new NostrClient(privkey, pubkey, vi.fn());
-    
+
     const received: string[] = [];
     client.startSignalRouter((contactId, kind, payload) => {
       received.push(JSON.stringify(payload));
     });
-    
-    const event = buildTestEvent({ kind: 5004, content: 'hello' });
-    await client.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: false });
-    
+
+    const event = buildTestEvent({ kind: 5004, content: "hello" });
+    await client.publishSignalDirect(contactId, 5004, {
+      state: "online",
+      isResponse: false,
+    });
+
     await waitFor(() => received.length > 0);
-    expect(received[0]).toContain('online');
+    expect(received[0]).toContain("online");
   });
 });
 ```
-
 
 ---
 
@@ -808,6 +980,6 @@ describe('NostrClient (integration)', () => {
 - **History via `fetchKindHistory(contactId, kind)`** — relay and channel key resolved internally; caller passes contactId and kind only
 - **Single-relay writes, fan-fetch reads** — publish goes to one relay (LRU-eligible from peer's list via `RelayStateController`); `fetchKindHistory` fan-fetches `limit:1` from all non-cooldown relays per round, deduplicates, yields one at a time
 - **Cooldown is global per relay URL** — `RelayStateController` is shared across all peers and all operation types; one peer's rate-limit hit affects relay availability for all other peers on that relay
-- **Signal kinds are never multiplexed** — each signal type has its own kind (5001–5005 for connection/presence, 5010–5011 for action notifications); route on kind number, not decrypted payload. The signal router subscribes to all of these.
+- **Signal routing is by kind** — each signal type has its own kind (5001–5005 for connection/presence, 5010–5011 for action notifications); callbacks are dispatched by kind number, never by decrypted payload content. At the relay layer, the `SubscriptionManager` may group multiple kinds into one REQ for efficiency — this is invisible to callers.
 - **`isResponse` replaces request/response type pairs** — `false` = initiating party, `true` = responding party
 - **All queue operations are non-blocking** — `publishSignal` returns immediately; events flow out on timer with cooldown-aware relay selection

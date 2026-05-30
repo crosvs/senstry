@@ -118,7 +118,7 @@ Defines event format, signing, relay protocol, and canonical JSON serialization.
 ### NIP-33: Parameterized Replaceable Events
 Events with kind ≥ 30000 are replaceable. Relay deduplicates by `(pubkey, kind, d-tag)`.
 - **Status:** Stable
-- **Used by:** Not currently used in Senstry. Footage metadata is exchanged over RTC data channels, not Nostr.
+- **Used by:** Not used in Senstry. Footage metadata is exchanged over RTC data channels, not Nostr.
 
 ### NIP-44: Encrypted Payloads (ChaCha20-Poly1305)
 Standard encryption for Nostr content.
@@ -170,11 +170,11 @@ Relay visibility: Channel pubkeys only — real identities are not visible
 
 ### Model 2: Gift-Wrap – Non-Paired Communication Only
 
-Previously used for WebRTC signaling (kind 5001).
+Not used for WebRTC signaling. The design was evaluated and rejected in favor of ECDH channel keys.
 
-**Why it was proposed:** Relay cannot see sender/recipient (ephemeral outer key). Offered sender deniability: "Anyone could have published this signal."
+**The appeal:** Relay cannot see sender/recipient (ephemeral outer key). Offered sender deniability.
 
-**Why it was removed:** Two critical flaws: (1) Expensive to query—relay cannot filter by `authors`, forcing full table scans over ~1.6 hour windows, burning rate limits; (2) Randomized timestamps break relay `since` filtering, defeating efficient subscription windows. These costs made it unsuitable for frequent WebRTC handshakes.
+**Why rejected:** Two critical flaws: (1) Expensive to query—relay cannot filter by `authors`, forcing full table scans over ~1.6 hour windows, burning rate limits; (2) Randomized timestamps break relay `since` filtering, defeating efficient subscription windows. These costs made it unsuitable for frequent WebRTC handshakes.
 
 ### Model 3: ECDH-Derived Channel Keys – How Channel Keys Work
 
@@ -424,6 +424,8 @@ if (now - event.created_at > TTL_SECONDS) {
 ```
 
 **Purpose:** Prevent replay of old events and maintain freshness guarantees.
+
+**Scope:** TTL applies to live signal router delivery — events arriving on a T+0 subscription that exceed their TTL are discarded as stale. `fetchKindHistory()` bypasses TTL entirely; it is an intentional request for historical data with a caller-controlled time window (default 2 days). Missed action signals (kinds 5010, 5011) are retrieved this way on reconnect.
 
 ## 11. Event Immutability and Replaceable Events
 

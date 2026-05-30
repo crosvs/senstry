@@ -1,6 +1,5 @@
 # Nostr Communication Architecture
 
-
 ---
 
 ## Overview
@@ -21,6 +20,7 @@ All post-pairing Nostr events — without exception — are signed with a contac
 **TOTP** is a separate security layer for credential validation (not a pairing method). It can be used to securely over Nostr deliver an instruction with a payload, such as "Accept this invite QR/URI request", or other contexts requiring credential validation.
 
 TOTP is an **optional credential validation layer** that is **independent of the pairing protocol**. It:
+
 - Generates time-based seeds (20-byte random values)
 - Validates 6-digit codes (RFC 6238, 30-second windows)
 - Supports raw seed matching for programmatic access
@@ -34,17 +34,17 @@ TOTP is an **optional credential validation layer** that is **independent of the
 #### Generating a TOTP Seed
 
 ```typescript
-import { randomBytes } from 'crypto';
-import { base32 } from 'rfc4648';
+import { randomBytes } from "crypto";
+import { base32 } from "rfc4648";
 
 /**
  * Generate a random TOTP seed for a new credential.
- * 
+ *
  * @returns 20-byte seed as base32-encoded string (readable QR code)
  */
 export function generateTOTPSeed(): string {
-  const seed = randomBytes(20);  // 160 bits (base32-encoded = 32 characters)
-  return base32.stringify(seed).replace(/=/g, '').toLowerCase();  // 32-char alphanumeric
+  const seed = randomBytes(20); // 160 bits (base32-encoded = 32 characters)
+  return base32.stringify(seed).replace(/=/g, "").toLowerCase(); // 32-char alphanumeric
 }
 
 // Example output: "jbswy3dpeblw64tmmq4qy27kfq4qye4"
@@ -54,15 +54,15 @@ export function generateTOTPSeed(): string {
 
 ```typescript
 interface TOTPCredential {
-  credentialId: string;         // UUID or internal identifier
-  seed: Uint8Array;             // Raw 20-byte seed (NOT base32)
-  createdAt: number;            // unix timestamp
-  lastUsedAt?: number;          // track usage
-  label?: string;               // "Pairing Code", "Login", etc.
-  expiresAt?: number;           // optional expiration (null = no expiry)
-  maxAttempts?: number;         // rate limit: max failed attempts
-  failedAttempts: number;       // counter for current lockout window
-  lockedUntil?: number;         // unix ms; clear when now > lockedUntil
+  credentialId: string; // UUID or internal identifier
+  seed: Uint8Array; // Raw 20-byte seed (NOT base32)
+  createdAt: number; // unix timestamp
+  lastUsedAt?: number; // track usage
+  label?: string; // "Pairing Code", "Login", etc.
+  expiresAt?: number; // optional expiration (null = no expiry)
+  maxAttempts?: number; // rate limit: max failed attempts
+  failedAttempts: number; // counter for current lockout window
+  lockedUntil?: number; // unix ms; clear when now > lockedUntil
 }
 
 // IDB schema: "totp" store (keyPath: 'credentialId')
@@ -74,13 +74,13 @@ async function storeTOTPSeed(seed: Uint8Array, label: string): Promise<string> {
     createdAt: Date.now(),
     label,
     maxAttempts: 5,
-    failedAttempts: 0
+    failedAttempts: 0,
   };
-  
+
   // Store in IDB
   const db = await openDB();
-  await db.put('totp', credential);
-  
+  await db.put("totp", credential);
+
   return credentialId;
 }
 ```
@@ -90,12 +90,12 @@ async function storeTOTPSeed(seed: Uint8Array, label: string): Promise<string> {
 #### Verifying a 6-Digit Code
 
 ```typescript
-import { totp } from 'speakeasy';  // or equivalent RFC 6238 implementation
+import { totp } from "speakeasy"; // or equivalent RFC 6238 implementation
 
 /**
  * Verify a 6-digit TOTP code against a stored seed.
  * Implements 30-second time windows with ±1 window tolerance.
- * 
+ *
  * @param seed Raw 20-byte seed (Uint8Array)
  * @param code 6-digit code entered by user
  * @param window Time window tolerance (default: ±1, covers 90 seconds total)
@@ -104,28 +104,28 @@ import { totp } from 'speakeasy';  // or equivalent RFC 6238 implementation
 export function verifyTOTPCode(
   seed: Uint8Array,
   code: string,
-  window: number = 1
+  window: number = 1,
 ): boolean {
   // Strip non-digits
-  const cleanCode = code.replace(/\D/g, '');
+  const cleanCode = code.replace(/\D/g, "");
   if (cleanCode.length !== 6) return false;
-  
+
   // RFC 6238: time-step is 30 seconds, UNIX epoch 0
   const now = Math.floor(Date.now() / 1000);
   const timeStep = 30;
   const currentCounter = Math.floor(now / timeStep);
-  
+
   // Check current window and ±N adjacent windows
   for (let offset = -window; offset <= window; offset++) {
     const counter = currentCounter + offset;
     const expectedCode = generateTOTPCodeForCounter(seed, counter);
-    
+
     // Constant-time comparison to prevent timing attacks
     if (constantTimeEqual(cleanCode, expectedCode)) {
       return true;
     }
   }
-  
+
   return false;
 }
 
@@ -134,22 +134,25 @@ export function verifyTOTPCode(
  * Implements RFC 6238 HOTP with SHA-1 digest.
  */
 function generateTOTPCodeForCounter(seed: Uint8Array, counter: number): string {
-  const hmac = createHmac('sha1', seed);
-  
+  const hmac = createHmac("sha1", seed);
+
   // Counter as big-endian 64-bit value
   const buffer = Buffer.alloc(8);
   buffer.writeBigUInt64BE(BigInt(counter));
-  
+
   hmac.update(buffer);
   const digest = hmac.digest();
-  
+
   // Dynamic truncation (RFC 4226)
   const offset = digest[digest.length - 1] & 0x0f;
-  const dyn = (digest[offset] << 24) | (digest[offset + 1] << 16) | 
-              (digest[offset + 2] << 8) | digest[offset + 3];
+  const dyn =
+    (digest[offset] << 24) |
+    (digest[offset + 1] << 16) |
+    (digest[offset + 2] << 8) |
+    digest[offset + 3];
   const code = (dyn & 0x7fffffff) % 1000000;
-  
-  return code.toString().padStart(6, '0');
+
+  return code.toString().padStart(6, "0");
 }
 
 /**
@@ -157,12 +160,12 @@ function generateTOTPCodeForCounter(seed: Uint8Array, counter: number): string {
  */
 function constantTimeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  
+
   let result = 0;
   for (let i = 0; i < a.length; i++) {
     result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
-  
+
   return result === 0;
 }
 ```
@@ -175,32 +178,32 @@ When a device needs to validate a seed directly (e.g., bearer token, API credent
 /**
  * Verify a raw seed value matches a stored seed.
  * Used for programmatic credential exchange (not TOTP codes).
- * 
+ *
  * @param storedSeed Stored seed (Uint8Array, raw 20 bytes)
  * @param submittedSeed Seed as base32-encoded string (32 alphanumeric characters, no padding)
  * @returns true if seeds match
  */
 export function verifyRawSeed(
   storedSeed: Uint8Array,
-  submittedSeed: string  // Must be base32-encoded 32-character string
+  submittedSeed: string, // Must be base32-encoded 32-character string
 ): boolean {
   let submitted: Uint8Array;
-  
-  if (typeof submittedSeed === 'string') {
+
+  if (typeof submittedSeed === "string") {
     // Decode base32 to bytes
-    submitted = base32.parse(submittedSeed.toUpperCase().padEnd(40, '='));
+    submitted = base32.parse(submittedSeed.toUpperCase().padEnd(40, "="));
   } else {
     submitted = submittedSeed;
   }
-  
+
   // Constant-time comparison
   if (storedSeed.length !== submitted.length) return false;
-  
+
   let result = 0;
   for (let i = 0; i < storedSeed.length; i++) {
     result |= storedSeed[i] ^ submitted[i];
   }
-  
+
   return result === 0;
 }
 ```
@@ -213,29 +216,29 @@ export function verifyRawSeed(
  */
 export async function recordTOTPAttempt(
   credentialId: string,
-  codeValid: boolean
+  codeValid: boolean,
 ): Promise<{ allowed: boolean; lockoutMs?: number }> {
   const db = await openDB();
-  const cred = await db.get('totp', credentialId);
-  
+  const cred = await db.get("totp", credentialId);
+
   if (!cred) {
-    return { allowed: false };  // Credential not found
+    return { allowed: false }; // Credential not found
   }
-  
+
   const now = Date.now();
-  
+
   // Check if currently locked
   if (cred.lockedUntil && now < cred.lockedUntil) {
     const lockoutMs = cred.lockedUntil - now;
     return { allowed: false, lockoutMs };
   }
-  
+
   // Reset failed attempts if lockout window has passed
   if (cred.lockedUntil && now >= cred.lockedUntil) {
     cred.failedAttempts = 0;
     cred.lockedUntil = undefined;
   }
-  
+
   if (codeValid) {
     // Valid code: reset counter, update lastUsedAt
     cred.failedAttempts = 0;
@@ -244,25 +247,25 @@ export async function recordTOTPAttempt(
   } else {
     // Invalid code: increment counter, apply lockout if threshold hit
     cred.failedAttempts++;
-    
+
     if (cred.maxAttempts && cred.failedAttempts >= cred.maxAttempts) {
       // Exponential backoff: 2^failedAttempts * 5 seconds
       const baseMs = 5000;
       const backoffFactor = Math.pow(2, cred.failedAttempts - cred.maxAttempts);
-      cred.lockedUntil = now + (baseMs * backoffFactor);
-      
+      cred.lockedUntil = now + baseMs * backoffFactor;
+
       // Cap at 1 hour
       if (cred.lockedUntil - now > 3600000) {
         cred.lockedUntil = now + 3600000;
       }
     }
   }
-  
-  await db.put('totp', cred);
-  
+
+  await db.put("totp", cred);
+
   return {
     allowed: codeValid && (!cred.lockedUntil || now >= cred.lockedUntil),
-    lockoutMs: cred.lockedUntil ? cred.lockedUntil - now : undefined
+    lockoutMs: cred.lockedUntil ? cred.lockedUntil - now : undefined,
   };
 }
 ```
@@ -272,17 +275,17 @@ export async function recordTOTPAttempt(
 ```typescript
 /**
  * Validate a TOTP credential's freshness.
- * 
+ *
  * @param cred TOTP credential
  * @returns true if credential is still valid (not expired)
  */
 export function isTOTPCredentialValid(cred: TOTPCredential): boolean {
   const now = Date.now();
-  
+
   if (cred.expiresAt && now > cred.expiresAt) {
-    return false;  // Credential has expired
+    return false; // Credential has expired
   }
-  
+
   return true;
 }
 
@@ -292,16 +295,16 @@ export function isTOTPCredentialValid(cred: TOTPCredential): boolean {
  */
 export async function cleanupExpiredTOTPCredentials(): Promise<number> {
   const db = await openDB();
-  const allCredentials = await db.getAll('totp');
-  
+  const allCredentials = await db.getAll("totp");
+
   let deleted = 0;
   for (const cred of allCredentials) {
     if (!isTOTPCredentialValid(cred)) {
-      await db.delete('totp', cred.credentialId);
+      await db.delete("totp", cred.credentialId);
       deleted++;
     }
   }
-  
+
   return deleted;
 }
 ```
@@ -315,6 +318,7 @@ export async function cleanupExpiredTOTPCredentials(): Promise<number> {
 The **QR method** is a manual, one-time pairing mechanism designed for **initial device discovery**. It is **entirely local** until acceptance; Nostr is used only for sending the acceptance acknowledgment and subsequent communication setup. The method is secure, efficient, and requires no prior knowledge between devices.
 
 **Key properties:**
+
 - ✅ No gift-wrap needed (real pubkeys stay offline until acceptance)
 - ✅ Ephemeral invite keys — never reused
 - ✅ Direct ECDH + NIP-44 encryption (single layer)
@@ -323,6 +327,7 @@ The **QR method** is a manual, one-time pairing mechanism designed for **initial
 - ✅ Offline-tolerant (acceptance can be retried)
 
 **Flow diagram:**
+
 ```
 ┌─────────────┐                                           ┌─────────────┐
 │   Monitor   │                                           │   Viewer    │
@@ -372,26 +377,27 @@ The QR encodes a **JSON-serializable payload** that is **public and safe to scan
 
 ```typescript
 interface QRPayload {
-  v: 2;                              // Version (for future upgrades)
-  ik: string;                         // Invite key: ephemeral pubkey (hex, 64 chars)
-  pk: string;                         // Monitor's real pubkey (hex, 64 chars)
-  relays: string[];                   // Monitor's listening relays
-  id: string;                         // Invite ID (UUID, opaque to scanner)
-  ttl: number;                        // Unix timestamp when QR expires (e.g., now + 300)
-  label?: string;                     // Optional: monitor's self-label ("Living Room Camera", "Hallway", etc.)
+  v: 2; // Version (for future upgrades)
+  ik: string; // Invite key: ephemeral pubkey (hex, 64 chars)
+  pk: string; // Monitor's real pubkey (hex, 64 chars)
+  relays: string[]; // Monitor's listening relays
+  id: string; // Invite ID (UUID, opaque to scanner)
+  ttl: number; // Unix timestamp when QR expires (e.g., now + 300)
+  label?: string; // Optional: monitor's self-label ("Living Room Camera", "Hallway", etc.)
 }
 ```
 
 **Encoding:**
+
 ```typescript
 const payload: QRPayload = {
   v: 2,
-  ik: ephemeralPubkey,     // ephemeral invite key's pubkey
-  pk: monitorRealPubkey,   // monitor's identity
-  relays: ['wss://relay1.com', 'wss://relay2.com'],
+  ik: ephemeralPubkey, // ephemeral invite key's pubkey
+  pk: monitorRealPubkey, // monitor's identity
+  relays: ["wss://relay1.com", "wss://relay2.com"],
   id: crypto.randomUUID(),
-  ttl: 300,                // 5 minutes
-  label: 'Living Room Camera'
+  ttl: 300, // 5 minutes
+  label: "Living Room Camera",
 };
 
 // Serialize to a compact URI string
@@ -402,7 +408,7 @@ const uri = `senstry://pair?${new URLSearchParams({
   relays: JSON.stringify(payload.relays),
   id: payload.id,
   ttl: payload.ttl.toString(),
-  ...(payload.label && { label: payload.label })
+  ...(payload.label && { label: payload.label }),
 }).toString()}`;
 
 // Encode into QR code (using qrcode library)
@@ -410,6 +416,7 @@ const qrDataUrl = await QRCode.toDataURL(uri);
 ```
 
 **Why QR and not a link?**
+
 - **QR is offline-safe**: Scanner doesn't need internet until acceptance
 - **Expiration is local**: TTL is part of payload; scanner can validate without calling home
 - **No network state leakage**: Scanning a QR doesn't ping any server
@@ -424,26 +431,26 @@ async function acceptInviteFromQR(
   viewerPrivkey: Uint8Array,
   viewerRealPubkey: string,
   viewerRelays: string[],
-  qrPayload: QRPayload
+  qrPayload: QRPayload,
 ): Promise<{ success: boolean; pairedMonitorPubkey?: string; error?: string }> {
   // ─── Step 1: Validate payload ───────────────────────────────────────────
   const nowSec = Math.floor(Date.now() / 1000);
-  
+
   // Check version
   if (qrPayload.v !== 2) {
-    return { success: false, error: 'Unsupported QR version' };
+    return { success: false, error: "Unsupported QR version" };
   }
-  
+
   // ttl is a unix timestamp of expiry (set by monitor as now + 300)
   if (nowSec > qrPayload.ttl) {
-    return { success: false, error: 'QR code has expired' };
+    return { success: false, error: "QR code has expired" };
   }
-  
+
   // Verify pubkey formats
   if (qrPayload.ik.length !== 64 || qrPayload.pk.length !== 64) {
-    return { success: false, error: 'Invalid pubkey format in QR' };
+    return { success: false, error: "Invalid pubkey format in QR" };
   }
-  
+
   // ─── Step 2: Derive temporary channel key ───────────────────────────────
   // This key is derived from:
   //   - Viewer's privkey (known only to viewer)
@@ -451,57 +458,64 @@ async function acceptInviteFromQR(
   // The monitor independently derives the same key using:
   //   - Ephemeral invite privkey
   //   - Viewer's real pubkey (in the acceptance message)
-  
+
   const tempChannelSecret = getConversationKey(viewerPrivkey, qrPayload.ik);
-  
+
   // Verify it's a 32-byte key
   if (tempChannelSecret.length !== 32) {
-    return { success: false, error: 'Channel key derivation failed' };
+    return { success: false, error: "Channel key derivation failed" };
   }
-  
+
   // ─── Step 3: Create acceptance message ──────────────────────────────────
   // This message contains the viewer's real identity + relays
   // The monitor will use this to derive post-pairing channel keys
-  
+
   const acceptancePayload = {
-    type: 'qr-acceptance',
-    viewerPubkey: viewerRealPubkey,        // viewer's identity
-    viewerRelays: viewerRelays,             // where to send signals to viewer
+    type: "qr-acceptance",
+    viewerPubkey: viewerRealPubkey, // viewer's identity
+    viewerRelays: viewerRelays, // where to send signals to viewer
     timestamp: Math.floor(Date.now() / 1000),
-    inviteId: qrPayload.id                 // echo back the invite ID
+    inviteId: qrPayload.id, // echo back the invite ID
   };
-  
+
   // ─── Step 4: Encrypt acceptance with temporary channel key ──────────────
   // Single-layer NIP-44 encryption (not gift-wrap)
-  
+
   const encryptedContent = nip44Encrypt(
     JSON.stringify(acceptancePayload),
-    tempChannelSecret
+    tempChannelSecret,
   );
-  
+
   // ─── Step 5: Sign with ephemeral key (not real identity) ────────────────
   // This hides viewer's real pubkey on the relay until monitor decrypts
   // Monitor knows to expect an ephemeral signature because it's from the
   // ephemeral invite key's perspective
-  
-  const ephemeralPrivkey = generateSecretKey();  // New ephemeral key per acceptance
-  
-  const acceptanceEvent: NostrEvent = finalizeEvent({
-    kind: KIND_QR_ACCEPTANCE,  // 5100 (custom kind for QR acceptances)
-    created_at: Math.floor(Date.now() / 1000),
-    tags: [
-      ['p', qrPayload.pk],           // tag the monitor's real pubkey
-      ['invite', qrPayload.id],      // tag the invite ID
-      ['v', '2']                     // version tag
-    ],
-    content: encryptedContent
-  }, ephemeralPrivkey);
-  
+
+  const ephemeralPrivkey = generateSecretKey(); // New ephemeral key per acceptance
+
+  const acceptanceEvent: NostrEvent = finalizeEvent(
+    {
+      kind: KIND_QR_ACCEPTANCE, // 5100 (custom kind for QR acceptances)
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["p", qrPayload.pk], // tag the monitor's real pubkey
+        ["invite", qrPayload.id], // tag the invite ID
+        ["v", "2"], // version tag
+      ],
+      content: encryptedContent,
+    },
+    ephemeralPrivkey,
+  );
+
   // ─── Step 6: Publish acceptance to monitor's relays ────────────────────
   // Fanout to all relays listed in QR
-  
-  const publishResults: Array<{ relay: string; success: boolean; error?: string }> = [];
-  
+
+  const publishResults: Array<{
+    relay: string;
+    success: boolean;
+    error?: string;
+  }> = [];
+
   for (const relay of qrPayload.relays) {
     try {
       await publish(acceptanceEvent, { relay, timeout: 5000 });
@@ -510,42 +524,50 @@ async function acceptInviteFromQR(
       publishResults.push({
         relay,
         success: false,
-        error: String(err)
+        error: String(err),
       });
     }
   }
-  
+
   // Check if at least one relay succeeded
-  const anySuccess = publishResults.some(r => r.success);
+  const anySuccess = publishResults.some((r) => r.success);
   if (!anySuccess) {
     return {
       success: false,
-      error: `Failed to publish to all relays: ${publishResults.map(r => r.error).join(', ')}`
+      error: `Failed to publish to all relays: ${publishResults.map((r) => r.error).join(", ")}`,
     };
   }
-  
+
   // ─── Step 7: Store paired device locally ────────────────────────────────
   // Derive post-pairing channel keys so we can communicate
-  
+
   const sharedSecret = getConversationKey(viewerPrivkey, qrPayload.pk);
-  const inboundChannelKey = deriveChannelKey(sharedSecret, qrPayload.pk, viewerRealPubkey);
-  const outboundChannelKey = deriveChannelKey(sharedSecret, viewerRealPubkey, qrPayload.pk);
-  
+  const inboundChannelKey = deriveChannelKey(
+    sharedSecret,
+    qrPayload.pk,
+    viewerRealPubkey,
+  );
+  const outboundChannelKey = deriveChannelKey(
+    sharedSecret,
+    viewerRealPubkey,
+    qrPayload.pk,
+  );
+
   await addPairedDevice({
-    pubkey: qrPayload.pk,                    // monitor's real pubkey
+    pubkey: qrPayload.pk, // monitor's real pubkey
     nickname: qrPayload.label || generateNickname(),
-    relays: qrPayload.relays,                // monitor's relays
+    relays: qrPayload.relays, // monitor's relays
     capabilities: [],
     lastSeenAt: null,
     channelKeys: {
-      inbound: inboundChannelKey,            // listen on monitor's channel outbound
-      outbound: outboundChannelKey           // publish on viewer's channel outbound
+      inbound: inboundChannelKey, // listen on monitor's channel outbound
+      outbound: outboundChannelKey, // publish on viewer's channel outbound
     },
-    addedAt: Date.now()
+    addedAt: Date.now(),
   });
-  
-  dbg('info', 'pairing', `QR acceptance sent to ${qrPayload.pk.slice(0, 8)}`);
-  
+
+  dbg("info", "pairing", `QR acceptance sent to ${qrPayload.pk.slice(0, 8)}`);
+
   return { success: true, pairedMonitorPubkey: qrPayload.pk };
 }
 ```
@@ -560,55 +582,52 @@ export async function generateQRAndListenForAcceptance(
   monitorPrivkey: Uint8Array,
   monitorPubkey: string,
   monitorRelays: string[],
-  onAccepted: (viewerPubkey: string, viewerRelays: string[], label: string) => void
+  onAccepted: (
+    viewerPubkey: string,
+    viewerRelays: string[],
+    label: string,
+  ) => void,
 ): Promise<{ qrDataUrl: string; uri: string; cleanup: () => void }> {
   // ─── Step 1: Generate ephemeral invite key ──────────────────────────────
   // This key is ephemeral and never reused
-  
+
   const ephemeralInvitePrivkey = generateSecretKey();
   const ephemeralInvitePubkey = getPublicKey(ephemeralInvitePrivkey);
-  
+
   // ─── Step 2: Create QR payload ──────────────────────────────────────────
-  
+
   const qrPayload: QRPayload = {
     v: 2,
     ik: ephemeralInvitePubkey,
     pk: monitorPubkey,
     relays: monitorRelays,
     id: crypto.randomUUID(),
-    ttl: Math.floor(Date.now() / 1000) + 300,  // 5 minutes
-    label: 'Monitor Device'
+    ttl: Math.floor(Date.now() / 1000) + 300, // 5 minutes
+    label: "Monitor Device",
   };
-  
+
   // ─── Step 3: Encode and display QR ─────────────────────────────────────
-  
+
   const uri = encodeInviteUri(qrPayload);
   const qrDataUrl = await generateQRDataUrl(uri);
-  
+
   // ─── Step 4: Start listening for acceptances ────────────────────────────
   // Listen on all monitor relays for KIND_QR_ACCEPTANCE (5100) events
   // that we can decrypt with ephemeralInvitePrivkey
-  
+
   const acceptanceHandlers = new Map<string, NostrEvent>();
-  
-  const cleanup = subscribeToRelays(
-    {
-      relayUrls: monitorRelays,
-      filters: [
-        {
-          kinds: [KIND_QR_ACCEPTANCE],
-          since: Math.floor(Date.now() / 1000) - 10,  // ~10s ago (clock skew buffer)
-          limit: 100
-        }
-      ]
-    },
+
+  // Request T+0 subscription for QR acceptance events on monitor's own relays
+  const acceptanceHandle = nostrClient.requestSubscription(
+    [{ kinds: [KIND_QR_ACCEPTANCE] }],
     async (event: NostrEvent) => {
       try {
         // ─ Attempt decryption with ephemeral invite key
-        const decrypted = nip44Decrypt(event.content, 
-          getConversationKey(ephemeralInvitePrivkey, event.pubkey)
+        const decrypted = nip44Decrypt(
+          event.content,
+          getConversationKey(ephemeralInvitePrivkey, event.pubkey),
         );
-        
+
         const acceptance = JSON.parse(decrypted) as {
           type: string;
           viewerPubkey: string;
@@ -616,33 +635,45 @@ export async function generateQRAndListenForAcceptance(
           timestamp: number;
           inviteId: string;
         };
-        
+
         // ─ Validate acceptance format
-        if (acceptance.type !== 'qr-acceptance') return;
-        if (acceptance.inviteId !== qrPayload.id) return;  // Not for this invite
-        
+        if (acceptance.type !== "qr-acceptance") return;
+        if (acceptance.inviteId !== qrPayload.id) return; // Not for this invite
+
         // ─ Skip if we've already processed this acceptance
         if (acceptanceHandlers.has(event.id)) return;
         acceptanceHandlers.set(event.id, event);
-        
+
         // ─ Validate timestamp (acceptance is fresh, within 1 minute)
-        const acceptanceAgeS = Math.floor(Date.now() / 1000) - acceptance.timestamp;
+        const acceptanceAgeS =
+          Math.floor(Date.now() / 1000) - acceptance.timestamp;
         if (acceptanceAgeS > 60) {
-          dbg('warn', 'pairing', `QR acceptance too old: ${acceptanceAgeS}s`);
+          dbg("warn", "pairing", `QR acceptance too old: ${acceptanceAgeS}s`);
           return;
         }
-        
+
         // ─ Validate viewer pubkey format
         if (acceptance.viewerPubkey.length !== 64) {
-          dbg('warn', 'pairing', 'Invalid viewer pubkey in QR acceptance');
+          dbg("warn", "pairing", "Invalid viewer pubkey in QR acceptance");
           return;
         }
-        
+
         // ─ Store paired device and derive post-pairing channel keys
-        const sharedSecret = getConversationKey(monitorPrivkey, acceptance.viewerPubkey);
-        const inboundChannelKey = deriveChannelKey(sharedSecret, acceptance.viewerPubkey, monitorPubkey);
-        const outboundChannelKey = deriveChannelKey(sharedSecret, monitorPubkey, acceptance.viewerPubkey);
-        
+        const sharedSecret = getConversationKey(
+          monitorPrivkey,
+          acceptance.viewerPubkey,
+        );
+        const inboundChannelKey = deriveChannelKey(
+          sharedSecret,
+          acceptance.viewerPubkey,
+          monitorPubkey,
+        );
+        const outboundChannelKey = deriveChannelKey(
+          sharedSecret,
+          monitorPubkey,
+          acceptance.viewerPubkey,
+        );
+
         await addPairedDevice({
           pubkey: acceptance.viewerPubkey,
           nickname: generateNickname(),
@@ -651,24 +682,28 @@ export async function generateQRAndListenForAcceptance(
           lastSeenAt: null,
           channelKeys: {
             inbound: inboundChannelKey,
-            outbound: outboundChannelKey
+            outbound: outboundChannelKey,
           },
-          addedAt: Date.now()
+          addedAt: Date.now(),
         });
-        
-        dbg('info', 'pairing', `QR acceptance received from ${acceptance.viewerPubkey.slice(0, 8)}`);
-        
+
+        dbg(
+          "info",
+          "pairing",
+          `QR acceptance received from ${acceptance.viewerPubkey.slice(0, 8)}`,
+        );
+
         // Call the callback (triggers onAccepted handler)
-        onAccepted(acceptance.viewerPubkey, acceptance.viewerRelays, 'Viewer');
-        
+        onAccepted(acceptance.viewerPubkey, acceptance.viewerRelays, "Viewer");
       } catch (err) {
         // Not decryptable — either not for us or corrupt data
         // Silently skip; this is normal
       }
-    }
+    },
+    (_since) => {}, // long-lived until QR is cancelled; no history fetch needed
   );
-  
-  return { qrDataUrl, uri, cleanup };
+
+  return { qrDataUrl, uri, unsubscribe: () => acceptanceHandle.unsubscribe() };
 }
 ```
 
@@ -692,13 +727,29 @@ Both monitor and viewer independently derive **identical channel keys** from the
 
 // Example: Monitor's perspective
 const monitorSharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
-const monitorInbound = deriveChannelKey(monitorSharedSecret, viewerPubkey, monitorPubkey);
-const monitorOutbound = deriveChannelKey(monitorSharedSecret, monitorPubkey, viewerPubkey);
+const monitorInbound = deriveChannelKey(
+  monitorSharedSecret,
+  viewerPubkey,
+  monitorPubkey,
+);
+const monitorOutbound = deriveChannelKey(
+  monitorSharedSecret,
+  monitorPubkey,
+  viewerPubkey,
+);
 
 // Example: Viewer's perspective (identical keys, different perspective)
 const viewerSharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
-const viewerInbound = deriveChannelKey(viewerSharedSecret, monitorPubkey, viewerPubkey);
-const viewerOutbound = deriveChannelKey(viewerSharedSecret, viewerPubkey, monitorPubkey);
+const viewerInbound = deriveChannelKey(
+  viewerSharedSecret,
+  monitorPubkey,
+  viewerPubkey,
+);
+const viewerOutbound = deriveChannelKey(
+  viewerSharedSecret,
+  viewerPubkey,
+  monitorPubkey,
+);
 
 // Assertion (both sides):
 // monitorOutbound === viewerInbound  (monitor sends on this channel)
@@ -706,6 +757,7 @@ const viewerOutbound = deriveChannelKey(viewerSharedSecret, viewerPubkey, monito
 ```
 
 **Why this is safe:**
+
 - The derivation function is **deterministic** — same inputs always produce same output
 - The derivation is **directional** — swapping sender/recipient produces a different key
 - No key exchange is needed — both sides compute from existing identities
@@ -727,7 +779,7 @@ Gift Wrap (kind 1059)
   └── Seal (kind 13)
         pubkey: sender's real pubkey  ← recipient learns sender identity after decryption
         content: NIP-44(sender privkey → recipient pubkey, Rumor)
-        created_at: randomized ±2 days
+        created_at: randomized ±30 minutes
 
         └── Rumor (unsigned kind 5200 or similar)
               pubkey: sender's real pubkey
@@ -753,14 +805,14 @@ When a device receives and decrypts a gift wrap, it creates a temp contact entry
 const rumor = decryptGiftwrap(giftWrapEvent, myPrivkey);
 
 const tempContactId = nostrClient.registerTempContact({
-  pubkey: seal.pubkey,                    // sender's real pubkey (from decrypted seal)
+  pubkey: seal.pubkey, // sender's real pubkey (from decrypted seal)
 
-  inboundChannelKey: generateKeypair(),   // fresh ephemeral key; privkey held in memory
-                                          // pubkey included in our response as return address
+  inboundChannelKey: generateKeypair(), // fresh ephemeral key; privkey held in memory
+  // pubkey included in our response as return address
 
-  outboundChannelKey: rumor.content.replyKey,   // sender's ephemeral key from rumor
-                                                 // null if sender didn't include one
-  inboundRelayList: [myRelay],            // where WE listen for their response
+  outboundChannelKey: rumor.content.replyKey, // sender's ephemeral key from rumor
+  // null if sender didn't include one
+  inboundRelayList: [myRelay], // where WE listen for their response
   outboundRelayList: rumor.content.replyRelays, // where WE send our response
 
   addedAt: Date.now(),
@@ -769,10 +821,10 @@ const tempContactId = nostrClient.registerTempContact({
 
 // Now respond using the same API as a paired device:
 await nostrClient.sendGiftWrap(tempContactId, {
-  type: 'totp-response',
-  replyKey: tempContact.inboundChannelKey.pubkey,  // included automatically by sendGiftWrap
-  replyRelays: tempContact.inboundRelayList,        // included automatically
-  result: 'accepted',
+  type: "totp-response",
+  replyKey: tempContact.inboundChannelKey.pubkey, // included automatically by sendGiftWrap
+  replyRelays: tempContact.inboundRelayList, // included automatically
+  result: "accepted",
   // ...
 });
 ```
@@ -802,10 +854,12 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
 ### Architectural Clarity: TOTP is NOT a Pairing Method
 
 **Critical distinction:**
+
 - **Pairing protocol** = ephemeral key generation → temporary channel derivation → acceptance message → post-pairing channel keys (deriveChannelKey)
 - **TOTP** = credential validation layer that can optionally secure the pairing delivery
 
 **TOTP's role:**
+
 - Does NOT define how devices exchange identity (that's ECDH)
 - Does NOT define the acceptance flow (that's the invite protocol)
 - Does NOT replace ephemeral keys or channel key derivation
@@ -813,13 +867,13 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
 
 **Why they are separate:**
 
-| Aspect | Pairing Protocol | TOTP Layer |
-|--------|------------------|-----------|
-| Scope | Identity exchange, key derivation | Credential validation only |
-| Reusable | No, specific to Senstry pairing | Yes, can be used for login, re-auth, API access, etc. |
-| Required | Yes (core pairing mechanism) | No (optional security enhancement) |
-| Backward compatible | Must preserve invite format | Doesn't affect pairing protocol |
-| Delivery | QR code or Nostr (independent of pairing) | Works with any delivery mechanism |
+| Aspect              | Pairing Protocol                          | TOTP Layer                                            |
+| ------------------- | ----------------------------------------- | ----------------------------------------------------- |
+| Scope               | Identity exchange, key derivation         | Credential validation only                            |
+| Reusable            | No, specific to Senstry pairing           | Yes, can be used for login, re-auth, API access, etc. |
+| Required            | Yes (core pairing mechanism)              | No (optional security enhancement)                    |
+| Backward compatible | Must preserve invite format               | Doesn't affect pairing protocol                       |
+| Delivery            | QR code or Nostr (independent of pairing) | Works with any delivery mechanism                     |
 
 **Example:** A login flow uses the same TOTP infrastructure (generate seed, validate code, rate limit attempts) without touching the pairing protocol at all. Conversely, QR-based pairing does not require TOTP; viewers can accept invites without credentials.
 
@@ -828,6 +882,7 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
 ## TOTP Integration with Pairing Methods
 
 ### QR-Based Pairing
+
 - **TOTP is optional**
 - **Rationale:** QR codes are ephemeral (5-minute TTL) and inherently local (air-gapped until acceptance). The 5-minute window is sufficient security for pairing. TOTP adds a second authentication factor if the monitor operator wants extra security (e.g., for high-security deployments), but is not required for basic pairing.
 - **Flow variant with TOTP:**
@@ -838,6 +893,7 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
   5. Monitor receives acceptance: if TOTP was embedded in QR, validates code before storing pairing
 
 ### Nostr-Based Pairing
+
 - **TOTP is required**
 - **Rationale:** Nostr-delivered invites travel on public relays. TOTP validates that the acceptance came from someone who knows the shared secret (the viewer who is authorized to pair), not from relay surveillance.
 - **Flow:**
@@ -849,6 +905,7 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
   6. Monitor validates TOTP before storing pairing
 
 ### Programmatic Pairing (API / Headless Access)
+
 - **TOTP is required as bearer token**
 - **Rationale:** API calls are stateless; no session context to verify the caller's intent. TOTP seed acts as a shared secret for credential exchange.
 - **Flow:**
@@ -870,17 +927,18 @@ The acceptance payload (encrypted and published by viewer) contains all informat
 
 ```typescript
 interface QRAcceptancePayload {
-  type: 'qr-acceptance';
-  viewerPubkey: string;          // viewer's real pubkey (hex, 64 chars)
-  viewerRelays: string[];        // where monitor should send signals to viewer
-  timestamp: number;             // unix seconds (creation time)
-  inviteId: string;              // echoed from QR payload; secondary correlation check
+  type: "qr-acceptance";
+  viewerPubkey: string; // viewer's real pubkey (hex, 64 chars)
+  viewerRelays: string[]; // where monitor should send signals to viewer
+  timestamp: number; // unix seconds (creation time)
+  inviteId: string; // echoed from QR payload; secondary correlation check
 }
 ```
 
 **Correlation:** Successful decryption with the `ephemeral_invite_privkey` already identifies which QR the acceptance belongs to — each active QR has a distinct ephemeral key and only that key can decrypt. The `inviteId` field provides an additional explicit check (`acceptance.inviteId !== qrPayload.id → reject`) so the monitor never accidentally processes an acceptance from a different concurrent invite.
 
 **Encryption and signing:**
+
 ```
 ┌─────────────────────────────────────────────┐
 │ QR Acceptance Event (Kind 5100)             │
@@ -909,30 +967,36 @@ interface QRAcceptancePayload {
 ### Recovery & Error Scenarios
 
 **Scenario 1: Acceptance event lost to relay**
+
 - Viewer published acceptance to all relays in QR
 - If some/all relays lose the event, monitor never receives it
 - **Recovery:** Viewer can rescan QR and retry. Since inviteId is echoed, retries are safe (idempotent).
 - **Timeout:** Monitor's listening window is typically 5 minutes (QR TTL). After that, it stops listening for that invite.
 
 **Scenario 2: Network lag (late acceptance)**
+
 - Viewer publishes acceptance but it reaches relay after QR TTL expires
 - Monitor already stopped listening
 - **Recovery:** Viewer should rescan QR or ask monitor to generate a fresh invite. TTL validation on viewer side prevents accepting stale QRs.
 
 **Scenario 3: Duplicated acceptance event**
+
 - Relay redelivers the same acceptance event (replay)
 - Monitor receives it twice (same event ID)
 - **Recovery:** Monitor deduplicates by event ID: `if (acceptanceHandlers.has(event.id)) return;`
 
 **Scenario 4: Acceptance signed with wrong key**
+
 - Event signature doesn't match the pubkey
 - **Recovery:** Nostr clients validate signatures automatically. Invalid events are rejected before reaching decryption logic.
 
 **Scenario 5: Viewer loses QR before acceptance**
+
 - Viewer scanned QR but app crashed before publishing acceptance
 - **Recovery:** Viewer needs to rescan (or ask monitor to regenerate). There's no state to recover; just redo the scan and accept.
 
 **Scenario 6: Monitor loses invite privkey**
+
 - Monitor generated QR, then app crashed before storing ephemeralInvitePrivkey
 - Monitor can no longer decrypt acceptances for that QR
 - **Recovery:** Monitor stops listening for that QR after TTL expires. Viewer will notice pairing didn't complete and should ask monitor to generate a new invite.
@@ -941,16 +1005,17 @@ interface QRAcceptancePayload {
 
 Gift-wrap (NIP-59) is **not needed** for QR-based pairing:
 
-| Aspect | Gift-wrap | QR Method |
-|--------|-----------|-----------|
-| **Purpose** | Hide recipient and content from relays | Hide acceptance content from relays |
-| **Overhead** | ~20% larger (double-encrypted, sealed, wrapped) | Single NIP-44 layer |
-| **Relay cost** | Expensive: must return all gift-wraps meant for recipient | Cheap: filter by kind (5100) + tag query |
-| **Decryption complexity** | 3-layer: unwrap → unseal → decrypt | 1-layer: decrypt |
-| **Real pubkey exposure** | Hidden until after unwrap | Signed with ephemeral key; revealed in encrypted content |
-| **Scalability** | Grows with pairing count (each pairing adds subscriptions) | Ephemeral per-invite (single listening window) |
+| Aspect                    | Gift-wrap                                                  | QR Method                                                |
+| ------------------------- | ---------------------------------------------------------- | -------------------------------------------------------- |
+| **Purpose**               | Hide recipient and content from relays                     | Hide acceptance content from relays                      |
+| **Overhead**              | ~20% larger (double-encrypted, sealed, wrapped)            | Single NIP-44 layer                                      |
+| **Relay cost**            | Expensive: must return all gift-wraps meant for recipient  | Cheap: filter by kind (5100) + tag query                 |
+| **Decryption complexity** | 3-layer: unwrap → unseal → decrypt                         | 1-layer: decrypt                                         |
+| **Real pubkey exposure**  | Hidden until after unwrap                                  | Signed with ephemeral key; revealed in encrypted content |
+| **Scalability**           | Grows with pairing count (each pairing adds subscriptions) | Ephemeral per-invite (single listening window)           |
 
 **Why QR method is simpler:**
+
 1. Monitor generates ephemeral key **for this specific invite only**
 2. Viewer derives temporary channel key from ephemeral pubkey
 3. Viewer publishes acceptance encrypted with that temporary key
@@ -1000,16 +1065,16 @@ The general pattern for using TOTP to authorize any remote instruction:
 ```typescript
 /**
  * Generic remote instruction with TOTP authorization.
- * 
+ *
  * Sender has:
  *   - A TOTP seed (shared with recipient via QR, manual entry, etc.)
  *   - An instruction to send to recipient (invite, request, proposal, etc.)
- * 
+ *
  * Sender publishes:
  *   - Nostr event (kind X, encrypted with NIP-44)
  *   - Payload: { type: 'instruction-type', credential: '...', ...otherFields }
  *   - Credential is either TOTP seed (base32) or freshly-generated 6-digit code
- * 
+ *
  * Recipient receives and validates:
  *   1. Decrypt event content (NIP-44)
  *   2. Check freshness (created_at must be recent)
@@ -1021,12 +1086,12 @@ The general pattern for using TOTP to authorize any remote instruction:
  */
 
 interface RemoteInstructionPayload {
-  type: string;                    // 'pairing-accept', 'login', 'api-token', etc.
-  credential: string;              // TOTP seed (base32, 32 chars) or code (6 digits)
-  credential_type: 'seed' | 'code'; // which validation mode to use
-  ttl: number;                      // seconds (credential validity window)
+  type: string; // 'pairing-accept', 'login', 'api-token', etc.
+  credential: string; // TOTP seed (base32, 32 chars) or code (6 digits)
+  credential_type: "seed" | "code"; // which validation mode to use
+  ttl: number; // seconds (credential validity window)
   // ... other instruction-specific fields (action, relays, etc.)
-  created_at: number;              // unix timestamp (for freshness check)
+  created_at: number; // unix timestamp (for freshness check)
 }
 ```
 
@@ -1035,22 +1100,23 @@ interface RemoteInstructionPayload {
 Pairing invite authorization is **one use case** of the TOTP protocol. Here's how it applies:
 
 **Monitor side (sender):**
+
 ```typescript
 // Monitor generates invite + TOTP seed
 const { ephemeralPrivkey, ephemeralPubkey } = genKeyPair();
-const totpSeed = generateTOTPSeed();  // base32 string (32 chars)
+const totpSeed = generateTOTPSeed(); // base32 string (32 chars)
 
 // Build pairing invite payload with credential
 const payload: RemoteInstructionPayload = {
-  type: 'pairing-accept',
+  type: "pairing-accept",
   ephemeral_pubkey: ephemeralPubkey,
   client_pubkey: monitorPubkey,
   client_relays: monitorRelays,
   sessionUUID: crypto.randomUUID(),
   credential: totpSeed,
-  credential_type: 'seed',
-  ttl: 3600,  // 1 hour validity window
-  created_at: Math.floor(Date.now() / 1000)
+  credential_type: "seed",
+  ttl: 3600, // 1 hour validity window
+  created_at: Math.floor(Date.now() / 1000),
 };
 
 // In practice, this payload is the Rumor inside a NIP-59 gift wrap (kind 1059).
@@ -1068,6 +1134,7 @@ await sendGiftWrap(rumor, viewerPubkey, monitorPrivkey, [viewerRelay]);
 ```
 
 **Viewer side (recipient):**
+
 ```typescript
 // Viewer receives event and decrypts payload
 const sharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
@@ -1076,16 +1143,16 @@ const payload = JSON.parse(nip44Decrypt(event.content, sharedSecret));
 // Validate freshness
 const payloadAge = Math.floor(Date.now() / 1000) - payload.created_at;
 if (payloadAge > payload.ttl) {
-  throw new Error('Instruction has expired');
+  throw new Error("Instruction has expired");
 }
 
 // Validate TOTP credential
 let credentialValid = false;
-if (payload.credential_type === 'seed') {
+if (payload.credential_type === "seed") {
   // Compare seed against stored TOTP credential
-  const storedSeed = await retrieveStoredTOTPSeed();  // from IDB
+  const storedSeed = await retrieveStoredTOTPSeed(); // from IDB
   credentialValid = verifyRawSeed(storedSeed, payload.credential);
-} else if (payload.credential_type === 'code') {
+} else if (payload.credential_type === "code") {
   // Validate 6-digit code against stored seed
   const storedSeed = await retrieveStoredTOTPSeed();
   credentialValid = verifyTOTPCode(storedSeed, payload.credential);
@@ -1094,17 +1161,18 @@ if (payload.credential_type === 'seed') {
 if (!credentialValid) {
   // Record failed attempt + apply rate limiting
   await recordTOTPAttempt(credentialId, false);
-  throw new Error('Credential invalid');
+  throw new Error("Credential invalid");
 }
 
 // Credential valid — proceed with instruction
 await recordTOTPAttempt(credentialId, true);
-await acceptPairingInvite(payload);  // Pairing-specific logic
+await acceptPairingInvite(payload); // Pairing-specific logic
 ```
 
 ### Use Cases: When to Use TOTP for Remote Instructions
 
 **Use TOTP when:**
+
 - Remote action requires confirmation from a party with a **shared secret**
 - Action is **sensitive** (pairing, account unlock, credential reset, API token generation)
 - **Rate limiting** is needed to prevent brute-force attacks
@@ -1112,6 +1180,7 @@ await acceptPairingInvite(payload);  // Pairing-specific logic
 - Instruction is **already encrypted** over ECDH (TOTP adds a second auth layer)
 
 **Don't use TOTP when:**
+
 - No shared secret between parties (first-time discovery — use QR instead)
 - Action is **non-sensitive** (status queries, read-only requests)
 - Real-time **human verification** is needed (use UI-based confirmation instead)
@@ -1120,21 +1189,25 @@ await acceptPairingInvite(payload);  // Pairing-specific logic
 ### Security Considerations
 
 **TOTP validates credentials, not identity:**
+
 - TOTP proves "you know the shared secret", not "you are Device X"
 - Always verify the **instruction payload** in addition to credential (wrong payload + right credential = still wrong)
 - Use TOTP as a **second factor** (with ECDH encryption and real pubkey verification)
 
 **TOTP does not prevent relay eavesdropping:**
+
 - Event itself is encrypted (NIP-44), but relay can see recipient pubkey and timestamp
 - Attacker cannot forge instruction (wrong credential fails validation)
 - Attacker can replay old instructions if **freshness check fails** — always validate `created_at` against `ttl`
 
 **Rate limiting prevents brute-force:**
+
 - Failed attempts increment counter; after N attempts, credential locks for exponential backoff
 - Even if attacker knows the TOTP seed, they cannot bypass rate limiting
 - See `recordTOTPAttempt()` in Security Layer for implementation
 
 **Credential expiration prevents replay:**
+
 - TOTP code expires after 30 seconds (RFC 6238)
 - Instruction payload expires after `ttl` (typically 1 hour for pairing, 5 minutes for sensitive operations)
 - Never accept instructions with `created_at > now + clock_skew`
@@ -1144,6 +1217,7 @@ await acceptPairingInvite(payload);  // Pairing-specific logic
 ### Post-Pairing Transition to Channel Keys
 
 After successful invite acceptance (whether QR or Nostr delivery), both devices have:
+
 - Each other's **real pubkeys** (from QR payload and acceptance message)
 - **Relay lists** (from QR and acceptance)
 - **Shared ECDH secret** (computed from their privkeys)
@@ -1153,13 +1227,29 @@ Now they can **independently derive post-pairing channel keys**:
 ```typescript
 // Monitor's computation:
 const monitorSharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
-const monitorInbound = deriveChannelKey(monitorSharedSecret, viewerPubkey, monitorPubkey);
-const monitorOutbound = deriveChannelKey(monitorSharedSecret, monitorPubkey, viewerPubkey);
+const monitorInbound = deriveChannelKey(
+  monitorSharedSecret,
+  viewerPubkey,
+  monitorPubkey,
+);
+const monitorOutbound = deriveChannelKey(
+  monitorSharedSecret,
+  monitorPubkey,
+  viewerPubkey,
+);
 
 // Viewer's computation:
 const viewerSharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
-const viewerInbound = deriveChannelKey(viewerSharedSecret, monitorPubkey, viewerPubkey);
-const viewerOutbound = deriveChannelKey(viewerSharedSecret, viewerPubkey, monitorPubkey);
+const viewerInbound = deriveChannelKey(
+  viewerSharedSecret,
+  monitorPubkey,
+  viewerPubkey,
+);
+const viewerOutbound = deriveChannelKey(
+  viewerSharedSecret,
+  viewerPubkey,
+  monitorPubkey,
+);
 
 // Both derive identical keys:
 // monitorOutbound === viewerInbound  ✓
@@ -1171,15 +1261,18 @@ All subsequent signals (status, RTC handshake, relay updates, etc.) are publishe
 ### Security Considerations
 
 **Threat 1: QR Code Interception**
+
 - **Risk:** Attacker sees QR on screen and scans it before intended viewer
 - **Mitigation:** QR should be displayed in a physically secure context (locked room, private screen). Same as WiFi QR — user responsibility.
 - **Expiration:** TTL (e.g., 5 minutes) means old screenshots are useless
 
 **Threat 2: Relay Eavesdropping**
+
 - **Risk:** Relay operator sees acceptance event on relay and tries to decrypt
 - **Mitigation:** Acceptance is encrypted with temporary channel key; relay can't decrypt it. Even if they somehow decrypt it, they only see viewer's real pubkey + relays — can't act on it without the invite privkey.
 
 **Threat 3: Acceptance Forgery**
+
 - **Risk:** Attacker publishes a fake acceptance event claiming to be a different viewer
 - **Mitigation:** Acceptance is signed (Nostr signature) and encrypted. Forger would need:
   1. Know the ephemeral invite pubkey (from QR) ✓ (attacker can scan)
@@ -1192,14 +1285,17 @@ All subsequent signals (status, RTC handshake, relay updates, etc.) are publishe
   **Result:** Forged acceptance either has invalid signature (rejected) or creates a pairing with a wrong viewer pubkey (attacker's, not the intended viewer's). Monitor would need to trust the acceptance content; but acceptance contains an explicit `viewerPubkey` field, so attacker can't trick monitor into pairing with someone else.
 
 **Threat 4: Private Key Theft**
+
 - **Risk:** Attacker steals monitor's or viewer's privkey, then generates new QRs or acceptances
 - **Mitigation:** Same as any key-based system. Private keys must be protected by the device's OS (Keychain, Android Keystore, etc.). Out of scope for Nostr protocol.
 
 **Threat 5: Relay Censorship**
+
 - **Risk:** Relay blocks acceptance event (DOSes pairing)
 - **Mitigation:** Fanout to multiple relays. If at least one relay accepts, acceptance succeeds. Monitor listens on all relays listed in QR.
 
 **Why real pubkeys are safe in acceptance payload:**
+
 - Acceptance is **encrypted** — relay can't see it
 - Acceptance is **ephemeral** — lives only on relays for ~5 minutes
 - Acceptance includes **inviteId** — only valid for this specific QR
@@ -1252,8 +1348,8 @@ Within each kind, `isResponse` distinguishes the initiating party from the respo
 // isResponse=true: monitor responds with SDP offer
 interface RtcSessionPayload {
   sessionId: string;
-  mode?: 'live' | 'data';  // isResponse=false only
-  sdp?: string;            // isResponse=true only
+  mode?: "live" | "data"; // isResponse=false only
+  sdp?: string; // isResponse=true only
   isResponse: boolean;
 }
 
@@ -1262,7 +1358,7 @@ interface RtcSessionPayload {
 // isResponse=true: monitor acknowledges (optional)
 interface RtcAnswerPayload {
   sessionId: string;
-  sdp?: string;   // isResponse=false: the SDP answer
+  sdp?: string; // isResponse=false: the SDP answer
   isResponse: boolean;
 }
 
@@ -1278,7 +1374,7 @@ interface RtcHangupPayload {
 // isResponse=false: device announces presence (online/offline)
 // isResponse=true: peer replies to a received announcement
 interface StatusPayload {
-  state: 'online' | 'offline';
+  state: "online" | "offline";
   isResponse: boolean;
 }
 
@@ -1287,13 +1383,14 @@ interface StatusPayload {
 // isResponse=true: peer acknowledges (confirms it reached the new relay)
 interface RelayMigrationPayload {
   sessionId: string;
-  newRelays?: string[];  // isResponse=false: proposed relay list
+  newRelays?: string[]; // isResponse=false: proposed relay list
   timestamp: number;
   isResponse: boolean;
 }
 ```
 
 **Transmission (all signal kinds):**
+
 ```
 Kind: 5001–5005 (one per signal type)
 Pubkey: contact's inboundChannelPubkey (paired: ECDH-derived; temp: ephemeral)
@@ -1301,6 +1398,7 @@ Content: NIP-44 encrypted kind-specific payload
 created_at: honest timestamp (not randomized)
 Relay: selected by RelayStateController from contact's outboundRelayList
 ```
+
 Callers use `nostrClient.publishSignal(contactId, kind, payload)` — relay and key selection is internal.
 
 **Important:** Data requests (segments, coverage maps, etc.) are **never sent over Nostr**. They flow over RTC data channels (see RTC Connection & Control section).
@@ -1317,11 +1415,11 @@ Because each signal type has its own kind, a fetch for kind 5005 (relay migratio
 interface SignalWatermark {
   // Per contactId, per kind — latest created_at seen
   [contactId: string]: {
-    5001?: number;  // RTC Session
-    5002?: number;  // RTC Answer
-    5003?: number;  // RTC Hangup
-    5004?: number;  // Status
-    5005?: number;  // Relay Migration
+    5001?: number; // RTC Session
+    5002?: number; // RTC Answer
+    5003?: number; // RTC Hangup
+    5004?: number; // Status
+    5005?: number; // Relay Migration
   };
 }
 
@@ -1332,26 +1430,26 @@ async function resumeSignalFetches() {
     const wm = getWatermark(contactId);
 
     // Check for pending relay migration proposals
-    for await (const event of nostrClient.fetchKindHistory(contactId, 5005,
-      { windowStart: wm[5005] ?? (now() - 86400) }
-    )) {
+    for await (const event of nostrClient.fetchKindHistory(contactId, 5005, {
+      windowStart: wm[5005] ?? now() - 86400,
+    })) {
       const msg = event.decryptedPayload as RelayMigrationPayload;
       updateWatermark(contactId, 5005, event.created_at);
       if (!msg.isResponse) {
         handleRelayMigrationProposal(contactId, msg);
-        break;  // newest unacknowledged proposal found
+        break; // newest unacknowledged proposal found
       }
     }
 
     // Get last known status
-    for await (const event of nostrClient.fetchKindHistory(contactId, 5004,
-      { windowStart: wm[5004] ?? (now() - 3600) }
-    )) {
+    for await (const event of nostrClient.fetchKindHistory(contactId, 5004, {
+      windowStart: wm[5004] ?? now() - 3600,
+    })) {
       const msg = event.decryptedPayload as StatusPayload;
       if (!msg.isResponse) {
         updateContactStatus(contactId, msg.state, event.created_at);
         updateWatermark(contactId, 5004, event.created_at);
-        break;  // newest announcement found
+        break; // newest announcement found
       }
     }
   }
@@ -1359,6 +1457,7 @@ async function resumeSignalFetches() {
 ```
 
 **Key properties:**
+
 - Each `fetchKindHistory()` call issues one relay request at a time, yielding the newest matching event first
 - Rate-limit cost is per received event: each event delays the next request by `1 / relayRatePerMinute` minutes
 - The caller `break`s when it finds what it needs — no unnecessary fetching
@@ -1373,28 +1472,40 @@ async function resumeSignalFetches() {
 All calls use `contactId` — relay and key selection is internal.
 
 **Status Announcement** (on device startup):
+
 ```typescript
 // Monitor comes online — announces to all contacts
 for (const contactId of nostrClient.allContactIds()) {
-  await nostrClient.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: false });
+  await nostrClient.publishSignalDirect(contactId, 5004, {
+    state: "online",
+    isResponse: false,
+  });
 }
 
 // Viewer receives via signal router and replies
 nostrClient.startSignalRouter((contactId, kind, payload) => {
   if (kind === 5004 && !payload.isResponse) {
-    nostrClient.publishSignalDirect(contactId, 5004, { state: 'online', isResponse: true });
+    nostrClient.publishSignalDirect(contactId, 5004, {
+      state: "online",
+      isResponse: true,
+    });
   }
 });
 ```
 
 **Status solicitation** (manual "Status?" button):
+
 ```typescript
 // Viewer sends kind 5004 isResponse=false — monitor treats any isResponse=false as both
 // announcement and reply solicitation
-await nostrClient.publishSignalDirect(monitorContactId, 5004, { state: 'online', isResponse: false });
+await nostrClient.publishSignalDirect(monitorContactId, 5004, {
+  state: "online",
+  isResponse: false,
+});
 ```
 
 **RTC Handshake** (initiating connection):
+
 ```
 Viewer: publishSignalDirect(monitorContactId, 5001, { mode: 'data', sessionId, isResponse: false })
 Monitor: publishSignalDirect(viewerContactId, 5001, { sdp, sessionId, isResponse: true })
@@ -1424,10 +1535,12 @@ Naming scheme: relay-X-Y where X=device (a/b) and Y=version number
 ## Relay Migration & Dual-Channel
 
 Each device has **independent inbound and outbound relay lists**:
+
 - **Inbound**: your listening relays (you can propose changes)
 - **Outbound**: peer's inbound relays (you never change this; peer does via proposal)
 
 When a device wants to migrate its listening relays:
+
 1. Propose new inbound over peer's current inbound (outbound)
 2. Dual-listen to old + new inbound during negotiation
 3. Peer acknowledges by sending to the new inbound (proving it's listening)
@@ -1438,6 +1551,7 @@ When a device wants to migrate its listening relays:
 ### Migration Flow (DeviceA: relay-a-1 → relay-a-2)
 
 **Step 1: DeviceA proposes and dual-listens**
+
 ```
 DeviceA:
   ├─ Starts dual-listening to: [relay-a-1.com] + [relay-a-2.com]
@@ -1448,6 +1562,7 @@ DeviceA:
 ```
 
 **Step 2: DeviceB receives and acknowledges**
+
 ```
 DeviceB receives on [relay-b-1.com]:
   ├─ Learns: DeviceA wants to listen on [relay-a-2.com]
@@ -1459,6 +1574,7 @@ DeviceB receives on [relay-b-1.com]:
 ```
 
 **Step 3: DeviceA receives acknowledgement and commits**
+
 ```
 DeviceA receives ack on [relay-a-2.com]:
   ├─ Sees: DeviceB is listening to relay-a-2
@@ -1473,101 +1589,91 @@ Result:
 ```
 
 **Why communications never break:**
+
 - DeviceA always sends to [relay-b-1.com] ✓ (unchanged throughout)
 - DeviceB always listens to [relay-b-1.com] ✓ (unchanged throughout)
 - Acknowledgement sent to new relay where both are already dual-listening
 - DeviceB starts sending to new relay **immediately** upon receiving proposal
 
 **Code: DeviceA proposes migration**
+
 ```typescript
 async function proposeInboundMigration(contact, newInbound) {
   // Example: DeviceA proposing relay-a-1 → relay-a-2
   // contact.relays = [wss://relay-a-1.com]
   // newInbound = [wss://relay-a-2.com]
   // contact.outbound = [wss://relay-b-1.com]  (DeviceB's inbound)
-  
+
   const sessionId = crypto.randomUUID();
-  
-  // Step 1: Add subscriptions to new relays BEFORE sending proposal
-  // CRITICAL: Verify subscriptions are established before proposal, so we can receive ack
-  // If we send proposal but aren't listening to newInbound relays, we'll miss DeviceB's ack
-  addRelaySubscription(newInbound, {
-    kinds: [5005],  // Relay Migration only
-    authors: [contact.inboundChannelKey],
-    since: Math.floor(Date.now() / 1000),  // T+0
-    label: 'relay-proposal'
-  });
-  
-  // Wait briefly for subscriptions to establish (relays need time to connect)
-  // In practice, this happens quickly (~100ms), but we want certainty before sending proposal
-  await new Promise(resolve => setTimeout(resolve, 100));
-  
-  // Step 2: Store proposal to IDB (survives reload)
-  contact.relayProposal = {
-    sessionId,
-    newInbound,  // [wss://relay-a-2.com, ...]
-    proposedAt: Date.now()
-  };
-  await savePairedDevice(contact);
-  
-  // Step 3: NOW send proposal over peer's inbound relays (our outbound)
-  // Dual-listening is ready; we're listening on both old and new inbound relays
-  // Sends proposal to [wss://relay-b-1.com] where DeviceB is listening
-  await sendSignal(privkey, myPubkey, contact.pubkey, {
-    // kind 5005 (Relay Migration), isResponse=false = proposal
-    isResponse: false,
-    sessionId,
-    newRelays: newInbound,  // "I want to use [relay-a-2]"
-    timestamp: Math.floor(Date.now() / 1000)
-  }, { relays: contact.outbound, kind: 5005 });
+
+  // Step 1a: Request dual-listening on new inbound relays before sending proposal.
+  // Temporarily extends the contact's inbound relay list to cover newInbound.
+  // onReady fires when the relay confirms the subscription is active — no setTimeout guesswork.
+  nostrClient.requestRelayMigrationListening(
+    contactId,
+    newInbound,
+    async (since) => {
+      // onReady: confirmed active on new relays — safe to proceed, won't miss the ack
+
+      // Step 1b: Store proposal to IDB (survives reload)
+      contact.relayProposal = {
+        sessionId,
+        newInbound,
+        proposedAt: since,
+      };
+      await savePairedDevice(contact);
+
+      // Step 1c: Send proposal — relay selection and encryption are internal
+      nostrClient.publishSignalDirect(contactId, 5005, {
+        isResponse: false,
+        sessionId,
+        newRelays: newInbound,
+        timestamp: since,
+      });
+    },
+  );
 }
 ```
 
 **Step 3: DeviceA waits for acknowledgement on dual-listened relays**
+
 ```typescript
 async function waitForInboundMigrationAck(contact) {
   const { sessionId, newInbound, proposedAt } = contact.relayProposal;
-  
+
   // Listen on both old and new relays for acknowledgement
   // DeviceA is dual-listening: [relay-a-1.com] + [relay-a-2.com]
   // Acknowledgement will come from DeviceB on [relay-a-2.com] (where they just learned to send)
-  
-  const allListenRelays = [...new Set([...contact.relays, ...newInbound])];
-  
+
   try {
-    // Wait for ack signal on either old or new inbound
-    // Timeout: 30 seconds (relay propagation + peer processing)
-    // Filter by sessionId to ensure we only accept acks for CURRENT proposal
-    // (Watermark-based fetching prevents the relay from returning massive historical batches)
-    const ack = await waitForSignal(
-      {
-        kind: 5005,       // Relay Migration
-        isResponse: true,
-        sessionId,        // ← Must match CURRENT proposal's sessionId (rejects stale acks)
-        fromPubkey: contact.pubkey
-      },
-      { relays: allListenRelays, timeout: 30_000 }
-    );
-    
+    // Ack arrives via signal router — dual-listening on old + new inbound is already active.
+    // Filter by sessionId; timeout after 30 seconds.
+    const ack = await nostrClient.waitForSignal(contactId, {
+      kind: 5005,
+      filter: (payload) =>
+        payload.isResponse && payload.sessionId === sessionId,
+      timeoutMs: 30_000,
+    });
+
     if (ack) {
       // Acknowledgement received for CURRENT proposal — commit migration
-      contact.relays = newInbound;
       contact.relayProposal = null;
-      
-      // Cleanup: stop dual-listening, keep only new inbound
-      removeRelaySubscription(contact.relays, { label: 'relay-proposal' });
-      
-      // Update signal subscriptions to new inbound
-      resetSignalSubscriptions();
-      
+
+      // Commit migration — ContactManager updates relay list; signal router re-subscribes to new inbound only
+      nostrClient.updatePairedRelays(contactId, newInbound);
+
       await savePairedDevice(contact);
       return true;
     }
   } catch (err) {
     // Ack timeout — peer may be offline or ack lost
     // Relays keep old acks, but they don't match current sessionId so won't confuse retry
-    dbg('warn', 'relay-migration', `ack timeout for ${contact.pubkey} after ${Date.now() - proposedAt}ms`);
-    
+    dbg(
+      "warn",
+      "relay-migration",
+      `ack timeout for ${contact.pubkey} after ${Date.now() - proposedAt}ms`,
+    );
+
     // Will retry on next startup via resumePendingRelayMigrations()
     return false;
   }
@@ -1575,118 +1681,89 @@ async function waitForInboundMigrationAck(contact) {
 ```
 
 **Step 4: DeviceB receives proposal and immediately acknowledges**
+
 ```typescript
 // Signal router delivers: (contactId, kind, payload)
 // kind 5005 = Relay Migration; isResponse=false = proposal
-onSignal((contactId, kind, payload) => {
+nostrClient.startSignalRouter((contactId, kind, payload) => {
   if (kind === 5005 && !payload.isResponse) {
     const msg = payload as RelayMigrationPayload;
-    const contact = getPairedDevice(fromPubkey);
-    
+    // contactId identifies DeviceA — relay/key lookup is internal to NostrClient
+
     // Example scenario:
     // DeviceB receives on [relay-b-1.com] (where we're listening):
     //   msg.newRelays = [relay-a-2.com]
     //   msg.sessionId = UUID
     // DeviceA's proposal: "I'm moving to relay-a-2, start sending to me there"
-    
-    // Step 4a: Start listening to peer's new inbound
-    // This is dual-listening for DeviceB: we'll catch the ack we're about to send
-    addRelaySubscription(msg.newRelays, {
-      kinds: [5005],  // Relay Migration only
-      authors: [contact.inboundChannelKey],  // our inbound channel (DeviceA's outbound)
-      since: Math.floor(Date.now() / 1000),  // T+0
-      label: 'relay-proposal'
-    });
-    
-    // Step 4b: Send acknowledgement to peer's new inbound
+
+    // Step 4a: Update where WE send to DeviceA (our outbound = DeviceA's new inbound)
+    // ContactManager commits the new relay list; dual-listening on DeviceA's side resolves after receiving this ack
+    nostrClient.updatePairedRelays(contactId, msg.newRelays);
+
+    // Step 4b: Send acknowledgement — NostrClient routes to the updated relay list
     // Sending to [relay-a-2.com] proves DeviceB can reach DeviceA on the new relay
-    await sendSignal(privkey, myPubkey, fromPubkey, {
-      // kind 5005 (Relay Migration), isResponse=true = acknowledgement
+    await nostrClient.publishSignalDirect(contactId, 5005, {
       isResponse: true,
       sessionId: msg.sessionId,
-      timestamp: Math.floor(Date.now() / 1000)
-    }, { relays: msg.newRelays, kind: 5005 });  // Send to [relay-a-2.com]
-    
-    // Step 4c: Update our outbound to peer's new inbound
-    // From now on, all signals to DeviceA go to [relay-a-2.com]
-    contact.outbound = msg.newRelays;
-    
-    // Step 4d: Update signal router subscriptions
-    resetSignalSubscriptions();
-    
-    await savePairedDevice(contact);
+      timestamp: Math.floor(Date.now() / 1000),
+    });
   }
 });
 ```
 
 **Step 5: Recovery on reload (resume dual-listening)**
+
 ```typescript
 async function resumePendingRelayMigrations() {
   const devices = await getAllPairedDevices();
-  
+
   for (const contact of devices) {
     // Check if migration was in-flight (proposal stored)
     if (!contact.relayProposal) continue;
-    
+
     const { sessionId, newInbound, proposedAt } = contact.relayProposal;
-    
+
     // Example scenario on reload:
     // contact.relays = [relay-a-1.com]  (old established inbound)
     // contact.relayProposal.newInbound = [relay-a-2.com]  (proposed new inbound)
     // We were proposing before the app crashed; resume waiting for ack
-    
+
     // Use watermark-based fetching (see "Signal Fetching Strategy" section)
     // Only fetch events newer than last known created_at to avoid relay rate limit burn
-    
-    // Step 5a: Dedup check — prevent duplicate proposals after reload
-    // Clock skew and simultaneous reboot race condition:
-    // - If both devices reload, initiator re-proposes with same sessionId but potentially different createdAt (±1s drift)
-    // - Dedup must be independent of timestamp; sessionId + initiatorPubkey is the unique proposal identifier
-    // 
-    // Fix: Use sessionId + initiatorPubkey for dedup (not timestamp)
-    // Rationale: sessionId is unique per migration attempt; if same (sessionId, initiatorPubkey) appears in history,
-    // it's the same migration proposal regardless of timing. Compare createdAt only for tie-breaking: if older,
-    // use stored proposal; if newer, update and re-send ack.
-    
-    const recentProposalHistory = await getRecentRelayProposals(contact.pubkey, { since: proposedAt - 60000 });
-    const existingProposal = recentProposalHistory.find(p => p.sessionId === sessionId && p.initiatorPubkey === contact.pubkey);
-    
-    if (existingProposal) {
-      if (proposedAt < existingProposal.createdAt) {
-        // Stored proposal is newer; use it (skip this older one)
-        dbg('info', 'relay-migration', `skipping older proposal for ${contact.pubkey} (newer one already stored)`);
-        continue;
-      } else if (proposedAt === existingProposal.createdAt) {
-        // Same timestamp; exact duplicate (already sent before reload)
-        dbg('info', 'relay-migration', `skipping duplicate proposal for ${contact.pubkey} (same sessionId+initiator+timestamp)`);
-        continue;
-      } else {
-        // Newer timestamp; update stored proposal and proceed
-        dbg('info', 'relay-migration', `updating proposal for ${contact.pubkey} to newer timestamp`);
-        contact.relayProposal.proposedAt = proposedAt;
-      }
-    }
-    
-    // Step 5b: Re-add dual-listening
-    // DeviceA is still listening to both old and new inbound after reload
-    addRelaySubscription(newInbound, {
-      kinds: [5005],  // Relay Migration only
-      authors: [contact.inboundChannelKey],
-      since: Math.floor(Date.now() / 1000),  // T+0
-      label: 'relay-proposal'
-    });
-    
-    // Step 5c: Continue waiting for acknowledgement
-    // Resume the ack wait; timeout will trigger another retry on next startup
-    // waitForInboundMigrationAck() MUST filter by sessionId to avoid accepting stale acks
-    const ackReceived = await waitForInboundMigrationAck(contact);
-    
-    if (ackReceived) {
-      dbg('info', 'relay-migration', `resumed and completed for ${contact.pubkey}`);
-    } else {
-      dbg('info', 'relay-migration', `resumed but still waiting for ack from ${contact.pubkey}`);
-      // relayProposal stays in IDB; next startup will retry again
-    }
+
+    // Step 5a: The stored relayProposal IS the source of truth — we proposed this before the reload.
+    // sessionId uniqueness guarantees there is no duplicate to resolve: same sessionId = same migration attempt.
+    // Just resume waiting for the ack without re-fetching history or re-sending the proposal.
+    dbg(
+      "info",
+      "relay-migration",
+      `resuming pending migration for ${contact.pubkey} (session ${sessionId})`,
+    );
+
+    // Step 5b/5c: Re-request dual-listening, then wait for ack once confirmed active.
+    // onReady ensures we don't start waiting before the relay subscription is live.
+    nostrClient.requestRelayMigrationListening(
+      contactId,
+      newInbound,
+      async () => {
+        const ackReceived = await waitForInboundMigrationAck(contact);
+
+        if (ackReceived) {
+          dbg(
+            "info",
+            "relay-migration",
+            `resumed and completed for ${contact.pubkey}`,
+          );
+        } else {
+          dbg(
+            "info",
+            "relay-migration",
+            `resumed but still waiting for ack from ${contact.pubkey}`,
+          );
+          // relayProposal stays in IDB; next startup will retry again
+        }
+      },
+    );
   }
 }
 ```
@@ -1694,22 +1771,26 @@ async function resumePendingRelayMigrations() {
 ### Key Properties of Dual-Channel Migration
 
 **Communications never break:**
+
 - **DeviceA always sends to `[relay-b-1.com]`** (DeviceB's inbound) throughout migration — never changes
 - **DeviceB dual-listens to old+new inbound** during entire handshake — catches proposal and ack on either relay
 - All proposals reach destination; all acks reach source
 
 **Multiple concurrent proposals are safe:**
+
 - Each proposal has unique `sessionId`
 - Initiator waits for ack matching its **LATEST** proposal's `sessionId`
 - Latest proposal implicitly wins; no explicit conflict resolution needed
 - Both devices can independently propose inbound changes without coordination
 
 **Cleanup happens only after acknowledgement:**
+
 - **Initiator** (e.g., DeviceA): dual-listens to `[relay-a-1.com, relay-a-2.com]` until ack received
 - **Acknowledger** (e.g., DeviceB): starts sending to new inbound `[relay-a-2.com]` immediately upon receiving proposal, sends ack as proof
 - After ack, initiator commits and stops dual-listening
 
 **Each device autonomously controls only its own inbound:**
+
 - **DeviceA** can propose A→A2→A3→... without waiting for previous proposals to complete
 - **DeviceB** acknowledges **ONE** (latest with highest sessionId) and updates where it sends to DeviceA
 - No "agreement phase"—just proposal + proof of listening via acknowledgement
@@ -1722,18 +1803,18 @@ async function resumePendingRelayMigrations() {
 ```typescript
 interface PairedDevice {
   pubkey: string;
-  
+
   // Relay lists (independent per device)
-  relays: string[];         // MY inbound relays (where I listen for signals)
-  outbound: string[];       // PEER's inbound relays (where I send signals to them)
-  
+  relays: string[]; // MY inbound relays (where I listen for signals)
+  outbound: string[]; // PEER's inbound relays (where I send signals to them)
+
   // Relay migration state
   relayProposal?: {
     sessionId: string;
-    newInbound: string[];   // my proposed new listening relays
+    newInbound: string[]; // my proposed new listening relays
     proposedAt: number;
   };
-  
+
   // ... other fields ...
 }
 ```
@@ -1741,6 +1822,7 @@ interface PairedDevice {
 ### Relay List for Signals
 
 **Semantics:**
+
 - `relays`: Your listening relays. You control this; peer updates it when you propose via `relayProposal`
 - `outbound`: Peer's listening relays (cached copy). You never write this directly; peer updates it by proposing changes to you
 
@@ -1749,6 +1831,7 @@ interface PairedDevice {
 **Subscription:** `nostrClient.startSignalRouter(onSignal)` maintains T+0 subscriptions across all relays in `ContactManager.allMyInboundRelays()`, filtering by all registered inbound channel pubkeys. The signal router re-subscribes automatically when contacts are added, updated, or expired.
 
 **Integration with Relay Migration:**
+
 - **Post-pairing signals:** `ContactManager` resolves the current outbound relay list per contact; `RelayStateController` selects the eligible relay; `NostrClient` handles key lookup and delivery
 - **Relay migration:** `updatePairedRelays(contactId, newInbound)` in `ContactManager` updates the relay list; subsequent publishes and subscriptions pick up the new list automatically
 
@@ -1759,6 +1842,7 @@ interface PairedDevice {
 Action signals are the Nostr layer of the Senstry pipeline. When a sensor fires and the pipeline resolves an action that includes a Nostr notification, `TriggerPublisher` sends a targeted channel-key signal to specific paired contacts. There are no real pubkeys, no open subscriptions, no public broadcasts. Action signals use the same encryption and routing as all other post-pairing signals.
 
 **Pipeline flow:**
+
 ```
 Monitor Device:
   Sensor fires
@@ -1777,10 +1861,10 @@ Footage itself is never sent over Nostr. The kind 5010 signal carries only the m
 
 ### Signal Kinds
 
-| Kind | Name | Purpose |
-|------|------|---------|
-| 5010 | Trigger | Sensor fired — detection type, timestamp, confidence |
-| 5011 | Arm State | Monitor armed or disarmed |
+| Kind | Name      | Purpose                                              |
+| ---- | --------- | ---------------------------------------------------- |
+| 5010 | Trigger   | Sensor fired — detection type, timestamp, confidence |
+| 5011 | Arm State | Monitor armed or disarmed                            |
 
 Both use NIP-44 over ECDH channel keys, same as kinds 5001–5005. Both flow through the signal router.
 
@@ -1803,18 +1887,22 @@ class TriggerPublisher {
   }
 
   private resolveTargets(config: ActionSignalConfig): string[] {
-    const all = this.contactManager.allContactIds()
-      .filter(id => !this.contactManager.get(id).expiresAt); // paired only
+    const all = this.contactManager
+      .allContactIds()
+      .filter((id) => !this.contactManager.get(id).expiresAt); // paired only
 
     switch (config.recipients) {
-      case 'all':       return all;
-      case 'specific':  return all.filter(id => config.contactIds.includes(id));
+      case "all":
+        return all;
+      case "specific":
+        return all.filter((id) => config.contactIds.includes(id));
     }
   }
 }
 ```
 
 **Target filtering is caller-configurable:**
+
 - `recipients: 'all'` — all paired contacts
 - `recipients: 'specific'` — listed contactIds only
 - Further filtering (online-only, not-on-rtc) is applied by the pipeline before calling `fire()`
@@ -1843,15 +1931,15 @@ Action signals differ from RTC signals in one way: a viewer that was offline may
 const lastOnlineSec = getLastOnlineTimestamp();
 
 for (const contactId of nostrClient.allContactIds()) {
-  for await (const event of nostrClient.fetchKindHistory(contactId, 5010,
-    { windowStart: lastOnlineSec }
-  )) {
+  for await (const event of nostrClient.fetchKindHistory(contactId, 5010, {
+    windowStart: lastOnlineSec,
+  })) {
     handleTriggerSignal(contactId, event.decryptedPayload as TriggerPayload);
   }
 
-  for await (const event of nostrClient.fetchKindHistory(contactId, 5011,
-    { windowStart: lastOnlineSec }
-  )) {
+  for await (const event of nostrClient.fetchKindHistory(contactId, 5011, {
+    windowStart: lastOnlineSec,
+  })) {
     handleArmStateSignal(contactId, event.decryptedPayload as ArmStatePayload);
   }
 }
@@ -1888,11 +1976,13 @@ Once RTC is open, all data and control requests flow over the data channel. The 
 ```
 
 **Responses:**
+
 - `segment-data` — binary chunk of segment (over separate data channel)
 - `coverage` — coverage map for timeline
 - `metadata` — footage refs, photo list, etc.
 
 **Live upgrade renegotiation** (in-band):
+
 ```
 Viewer sends: { type: 'live-request', channelId: 'video-1' } over RTC data channel
 Monitor responds: sends new offer via kind 5001 (isResponse=true, SDP with media tracks)
@@ -1913,18 +2003,18 @@ Each paired device stores two relay lists:
 ```typescript
 interface PairedDevice {
   pubkey: string;
-  relays: string[];                    // my inbound (where I listen for signals)
-  outbound: string[];                  // peer's inbound (where I send signals)
-  channelKeys: { inbound, outbound };
-  lastSeenAt?: number;                 // unix timestamp of last status signal (for health checking)
-  
+  relays: string[]; // my inbound (where I listen for signals)
+  outbound: string[]; // peer's inbound (where I send signals)
+  channelKeys: { inbound; outbound };
+  lastSeenAt?: number; // unix timestamp of last status signal (for health checking)
+
   // Relay migration state (persistent)
   relayProposal?: {
-    sessionId: string;                 // UUID tracking this proposal
-    newInbound: string[];              // relays I want to migrate to
-    proposedAt: number;                // timestamp (for debugging/observability)
+    sessionId: string; // UUID tracking this proposal
+    newInbound: string[]; // relays I want to migrate to
+    proposedAt: number; // timestamp (for debugging/observability)
   };
-  
+
   // ... other fields ...
 }
 ```
@@ -1941,6 +2031,7 @@ When a device wants to migrate its listening relays (e.g., relay shutting down, 
 4. Initiator commits migration after acknowledgement
 
 **Why this works:**
+
 - ✅ Communications never break (outbound to peer is unchanged)
 - ✅ Both devices can independently propose inbound changes
 - ✅ No "agreement phase" needed—proposal + proof of listening is sufficient
@@ -1964,6 +2055,7 @@ The Nostr stack is online only when there is something to do. `NostrClient.goOnl
 ## Summary: Communication Flows
 
 ### Pairing (Pre-connection)
+
 ```
 Monitor generates invite (relays included)
   ↓
@@ -1975,6 +2067,7 @@ Both online → peer-to-peer signals possible
 ```
 
 ### Real-time Status
+
 ```
 Monitor comes online → broadcasts status (isResponse: false)
   ↓
@@ -1984,6 +2077,7 @@ Both sides know: device is online
 ```
 
 ### RTC Handshake (Initiating Live View)
+
 ```
 Viewer sends kind 5001 isResponse=false (declares mode: 'data' or 'live')
   ↓
@@ -2003,6 +2097,7 @@ Media tracks added in-band
 ```
 
 ### Senstry Action Signal
+
 ```
 Trigger fires (pipeline: Sensor → Link → TriggerPublisher)
   ↓
@@ -2016,6 +2111,7 @@ Offline targets fetch on reconnect via fetchKindHistory(contactId, 5010, { windo
 ```
 
 ### Relay Migration (Dual-Listening, Autonomous Inbound)
+
 ```
 DeviceA wants to migrate from [relay-a-1] to [relay-a-2]
   ↓
@@ -2057,4 +2153,3 @@ If either device offline: relayProposal survives reload, retry on next startup
 ✅ **Offline-resilient** — Missed action signals retrieved via `fetchKindHistory` on reconnect  
 ✅ **Efficient** — Minimal Nostr events (handshake + presence + notifications); all footage data over RTC  
 ✅ **Flexible** — Action recipients configurable per pipeline action (all / specific / filtered by online state)
-

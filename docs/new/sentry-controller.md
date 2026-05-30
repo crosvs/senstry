@@ -1,4 +1,4 @@
-# SentrySection Controller Extraction
+# Sentry Pipeline Controllers
 
 ## Architecture
 
@@ -191,7 +191,7 @@ class RecordingController {
 
 ---
 
-## PinSegmentsController (optional, from SentrySection._handlePinSession)
+## PinSegmentsController
 
 Manages footage window pinning for `PinSegmentsAction`s.
 
@@ -208,7 +208,7 @@ Calls `pinSegmentsInRange(from, to, pinLifetimeSec)` internally. No external dep
 
 ---
 
-## CapturePhotosController (optional, from SentrySection._handleCaptureBurst)
+## CapturePhotosController
 
 Manages photo burst sessions for `CapturePhotosAction`s.
 
@@ -230,7 +230,7 @@ Calls `capturePhoto(stream, options)` and `saveSegment(blob, 'image/...', ...)` 
 
 ---
 
-## Thin SentrySection After Extraction
+## SentrySection.svelte
 
 After extraction, `SentrySection.svelte` becomes:
 
