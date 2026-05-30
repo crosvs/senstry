@@ -2,16 +2,16 @@
 
 ## Architecture
 
-**NostrController** exposes a peer-centric API to modules. Modules know only about paired devices — they never handle relay lists, channel keys, or rate-limit state directly. Two internal layers handle the translation.
+**NostrClient** exposes a peer-centric API to modules. Modules know only about paired contacts — they never handle relay lists, channel keys, or rate-limit state directly. Two internal layers handle the translation.
 
 ```
 Module
   │  "publish kind 5004 to peer X"
   │  "fetch kind 5005 history from peer X"
   ▼
-NostrController (peer-centric API)
+NostrClient (peer-centric API)
   │
-  ├── ContactManager                   ← paired devices + temp (giftwrap-derived) contacts
+  ├── ContactManager                   ← paired contacts + temp (TOTP-mailbox-derived) contacts
   │     paired: IDB-backed, ECDH keys, permanent
   │     temp:   memory-only, ephemeral keys, TTL
   │     never queried by modules directly
@@ -28,7 +28,7 @@ NostrController (peer-centric API)
 
 Each subsystem is independently testable:
 
-- **ContactManager** — unified registry for paired devices (permanent, ECDH keys, IDB) and temp contacts (ephemeral keys, memory-only TTL, giftwrap-derived). Source of truth for all relay and key lookups.
+- **ContactManager** — unified registry for paired contacts (permanent, ECDH keys, IDB) and temp contacts (ephemeral keys, memory-only TTL, TOTP-mailbox-derived). Source of truth for all relay and key lookups.
 - **RelayStateController** — per relay URL: cooldown, rate limit, failure count. Selects relay for publish; provides eligible set for fan-fetch.
 - **PublishQueue** — queue events with relay-safe re-enqueue on cooldown
 - **SubscriptionManager** — manage active subscriptions with kind multiplexing, dedup, T+0 enforced
@@ -52,7 +52,7 @@ class NostrClient {
   ) {}
 
   // Contact registry — both paired and temp use the same UUID-based contactId
-  registerPaired(device: PairedDevice): string; // returns UUID contactId
+  registerPaired(contact: PairedContact): string; // returns UUID contactId
   unregisterPaired(contactId: string): void;
   updatePairedRelays(contactId: string, newRelays: string[]): void; // updates stored inbound relay list; signal router re-subscribes to new list automatically
 
@@ -66,7 +66,13 @@ class NostrClient {
     onReady: (since: number) => void,
   ): void;
 
-  registerTempContact(rumor: GiftwrapRumor, ttlSeconds: number): string; // returns UUID contactId
+  registerTempFromMailbox(opts: {
+    senderEphemeralPubkey: string;  // sender's replyKey from mailbox payload
+    senderRelays: string[];
+    myListenRelays: string[];
+    expiresAt: number;              // unix timestamp
+    pubkey?: string;                // sender's real pubkey if known
+  }): string; // contactId
   expireTemp(contactId: string): void; // immediately discard a temp contact
   findContactsByPubkey(pubkey: string): ContactEntry[]; // check for existing contacts; used during pairing
   allContactIds(): string[]; // all registered contact UUIDs (paired + temp)
@@ -78,7 +84,14 @@ class NostrClient {
     kind: number,
     payload: object,
   ): Promise<void>; // time-sensitive
-  sendGiftWrap(contactId: string, payload: object): Promise<void>; // NIP-59 double-wrap applied automatically; payload is the plaintext rumor content
+
+  // TOTP mailbox — pre-contact delivery; separate from the signal router
+  subscribeToTOTPMailbox(
+    mailboxPrivkey: Uint8Array,
+    mailboxPubkey: string,
+    relays: string[],
+    onMessage: (decryptedPayload: object, senderEphemeralPubkey: string) => void,
+  ): () => void;
 
   // Signal router — T+0 across all contacts; decrypts before delivery
   startSignalRouter(
@@ -127,9 +140,8 @@ class NostrClient {
 
 **Publishing patterns:**
 
-- `publishSignal(contactId, kind, payload)` — queued; relay selected by `RelayStateController` (LRU-eligible)
+- `publishSignal(contactId, kind, payload)` — queued; relay selected by `RelayStateController` (LRU-eligible). Use for all post-contact communication.
 - `publishSignalDirect(contactId, kind, payload)` — immediate; for time-sensitive signals
-- `sendGiftWrap(contactId, payload)` — NIP-59 layers; uses `outboundChannelPubkey` if set, else addresses to `pubkey`
 - Relay selection, key lookup, and encryption are always internal
 
 **Subscribing:**
@@ -140,6 +152,11 @@ class NostrClient {
 **History:**
 
 - `fetchKindHistory(contactId, kind, opts)` — fan-fetches `limit:1` per round; relay list and keys resolved internally
+
+**TOTP mailbox:**
+
+- `subscribeToTOTPMailbox(mailboxPrivkey, mailboxPubkey, relays, onMessage)` — subscribes to kind 5201 events tagged `#p: mailboxPubkey`. NIP-44 decrypts each using `mailboxPrivkey` + `event.pubkey` (sender's ephemeral key). Returns cleanup function — caller must invoke it after `TempContact` is established. This subscription is separate from the signal router; it handles only pre-contact delivery.
+- `registerTempFromMailbox(opts)` — creates a `TempContact` from a validated TOTP mailbox message. The sender's `ephemeralPubkey` becomes the `outboundChannelPubkey`. A fresh inbound channel keypair is generated. Memory-only, expires at `expiresAt`.
 
 **Pairing with existing temp contact:**
 
@@ -159,29 +176,29 @@ existing
 
 ### ContactManager
 
-Internal registry for all contacts — both permanent paired devices and temporary ephemeral contacts derived from gift wraps. No module accesses this directly; `NostrClient` methods look up what they need here.
+Internal registry for all contacts — both permanent paired contacts and temporary ephemeral contacts derived from TOTP mailbox messages. No module accesses this directly; `NostrClient` methods look up what they need here.
 
 ```typescript
 // Shared interface — NostrClient sees no difference between paired and temp contacts
 interface ContactEntry {
   contactId: string; // UUID — generated at creation, stable for lifetime of contact
 
-  pubkey: string; // real identity; used to detect duplicates across paired/temp
+  pubkey?: string; // may be absent for TempContacts where only the ephemeral key is known
 
   inboundChannelPubkey: string; // paired: ECDH-derived; temp: freshly generated ephemeral
   inboundChannelPrivkey: Uint8Array; // held in memory; used to decrypt incoming events
-  outboundChannelPubkey: string | null; // null → address to pubkey directly (initial contact)
+  outboundChannelPubkey: string; // paired: ECDH-derived; temp: sender's ephemeralPubkey from mailbox payload
 
   inboundRelayList: string[]; // relays WE listen on for this contact
   outboundRelayList: string[]; // relays WE send to in order to reach this contact
 
   addedAt: number;
-  expiresAt?: number; // absent = permanent (paired); set = temp (giftwrap-derived)
+  expiresAt?: number; // absent = permanent (paired); set = temp (TOTP-mailbox-derived)
 }
 
 class ContactManager {
-  // Paired device management (persistent, IDB-backed)
-  registerPaired(device: PairedDevice): string; // returns new UUID contactId
+  // Paired contact management (persistent, IDB-backed)
+  registerPaired(contact: PairedContact): string; // returns new UUID contactId
   unregisterPaired(contactId: string): void;
   updatePairedRelays(contactId: string, newInboundRelays: string[]): void; // relay migration commit
 
@@ -200,24 +217,24 @@ class ContactManager {
 
 **Paired entries:**
 
-- Registered from `PairedDevice` records on startup; each gets a UUID `contactId`
+- Registered from `PairedContact` records on startup; each gets a UUID `contactId`
 - ECDH-derived channel keys, cached on register
 - No `expiresAt` — permanent until unpaired
 - Relay migration → `updatePairedRelays(contactId, ...)` → next operation picks up new list automatically
 
-**Temp entries (gift-wrap-derived):**
+**Temp entries (TOTP-mailbox-derived):**
 
-- Created when a gift wrap is received and decrypted; each gets a UUID `contactId`
-- `inboundChannelPubkey/Privkey` freshly generated at creation
-- `outboundChannelPubkey` = `replyKey` from the gift wrap rumor; `null` if initiating without prior wrap
-- Memory-only; discarded when `expiresAt` passes
+- Created via TOTP mailbox receipt (kind 5201) after TOTP credential validation; each gets a UUID `contactId`
+- Uses freshly generated ephemeral channel keypair (`inboundChannelPubkey/Privkey` generated at creation)
+- `outboundChannelPubkey` = sender's `ephemeralPubkey` from the mailbox payload
+- Memory-only, not persisted to IDB; discarded when `expiresAt` passes
 - Multiple temp entries may share the same `pubkey` — each has its own UUID
 
 **Pairing handshake — duplicate detection:**
 When pairing completes, `ContactManager.findByPubkey(pubkey)` checks whether a temp contact already exists for that real identity (e.g. a TOTP session was in progress before pairing finished). The controller decides whether to expire the temp entry, carry over its relay/key state, or let both coexist until the temp expires naturally.
 
 **Signal routing:**
-Incoming events carry either an `authors` pubkey (paired signals) or a `#p` tag (gift wraps) that matches an `inboundChannelPubkey`. `findByInboundKey()` maps that back to a `contactId`, which is what the signal router delivers to `onSignal`.
+Incoming events carry an `authors` pubkey that matches an `inboundChannelPubkey`. `findByInboundKey()` maps that back to a `contactId`, which is what the signal router delivers to `onSignal`.
 
 **Signal router coverage:**
 
@@ -584,7 +601,7 @@ If peer A and peer B both list `wss://relay-x.com`, a publish to peer A that con
 
 Subscriptions open at T+0 — `since: Math.floor(Date.now() / 1000)` — and never replay historical events. When a module needs to look back in time, it calls `fetchKindHistory()` explicitly with a specific goal, iterates until it finds what it needs, then stops.
 
-This is the **only** model for consuming Nostr events in Senstry. No module implements its own fetch loop or time-window strategy. All of that logic lives in `NostrController`.
+This is the **only** model for consuming Nostr events in Senstry. No module implements its own fetch loop or time-window strategy. All of that logic lives in `NostrClient`.
 
 **Why T+0 only subscriptions:**
 
@@ -599,7 +616,7 @@ This is the **only** model for consuming Nostr events in Senstry. No module impl
 
 ---
 
-#### `NostrController.fetchKindHistory()` — Progressive, Caller-Controlled
+#### `NostrClient.fetchKindHistory()` — Progressive, Caller-Controlled
 
 ```typescript
 interface HistoryFetchOptions {
@@ -712,12 +729,13 @@ for await (const event of nostrClient.fetchKindHistory(contactId, 5001, {
 
 #### Per-Kind Fetch Strategies
 
-| Kind                   | When to call fetchKindHistory | Goal                      | Stop condition                                |
-| ---------------------- | ----------------------------- | ------------------------- | --------------------------------------------- |
-| 5001 (RTC Session)     | Reconnecting mid-session      | Find active session offer | Found matching `sessionId`                    |
-| 5004 (Status)          | Came online after absence     | Last known peer state     | First announcement (`isResponse=false`) found |
-| 5005 (Relay Migration) | Startup check                 | Pending relay migration   | First unacknowledged proposal found           |
-| 5010/5011 (Actions)    | Came online after absence     | All missed actions        | `windowStart` reached (full range)            |
+| Kind                   | When to call fetchKindHistory   | Goal                                  | Stop condition                                |
+| ---------------------- | ------------------------------- | ------------------------------------- | --------------------------------------------- |
+| 5001 (RTC Session)     | Reconnecting mid-session        | Find active session offer             | Found matching `sessionId`                    |
+| 5004 (Status)          | Came online after absence       | Last known peer state                 | First announcement (`isResponse=false`) found |
+| 5005 (Relay Migration) | Startup check                   | Pending relay migration               | First unacknowledged proposal found           |
+| 5006 (Remote Command)  | Startup or reconnect            | Pending unacknowledged commands       | Newest unacknowledged command per contact     |
+| 5010/5011 (Actions)    | Came online after absence       | All missed actions                    | `windowStart` reached (full range)            |
 
 Modules that need "the most recent X" break on first match. Modules that need "all events in a range" iterate the full generator to `windowStart`. In both cases the fan-fetch behavior is invisible to the caller — events arrive one at a time, deduplicated.
 
@@ -743,7 +761,7 @@ The signal router is managed entirely inside `NostrClient`. Modules start it wit
 // Start the signal router — all relay subscriptions managed internally
 nostrClient.startSignalRouter((contactId, kind, payload) => {
   // contactId: UUID identifying which contact sent this (paired or temp)
-  // kind: 5001–5005 (connection/presence) or 5010–5011 (action notifications)
+  // kind: 5001–5005 (connection/presence), 5006 (remote command → RemoteCommandController), or 5010–5011 (action notifications)
   // payload: already decrypted and parsed
   routeSignal(contactId, kind, payload);
 });
@@ -756,6 +774,9 @@ onDestroy(() => nostrClient.stopSignalRouter());
 
 - Subscribes T+0 on all relays in `ContactManager.allMyInboundRelays()` — covers both paired and temp contacts
 - Filters for all registered peers' inbound channel keys
+- Subscription kind filter: `[5001, 5002, 5003, 5004, 5005, 5006, 5010, 5011]`
+- Kind 5006 (Remote Command) events are delivered via `onSignal` to `RemoteCommandController` (see sentry-controller.md)
+- Kind 5201 (TOTP Mailbox) events are NOT routed through the signal router — handled by the separate `subscribeToTOTPMailbox` subscription
 - Deduplicates by event ID
 - Decrypts and delivers to `onSignal` callback
 - When a peer is registered or updated (`updatePairedRelays`), the router re-subscribes using the transition lifecycle: a new REQ is opened and relay-verified before the old one closes, ensuring no coverage gap
@@ -971,15 +992,15 @@ describe("NostrClient (integration)", () => {
 
 ## Key Invariants
 
-- **Modules interact with contact identity only** — no relay lists, channel keys, NIP-59 layers, or raw Nostr events outside `NostrClient`. `ContactManager` holds all relay and key state internally.
-- **`ContactManager` is the single source of truth** — covers paired devices (permanent, ECDH keys, IDB) and temp contacts (ephemeral keys, memory-only, giftwrap-derived). Relay migration flows through `updatePairedRelays()`; temp contact expiry is automatic. All operations resolve through it.
-- **Gift wrap and channel-key contacts are unified** — `sendGiftWrap(contactId, payload)` and `publishSignalDirect(contactId, kind, payload)` use the same routing. Null `outboundChannelKey` means address to real pubkey (initial contact); non-null means address to channel key (paired or gift-wrap reply).
+- **Modules interact with contact identity only** — no relay lists, channel keys, or raw Nostr events outside `NostrClient`. `ContactManager` holds all relay and key state internally.
+- **`ContactManager` is the single source of truth** — covers paired contacts (permanent, ECDH keys, IDB) and temp contacts (ephemeral keys, memory-only, TOTP-mailbox-derived). Relay migration flows through `updatePairedRelays()`; temp contact expiry is automatic. All operations resolve through it.
+- **All contacts (TempContact and PairedContact) have non-null `outboundChannelPubkey`** — there is no null-channel case. The null-channel case was removed along with the pre-TOTP-mailbox initial contact pattern. Use `publishSignal(contactId, kind, payload)` for all post-contact communication.
 - **Never publish when `nostrOnline = false`** — gate checked before any outbound operation
 - **`publishSignal` is the default** — `publishSignalDirect` only for time-sensitive signals (status, RTC handshake)
 - **Subscriptions are T+0 only** — signal router always opens with `since: now`; no history replay
 - **History via `fetchKindHistory(contactId, kind)`** — relay and channel key resolved internally; caller passes contactId and kind only
 - **Single-relay writes, fan-fetch reads** — publish goes to one relay (LRU-eligible from peer's list via `RelayStateController`); `fetchKindHistory` fan-fetches `limit:1` from all non-cooldown relays per round, deduplicates, yields one at a time
 - **Cooldown is global per relay URL** — `RelayStateController` is shared across all peers and all operation types; one peer's rate-limit hit affects relay availability for all other peers on that relay
-- **Signal routing is by kind** — each signal type has its own kind (5001–5005 for connection/presence, 5010–5011 for action notifications); callbacks are dispatched by kind number, never by decrypted payload content. At the relay layer, the `SubscriptionManager` may group multiple kinds into one REQ for efficiency — this is invisible to callers.
+- **Signal routing is by kind** — each signal type has its own kind (5001–5006 for connection/presence/remote-command, 5010–5011 for action notifications); callbacks are dispatched by kind number, never by decrypted payload content. Kind 5201 (TOTP Mailbox) is not in the signal router — it uses a separate one-shot `subscribeToTOTPMailbox` subscription. At the relay layer, the `SubscriptionManager` may group multiple kinds into one REQ for efficiency — this is invisible to callers.
 - **`isResponse` replaces request/response type pairs** — `false` = initiating party, `true` = responding party
 - **All queue operations are non-blocking** — `publishSignal` returns immediately; events flow out on timer with cooldown-aware relay selection

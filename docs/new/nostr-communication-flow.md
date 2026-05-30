@@ -6,10 +6,48 @@
 
 Senstry uses Nostr for two purposes:
 
-1. **Device Pairing** — QR-based initial device discovery and gift-wrap-based invite delivery (ephemeral keys, temp contacts). Real pubkeys are used only at this layer.
-2. **Peer-to-Peer Signals** — All post-pairing communication, including connection setup, presence, relay migration, and action notifications. Every event is NIP-44 encrypted over ECDH channel keys. Real pubkeys never appear.
+1. **Device Pairing** — QR-based initial device discovery and TOTP-mailbox-based invite delivery for Nostr-delivered invites (ephemeral keys, temp contacts). Real pubkeys are used only at this layer.
+2. **Peer-to-Peer Signals** — All post-contact communication, including connection setup, presence, relay migration, and action notifications. Every event is NIP-44 encrypted over ECDH channel keys. Real pubkeys never appear.
 
-All post-pairing Nostr events — without exception — are signed with a contact's channel key, not their identity key. This applies to RTC handshake signals, status, relay migration proposals, and sensor-triggered action notifications alike.
+All post-contact Nostr events — whether TempContact or PairedContact — are signed with a contact's channel key, not their identity key. This applies to RTC handshake signals, status, relay migration proposals, and sensor-triggered action notifications alike.
+
+---
+
+## Contact Model
+
+### TempContact vs PairedContact
+
+Every communication peer in Senstry is represented as a contact. There are two contact types:
+
+**TempContact** — created via TOTP mailbox (kind 5201). The contact uses a fresh ephemeral channel keypair generated at creation time, is held in memory only (not persisted to IDB), and expires once the TTL elapses or the pairing flow completes. TempContacts are one-shot: each TOTP mailbox interaction creates exactly one TempContact, and the mailbox subscription is closed immediately after.
+
+**PairedContact** — created by completing an invite flow (QR, URI, or Nostr-delivered). The contact uses ECDH-derived channel keys (deterministic from both real pubkeys), is persisted to IDB, and has no expiry. PairedContacts survive app restarts; their channel keys are re-derived from stored identity pubkeys on load.
+
+Both types expose an identical API. Callers never inspect the contact type — they pass a `contactId` and the contact manager resolves the correct keys and relays internally.
+
+### Unified publishSignal API
+
+```typescript
+// The same call works for any contact — TempContact or PairedContact.
+// Relay selection and key lookup are internal to ContactManager.
+await nostrClient.publishSignal(contactId, kind, payload);
+```
+
+`publishSignal` resolves the contact's outbound channel keypair and relay list, NIP-44 encrypts the payload, signs the event with the channel key, and delivers to the selected relay. The kind number determines the signal type; the contactId determines routing.
+
+### What the Relay Sees
+
+For any post-contact signal — whether from a TempContact or PairedContact — the relay sees only:
+
+| Field     | Value                                                                   |
+| --------- | ----------------------------------------------------------------------- |
+| `pubkey`  | Pseudonymous channel pubkey (ECDH-derived or ephemeral; not real pubkey) |
+| `kind`    | Signal kind number (5001–5006, 5010–5011)                               |
+| `created_at` | Honest timestamp                                                     |
+| `tags`    | Empty array                                                             |
+| `content` | NIP-44 ciphertext (opaque to relay)                                     |
+
+No real pubkeys appear. No p-tags appear in post-contact signals. The relay cannot determine who is communicating, in which direction, or what the content contains.
 
 ---
 
@@ -322,7 +360,7 @@ The **QR method** is a manual, one-time pairing mechanism designed for **initial
 - ✅ No gift-wrap needed (real pubkeys stay offline until acceptance)
 - ✅ Ephemeral invite keys — never reused
 - ✅ Direct ECDH + NIP-44 encryption (single layer)
-- ✅ Consistent with post-pairing channel key architecture
+- ✅ Consistent with post-contact channel key architecture
 - ✅ QR encodes public data only (no secrets)
 - ✅ Offline-tolerant (acceptance can be retried)
 
@@ -356,7 +394,7 @@ The **QR method** is a manual, one-time pairing mechanism designed for **initial
        │ 9.  Monitor receives on relays (listening)              │
        │ 10. Decrypt with ephemeral_invite_privkey               │
        │ 11. Extract viewer's real pubkey + relays               │
-       │ 12. Store as pairedDevices[viewer_pubkey]               │
+       │ 12. Store as pairedContacts[viewer_pubkey]               │
        │                                                         │
        │ 13. Derive channel keys (ECDH)                          │
        │ 14. Both derive identical keys (independent)            │
@@ -553,7 +591,7 @@ async function acceptInviteFromQR(
     qrPayload.pk,
   );
 
-  await addPairedDevice({
+  await addPairedContact({
     pubkey: qrPayload.pk, // monitor's real pubkey
     nickname: qrPayload.label || generateNickname(),
     relays: qrPayload.relays, // monitor's relays
@@ -674,7 +712,7 @@ export async function generateQRAndListenForAcceptance(
           acceptance.viewerPubkey,
         );
 
-        await addPairedDevice({
+        await addPairedContact({
           pubkey: acceptance.viewerPubkey,
           nickname: generateNickname(),
           relays: acceptance.viewerRelays,
@@ -764,93 +802,6 @@ const viewerOutbound = deriveChannelKey(
 - The temporary channel key for acceptance is **ephemeral** — only used once, then discarded
 - The post-pairing keys are **derived from real identities**, not stored — re-derived on app restart
 
-### Gift Wrap Structure for Non-Paired Communication
-
-Nostr-delivered invites, TOTP-secured instructions, and any other communication with a non-paired device use NIP-59 gift wrap. This is the only mechanism in Senstry that uses gift wrap — signals between paired devices never use it.
-
-**Three-layer structure:**
-
-```
-Gift Wrap (kind 1059)
-  pubkey: random one-time key         ← relay sees nothing about sender identity
-  p tag: recipient's real pubkey      ← routing only; relay delivers to this pubkey's subscribers
-  content: NIP-44(random key → recipient pubkey, Seal)
-
-  └── Seal (kind 13)
-        pubkey: sender's real pubkey  ← recipient learns sender identity after decryption
-        content: NIP-44(sender privkey → recipient pubkey, Rumor)
-        created_at: randomized ±30 minutes
-
-        └── Rumor (unsigned kind 5200 or similar)
-              pubkey: sender's real pubkey
-              created_at: honest timestamp
-              content: {
-                type: 'pairing-invite' | 'totp-instruction' | ...
-                replyKey: <sender's ephemeral pubkey>,   ← recipient's outboundChannelKey
-                replyRelays: [...],                       ← recipient's outboundRelayList
-                ttl: 3600,
-                credential?: '...',                       // TOTP code/seed if secured
-                ...payload
-              }
-```
-
-**Timestamp handling:** the seal and gift wrap layers use randomized `created_at` (within ±30 minutes) to protect against time-analysis. The rumor's `created_at` is honest. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
-
-### Temp Contact Creation on Gift Wrap Receipt
-
-When a device receives and decrypts a gift wrap, it creates a temp contact entry in `ContactManager`:
-
-```typescript
-// After decrypting the gift wrap and seal:
-const rumor = decryptGiftwrap(giftWrapEvent, myPrivkey);
-
-const tempContactId = nostrClient.registerTempContact({
-  pubkey: seal.pubkey, // sender's real pubkey (from decrypted seal)
-
-  inboundChannelKey: generateKeypair(), // fresh ephemeral key; privkey held in memory
-  // pubkey included in our response as return address
-
-  outboundChannelKey: rumor.content.replyKey, // sender's ephemeral key from rumor
-  // null if sender didn't include one
-  inboundRelayList: [myRelay], // where WE listen for their response
-  outboundRelayList: rumor.content.replyRelays, // where WE send our response
-
-  addedAt: Date.now(),
-  expiresAt: Date.now() + rumor.content.ttl * 1000,
-});
-
-// Now respond using the same API as a paired device:
-await nostrClient.sendGiftWrap(tempContactId, {
-  type: "totp-response",
-  replyKey: tempContact.inboundChannelKey.pubkey, // included automatically by sendGiftWrap
-  replyRelays: tempContact.inboundRelayList, // included automatically
-  result: "accepted",
-  // ...
-});
-```
-
-**When the sender receives the response:**
-The response gift wrap is addressed to `replyKey` (the sender's original ephemeral key). The sender creates their own temp contact entry pointing back at the responder's `inboundChannelKey`:
-
-```typescript
-// Sender receives response addressed to their ephemeral reply key
-// seal.pubkey = responder's real pubkey
-// rumor.content.replyKey = responder's inboundChannelKey.pubkey
-const tempContactId = nostrClient.registerTempContact({
-  pubkey: seal.pubkey,
-  inboundChannelKey: myOriginalEphemeralKey,  // sender already holds this privkey
-  outboundChannelKey: rumor.content.replyKey, // responder's return address
-  inboundRelayList: [myRelay],
-  outboundRelayList: rumor.content.replyRelays,
-  addedAt: Date.now(),
-  expiresAt: ...,
-});
-```
-
-Both sides now have symmetric temp contact entries pointing at each other's ephemeral keys. Subsequent messages use `sendGiftWrap(contactId, payload)` — identical to communicating with a paired device.
-
-**Multiple temp contacts with the same pubkey:** each gift wrap interaction generates a unique `inboundChannelKey`, so each has a distinct `contactId`. Multiple parallel TOTP sessions with the same real identity are tracked separately.
-
 ### Architectural Clarity: TOTP is NOT a Pairing Method
 
 **Critical distinction:**
@@ -877,6 +828,211 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
 
 **Example:** A login flow uses the same TOTP infrastructure (generate seed, validate code, rate limit attempts) without touching the pairing protocol at all. Conversely, QR-based pairing does not require TOTP; viewers can accept invites without credentials.
 
+**Dual-role exception — TOTP Mailbox:** In the TOTP Mailbox delivery mechanism (kind 5201), the TOTP seed serves two distinct roles simultaneously. First, it is the routing keypair source: `mailboxPrivkey = HKDF(totpSeed, "senstry-v1-mailbox")` determines which Nostr pubkey the recipient subscribes to. Second, it is the credential source: the sender includes a TOTP code derived from the same seed in the payload, and the recipient validates it before creating a TempContact. These two roles do not conflict — routing and credential validation use the same seed but operate on different derived values and at different stages of the flow.
+
+---
+
+## Contact Creation: TOTP Mailbox
+
+### Overview
+
+The TOTP Mailbox is the mechanism for Nostr-delivered contact creation when two parties share only a TOTP seed out-of-band. It replaces any need for gift wrap: instead of routing to a recipient's real Nostr pubkey (which would expose identity on the relay), the sender derives a one-time mailbox pubkey from the shared TOTP seed and publishes there. The relay sees only a pseudonymous pubkey and an encrypted blob. No real pubkeys appear anywhere in the delivery event.
+
+The mailbox is one-shot: once the recipient decrypts and validates the event, the mailbox subscription closes and the keypair is discarded. The result is a TempContact with an ephemeral channel keypair, valid for communication until the TTL expires or pairing completes.
+
+### Mailbox Keypair Derivation
+
+Both sender and recipient independently derive the same mailbox keypair from the shared TOTP seed using HKDF:
+
+```typescript
+import { hkdf } from "@noble/hashes/hkdf";
+import { sha256 } from "@noble/hashes/sha256";
+import { secp256k1 } from "@noble/curves/secp256k1";
+
+/**
+ * Derive the mailbox keypair from a TOTP seed.
+ * Both sender (to address the event) and recipient (to subscribe) derive the same keypair.
+ *
+ * @param totpSeed  Raw 20-byte TOTP seed
+ * @returns { mailboxPrivkey: Uint8Array, mailboxPubkey: string }
+ */
+function deriveMailboxKeypair(totpSeed: Uint8Array): {
+  mailboxPrivkey: Uint8Array;
+  mailboxPubkey: string;
+} {
+  // HKDF-SHA256: expand seed into 32-byte privkey material
+  const mailboxPrivkey = hkdf(sha256, totpSeed, undefined, "senstry-v1-mailbox", 32);
+  // Derive the corresponding secp256k1 pubkey (Schnorr / x-only, 32 bytes → 64-char hex)
+  const mailboxPubkey = secp256k1.getPublicKey(mailboxPrivkey, true).slice(1);
+  return {
+    mailboxPrivkey,
+    mailboxPubkey: Buffer.from(mailboxPubkey).toString("hex"),
+  };
+}
+```
+
+### Sender Behavior
+
+The sender (e.g., a monitor publishing an invite) creates a fresh ephemeral keypair for each delivery. This ephemeral pubkey becomes the return address — the `replyKey` — that the recipient will use as their outbound channel pubkey to reach the sender:
+
+```typescript
+/**
+ * Publish a TOTP mailbox delivery event (kind 5201).
+ *
+ * @param totpSeed       Shared TOTP seed (20 bytes)
+ * @param invitePayload  Invite data to deliver (type, relays, ttl, etc.)
+ * @param publishRelays  Relays where the recipient is expected to subscribe
+ */
+async function publishMailboxDelivery(
+  totpSeed: Uint8Array,
+  invitePayload: object,
+  publishRelays: string[],
+): Promise<void> {
+  // Derive mailbox pubkey (recipient subscribes to this)
+  const { mailboxPubkey } = deriveMailboxKeypair(totpSeed);
+
+  // Generate a fresh ephemeral keypair — this is the sender's return address
+  const ephemeralPrivkey = generateSecretKey();
+  const ephemeralPubkey = getPublicKey(ephemeralPrivkey);
+
+  // Generate a TOTP code from the seed for this delivery
+  const totpCode = generateCurrentTOTPCode(totpSeed); // 6-digit RFC 6238 code
+
+  const content = JSON.stringify({
+    ...invitePayload,
+    replyKey: ephemeralPubkey, // sender's return address (recipient sends back here)
+    credential: totpCode,     // TOTP code for validation at recipient
+    created_at: Math.floor(Date.now() / 1000),
+  });
+
+  // NIP-44 encrypt content to the mailbox pubkey (recipient derives decryption key)
+  const conversationKey = getConversationKey(ephemeralPrivkey, mailboxPubkey);
+  const encryptedContent = nip44Encrypt(content, conversationKey);
+
+  // Sign with the ephemeral key (not the sender's real key)
+  const event = finalizeEvent(
+    {
+      kind: 5201,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["p", mailboxPubkey]], // routing tag — recipient subscribes to this pubkey
+      content: encryptedContent,
+    },
+    ephemeralPrivkey,
+  );
+
+  for (const relay of publishRelays) {
+    await publish(event, { relay, timeout: 5000 });
+  }
+}
+```
+
+The sender's real identity key never touches this event. The relay sees: ephemeral pubkey, kind 5201, a `#p` tag pointing to the mailbox pubkey, and opaque ciphertext.
+
+### Recipient Behavior
+
+The recipient derives the same mailbox keypair and opens a one-shot subscription. On receiving a kind 5201 event, it decrypts, validates the TOTP credential, and creates a TempContact:
+
+```typescript
+/**
+ * Subscribe to the TOTP mailbox and handle the first valid delivery.
+ * The subscription closes immediately after a valid event is processed.
+ *
+ * @param totpSeed      Shared TOTP seed (20 bytes)
+ * @param listenRelays  Relays to subscribe on
+ * @param onDelivery    Called with TempContact once validated
+ */
+async function subscribeToTOTPMailbox(
+  totpSeed: Uint8Array,
+  listenRelays: string[],
+  onDelivery: (tempContactId: string) => void,
+): Promise<{ unsubscribe: () => void }> {
+  const { mailboxPrivkey, mailboxPubkey } = deriveMailboxKeypair(totpSeed);
+
+  const handle = nostrClient.requestSubscription(
+    [{ kinds: [5201], "#p": [mailboxPubkey] }],
+    async (event) => {
+      try {
+        // Decrypt: sender used ephemeral key; we decrypt with mailboxPrivkey
+        const conversationKey = getConversationKey(mailboxPrivkey, event.pubkey);
+        const plaintext = nip44Decrypt(event.content, conversationKey);
+        const payload = JSON.parse(plaintext);
+
+        // Validate freshness (reject events older than TTL)
+        const age = Math.floor(Date.now() / 1000) - payload.created_at;
+        if (age > (payload.ttl ?? 3600)) {
+          dbg("warn", "mailbox", "kind 5201 event expired, ignoring");
+          return;
+        }
+
+        // Validate TOTP credential
+        const credentialValid = verifyTOTPCode(totpSeed, payload.credential);
+        // credentialId is looked up from the stored TOTP seed registry
+        const credentialId = await lookupCredentialIdBySeed(totpSeed);
+        await recordTOTPAttempt(credentialId, credentialValid);
+
+        if (!credentialValid) {
+          dbg("warn", "mailbox", "kind 5201 TOTP validation failed");
+          return;
+        }
+
+        // Create TempContact — ephemeral channel keypair, memory-only
+        const inboundChannelKey = generateKeypair(); // fresh ephemeral key
+        const tempContactId = nostrClient.registerTempFromMailbox({
+          senderEphemeralPubkey: payload.replyKey, // sender's return address = our outbound
+          senderRelays: payload.replyRelays,
+          myListenRelays: listenRelays,
+          expiresAt: Date.now() + (payload.ttl ?? 3600) * 1000,
+        });
+
+        // Close mailbox subscription — one-shot; done
+        handle.unsubscribe();
+
+        onDelivery(tempContactId);
+      } catch {
+        // Decryption failure or parse error — not for us, or corrupt; skip silently
+      }
+    },
+    (_since) => {},
+  );
+
+  return { unsubscribe: () => handle.unsubscribe() };
+}
+```
+
+### Nostr-Delivered Invite Flow
+
+When a monitor wants to send a pairing invite over Nostr (rather than via QR), the flow uses the TOTP mailbox for delivery:
+
+1. Monitor and viewer share a TOTP seed out-of-band (e.g., verbal exchange, QR of just the seed, secure messaging app).
+2. Monitor calls `publishMailboxDelivery(totpSeed, invitePayload, relays)` — publishes kind 5201 addressed to `mailboxPubkey`.
+3. Viewer calls `subscribeToTOTPMailbox(totpSeed, relays, onDelivery)` — subscribes to `#p: mailboxPubkey`.
+4. Viewer receives kind 5201, decrypts, validates TOTP credential → creates TempContact.
+5. Viewer sends kind 5100 (QR/Mailbox Acceptance) over the TempContact channel keys — same acceptance format as QR pairing, same `publishSignal(tempContactId, 5100, acceptancePayload)` call.
+6. Monitor receives kind 5100 over the TempContact's inbound channel, validates, derives ECDH channel keys, stores as PairedContact.
+7. Both sides now have a PairedContact. The TempContact on the viewer side is replaced by the PairedContact entry.
+
+### Security Properties
+
+| Property | TOTP Mailbox (Kind 5201) |
+| -------- | ------------------------ |
+| Relay sees recipient identity | No — mailbox pubkey is derived from seed, not real pubkey |
+| Relay sees sender identity | No — sender signs with ephemeral key |
+| Delivery routable without real pubkey | Yes — `#p: mailboxPubkey` is the routing tag |
+| Credential bound to delivery | Yes — TOTP code in payload, validated before TempContact is created |
+| Replay protection | Yes — TOTP code expires (30s window); payload TTL enforced |
+| Real pubkeys on relay | No — first real pubkey exposure is in kind 5100 acceptance (signed with ephemeral key) |
+| One-shot | Yes — mailbox subscription closes after first valid delivery |
+
+### Recovery Scenarios
+
+**Event lost in transit:** Sender republishes kind 5201 with a fresh TOTP code. The recipient's mailbox subscription is still open (until TTL elapses). As long as the TOTP seed is the same, the new event routes to the same mailbox pubkey.
+
+**TOTP code expired:** If the recipient processes the event after the 30-second code window, validation fails. The sender republishes a new kind 5201 event with the current TOTP code. No state needs to be reset — each kind 5201 event is self-contained.
+
+**Recipient offline:** The kind 5201 event sits on the relay. When the recipient comes online and opens the mailbox subscription, the relay delivers the stored event. If the event's `created_at` is within TTL, it is processed normally. If the TTL has elapsed, the recipient ignores it and the sender must republish.
+
+**Relay does not support #p tag filtering:** The mailbox mechanism requires relay support for `#p` tag queries. If a relay does not support it, the kind 5201 event is not delivered via subscription. The fallback is to use a different relay that supports tag filtering, or to fall back to QR-based pairing.
+
 ---
 
 ## TOTP Integration with Pairing Methods
@@ -895,14 +1051,14 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
 ### Nostr-Based Pairing
 
 - **TOTP is required**
-- **Rationale:** Nostr-delivered invites travel on public relays. TOTP validates that the acceptance came from someone who knows the shared secret (the viewer who is authorized to pair), not from relay surveillance.
+- **Rationale:** Nostr-delivered invites travel on public relays. The TOTP seed serves dual roles: it derives the mailbox keypair used to route the invite to the correct recipient, and it provides the credential that proves the accepting device is authorized. No real pubkeys appear on the relay.
 - **Flow:**
-  1. Monitor publishes gift-wrap invite → derives TOTP seed from ephemeral invite key
-  2. Monitor embeds TOTP code (6 digits) in invite payload
-  3. Viewer receives gift-wrap → extracts invite + TOTP code
-  4. Viewer enters TOTP code in app (or app auto-fills if from QR/direct URI)
-  5. Acceptance message includes TOTP code as proof of authorization
-  6. Monitor validates TOTP before storing pairing
+  1. Monitor derives mailbox keypair from TOTP seed via HKDF
+  2. Monitor publishes kind 5201 event to mailboxPubkey with TOTP credential in payload
+  3. Viewer subscribes to `#p: mailboxPubkey`, receives and decrypts event
+  4. Viewer validates TOTP credential → creates TempContact
+  5. Viewer sends acceptance (kind 5100) over TempContact channel keys
+  6. Monitor validates acceptance and promotes to PairedContact
 
 ### Programmatic Pairing (API / Headless Access)
 
@@ -918,7 +1074,7 @@ Both sides now have symmetric temp contact entries pointing at each other's ephe
 | Pairing Method | TOTP | Reason |
 |---|---|---|
 | QR-based | Optional | Ephemeral + air-gapped + short TTL |
-| Nostr-delivered | Required | Relays are public; TOTP validates recipient authorization |
+| Nostr-delivered | Required | TOTP seed derives mailbox keypair for delivery; credential in payload authorizes the action |
 | Programmatic API | Required | Stateless; TOTP is the shared secret |
 
 ### Acceptance Message Format
@@ -1001,62 +1157,13 @@ interface QRAcceptancePayload {
 - Monitor can no longer decrypt acceptances for that QR
 - **Recovery:** Monitor stops listening for that QR after TTL expires. Viewer will notice pairing didn't complete and should ask monitor to generate a new invite.
 
-### Why No Gift-Wrap
-
-Gift-wrap (NIP-59) is **not needed** for QR-based pairing:
-
-| Aspect                    | Gift-wrap                                                  | QR Method                                                |
-| ------------------------- | ---------------------------------------------------------- | -------------------------------------------------------- |
-| **Purpose**               | Hide recipient and content from relays                     | Hide acceptance content from relays                      |
-| **Overhead**              | ~20% larger (double-encrypted, sealed, wrapped)            | Single NIP-44 layer                                      |
-| **Relay cost**            | Expensive: must return all gift-wraps meant for recipient  | Cheap: filter by kind (5100) + tag query                 |
-| **Decryption complexity** | 3-layer: unwrap → unseal → decrypt                         | 1-layer: decrypt                                         |
-| **Real pubkey exposure**  | Hidden until after unwrap                                  | Signed with ephemeral key; revealed in encrypted content |
-| **Scalability**           | Grows with pairing count (each pairing adds subscriptions) | Ephemeral per-invite (single listening window)           |
-
-**Why QR method is simpler:**
-
-1. Monitor generates ephemeral key **for this specific invite only**
-2. Viewer derives temporary channel key from ephemeral pubkey
-3. Viewer publishes acceptance encrypted with that temporary key
-4. Monitor decrypts with ephemeral privkey
-5. Once acceptance is received, ephemeral key is discarded
-
-No need for the full NIP-59 machinery because we're not building a long-term encrypted channel yet — we're just bridging the gap between QR scanning and deriving the real channel keys.
-
 ## TOTP: Remote Instruction Authorization
 
 ### Overview
 
-**TOTP** is a general-purpose credential validation protocol (RFC 6238 time-based one-time passwords) for **authorizing ANY remote instruction** that requires credential validation. It is **independent of any specific action** (pairing, login, relay migration, etc.) and can be used whenever a device needs to validate that a remote action is authorized by someone who knows a shared secret.
+TOTP is a general-purpose credential layer for **authorizing any remote instruction** that requires validation — not just pairing. The same implementation described in the "Security Layer" section above applies here: 20-byte seeds, RFC 6238 time-based codes, constant-time comparison, rate limiting. TOTP validates credentials; it does not define the action being authorized.
 
-TOTP is **not a protocol for specific actions** — it is a **generic credential layer** that can wrap any remote instruction:
-
-- Device pairing acceptance (example: "Accept this invite from Device X")
-- Login to account (example: "Unlock my account with my password + TOTP code")
-- Credential reset (example: "Change my recovery passphrase")
-- API access authorization (example: "Generate an API token")
-- Relay migration (example: "Approve relay change to new server")
-
-**Key property:** TOTP validates credentials; it does **not** define the action being authorized. The action payload (pairing invite, login request, etc.) is orthogonal to TOTP; TOTP only verifies that the remote party knows the shared secret.
-
-### Credential Validation: Time-Based One-Time Passwords (TOTP)
-
-The TOTP implementation is fully detailed in the "Security Layer" section at the beginning of this document. This section summarizes key concepts:
-
-**TOTP operates in two modes:**
-
-1. **Interactive Mode** (user-facing): Validate 6-digit codes
-   - User reads code from authenticator app (e.g., Google Authenticator, Authy)
-   - User enters code on recipient device
-   - Recipient validates code against stored seed (RFC 6238, ±1 window)
-
-2. **Programmatic Mode** (API/automation): Validate raw seeds
-   - Sender includes TOTP seed (base32-encoded) in the remote instruction
-   - Recipient compares sent seed against stored seed (constant-time comparison)
-   - No user entry required; seed = bearer token for programmatic access
-
-**Both modes use the same 20-byte seed** (160 bits, base32-encoded = 32 alphanumeric characters).
+Use cases include pairing acceptance, relay migration commands, login, credential reset, and API access. The action payload is orthogonal to the TOTP credential; TOTP only verifies that the remote party knows the shared secret at this moment.
 
 ### Pattern: Authorizing Remote Instructions
 
@@ -1097,77 +1204,9 @@ interface RemoteInstructionPayload {
 
 ### Example: Pairing Acceptance with TOTP
 
-Pairing invite authorization is **one use case** of the TOTP protocol. Here's how it applies:
+Pairing invite authorization is **one use case** of the TOTP protocol. For Nostr-delivered invite delivery via the TOTP mailbox, see "Contact Creation: TOTP Mailbox" below. The credential validation pattern — derive seed, validate freshness, call `verifyRawSeed` or `verifyTOTPCode`, record attempt — applies to any TOTP-secured instruction.
 
-**Monitor side (sender):**
-
-```typescript
-// Monitor generates invite + TOTP seed
-const { ephemeralPrivkey, ephemeralPubkey } = genKeyPair();
-const totpSeed = generateTOTPSeed(); // base32 string (32 chars)
-
-// Build pairing invite payload with credential
-const payload: RemoteInstructionPayload = {
-  type: "pairing-accept",
-  ephemeral_pubkey: ephemeralPubkey,
-  client_pubkey: monitorPubkey,
-  client_relays: monitorRelays,
-  sessionUUID: crypto.randomUUID(),
-  credential: totpSeed,
-  credential_type: "seed",
-  ttl: 3600, // 1 hour validity window
-  created_at: Math.floor(Date.now() / 1000),
-};
-
-// In practice, this payload is the Rumor inside a NIP-59 gift wrap (kind 1059).
-// The gift wrap encrypts with a random one-time key; the Seal inside encrypts with
-// the monitor's real identity key. The published event is kind 1059, not kind 5200 directly.
-// Kind 5200 is the unsigned Rumor nested inside; it is never published bare.
-const rumor = {
-  kind: 5200,
-  content: JSON.stringify(payload),
-  tags: [],
-  created_at: payload.created_at,
-  pubkey: monitorPubkey,
-};
-await sendGiftWrap(rumor, viewerPubkey, monitorPrivkey, [viewerRelay]);
-```
-
-**Viewer side (recipient):**
-
-```typescript
-// Viewer receives event and decrypts payload
-const sharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
-const payload = JSON.parse(nip44Decrypt(event.content, sharedSecret));
-
-// Validate freshness
-const payloadAge = Math.floor(Date.now() / 1000) - payload.created_at;
-if (payloadAge > payload.ttl) {
-  throw new Error("Instruction has expired");
-}
-
-// Validate TOTP credential
-let credentialValid = false;
-if (payload.credential_type === "seed") {
-  // Compare seed against stored TOTP credential
-  const storedSeed = await retrieveStoredTOTPSeed(); // from IDB
-  credentialValid = verifyRawSeed(storedSeed, payload.credential);
-} else if (payload.credential_type === "code") {
-  // Validate 6-digit code against stored seed
-  const storedSeed = await retrieveStoredTOTPSeed();
-  credentialValid = verifyTOTPCode(storedSeed, payload.credential);
-}
-
-if (!credentialValid) {
-  // Record failed attempt + apply rate limiting
-  await recordTOTPAttempt(credentialId, false);
-  throw new Error("Credential invalid");
-}
-
-// Credential valid — proceed with instruction
-await recordTOTPAttempt(credentialId, true);
-await acceptPairingInvite(payload); // Pairing-specific logic
-```
+---
 
 ### Use Cases: When to Use TOTP for Remote Instructions
 
@@ -1186,35 +1225,93 @@ await acceptPairingInvite(payload); // Pairing-specific logic
 - Real-time **human verification** is needed (use UI-based confirmation instead)
 - Instruction is **not encrypted** (TOTP credential would be exposed on relay)
 
-### Security Considerations
+---
 
-**TOTP validates credentials, not identity:**
+## Remote Command (Kind 5006)
 
-- TOTP proves "you know the shared secret", not "you are Device X"
-- Always verify the **instruction payload** in addition to credential (wrong payload + right credential = still wrong)
-- Use TOTP as a **second factor** (with ECDH encryption and real pubkey verification)
+### Overview
 
-**TOTP does not prevent relay eavesdropping:**
+A Remote Command is a TOTP-authorized instruction delivered over an existing contact's channel keys. It travels as a kind 5006 signal — encrypted and routed identically to any other post-contact signal — but carries its own TOTP credential in the payload. TOTP authorizes the specific action; the channel keys establish the encrypted channel.
 
-- Event itself is encrypted (NIP-44), but relay can see recipient pubkey and timestamp
-- Attacker cannot forge instruction (wrong credential fails validation)
-- Attacker can replay old instructions if **freshness check fails** — always validate `created_at` against `ttl`
+Remote Commands work for both TempContacts and PairedContacts. The contact type determines the encryption channel; the TOTP credential determines whether the instruction is authorized.
 
-**Rate limiting prevents brute-force:**
+### Why TOTP Is Required Even on PairedContacts
 
-- Failed attempts increment counter; after N attempts, credential locks for exponential backoff
-- Even if attacker knows the TOTP seed, they cannot bypass rate limiting
-- See `recordTOTPAttempt()` in Security Layer for implementation
+An established PairedContact proves that both devices completed the pairing flow and share ECDH-derived channel keys. It does not prove that a message arriving over that channel authorizes a sensitive action. A Remote Command carries additional risk: it instructs the receiving device to take a concrete action (e.g., migrate relays, modify configuration). TOTP provides a second authorization layer:
 
-**Credential expiration prevents replay:**
+- The channel keys establish **identity**: only the paired device could send an encrypted message decryptable with the shared channel key.
+- The TOTP credential establishes **authorization**: only someone who knows the shared TOTP seed at this specific moment can produce a valid credential.
+- The credential is delivered at a different time and through a different out-of-band channel than the channel keys — an attacker who intercepts channel traffic cannot replay a valid command without also knowing the current TOTP code.
 
-- TOTP code expires after 30 seconds (RFC 6238)
-- Instruction payload expires after `ttl` (typically 1 hour for pairing, 5 minutes for sensitive operations)
-- Never accept instructions with `created_at > now + clock_skew`
+### Sending a Remote Command
+
+```typescript
+// ContactA sends a Remote Command to ContactB.
+// The command travels over the existing PairedContact channel — no gift wrap.
+await nostrClient.publishSignal(contactBId, 5006, {
+  commandId: crypto.randomUUID(),
+  credential: generateCurrentTOTPCode(sharedSeed), // current 6-digit code
+  credential_type: "code",
+  ttl: 300, // 5-minute validity window
+  created_at: Math.floor(Date.now() / 1000),
+  isResponse: false,
+  payload: {
+    type: "relay-migrate-command",
+    newRelays: ["wss://relay-b-2.com"],
+  },
+});
+```
+
+The same `publishSignal` API used for every other signal kind. ContactA holds a PairedContact (or TempContact) for ContactB; the contact resolves the channel key and relay internally.
+
+### Receiving via RemoteCommandController
+
+`RemoteCommandController` handles all incoming kind 5006 events from the signal router. Handlers are registered explicitly — one handler per `payload.type`. The controller:
+
+1. **Checks freshness** — rejects events where `now - created_at > ttl`. No ack sent.
+2. **Validates TOTP credential** — calls `verifyTOTPCode` or `verifyRawSeed` against the stored seed for the contact. Calls `recordTOTPAttempt` regardless of result (rate limiting).
+3. **On failure** — discards silently. No ack. No error signal. Attacker learns nothing.
+4. **On success** — sends ack immediately via `publishSignal(contactId, 5006, { isResponse: true, commandId, accepted: true })`.
+5. **Dispatches** — calls the registered handler for `payload.payload.type`. If no handler is registered for that type, discards after ack.
+
+### Relay Migration Command Example
+
+Handler registration at startup:
+
+```typescript
+remoteCommandController.registerHandler("relay-migrate-command", {
+  handle: async (contactId, payload) => {
+    const { newRelays } = payload as { newRelays: string[] };
+    // Initiate dual-channel migration — ContactB becomes the kind 5005 proposer
+    await proposeInboundMigration(contactId, newRelays);
+  },
+});
+```
+
+End-to-end sequence:
+
+```
+ContactA: publishSignal(contactBId, 5006, { type: "relay-migrate-command", newRelays, credential, ... })
+  → kind 5006 (isResponse=false) over ContactB's inbound channel
+  ↓
+ContactB: RemoteCommandController receives kind 5006
+  → validates freshness, validates TOTP
+  → publishSignal(contactAId, 5006, { isResponse: true, commandId, accepted: true })
+  → dispatches to "relay-migrate-command" handler
+  → proposeInboundMigration(contactAId, newRelays)
+  → kind 5005 (isResponse=false) to ContactA
+  ↓
+ContactA: receives kind 5005 proposal → normal dual-channel migration ack flow
+  → kind 5005 (isResponse=true) to newRelays (proof of listening)
+  ↓
+ContactB: receives kind 5005 ack → commits migration
+```
+
+**Role inversion:** In a self-initiated migration, the device that wants to change its relays sends kind 5005 (isResponse=false). Here, ContactB is instructed to migrate, so ContactB becomes the kind 5005 initiator. The Remote Command is the trigger; everything after follows the existing migration protocol.
 
 ---
 
-### Post-Pairing Transition to Channel Keys
+### Post-Contact Transition to Channel Keys
 
 After successful invite acceptance (whether QR or Nostr delivery), both devices have:
 
@@ -1334,9 +1431,9 @@ export const KIND_QR_ACCEPTANCE = 5100;
 
 ## Signal Exchange Patterns
 
-Signal kinds 5001–5005 are the universal mechanism for device-to-device communication. They work identically for any `contactId` — paired devices use ECDH-derived channel keys; temp (gift-wrap) contacts use ephemeral keys. The caller never handles keys or relay lists directly; those are internal to `ContactManager`.
+Signal kinds 5001–5006 are the universal mechanism for device-to-device communication. They work identically for any `contactId` — PairedContacts use ECDH-derived channel keys; TempContacts use ephemeral keys. The caller never handles keys or relay lists directly; those are internal to `ContactManager`.
 
-### Signal Kinds (5001–5005)
+### Signal Kinds (5001–5006)
 
 Signals use dedicated Nostr kinds — one per signal type. Relays cannot filter by encrypted content, so each signal type requires its own kind for targeted fetching. All signals are NIP-44 encrypted over the contact's channel keys. Signals handle **connection setup and presence only** — data requests flow over RTC data channels.
 
@@ -1387,17 +1484,47 @@ interface RelayMigrationPayload {
   timestamp: number;
   isResponse: boolean;
 }
+
+// Kind 5006 — Remote Command (TOTP-authorized instruction)
+// isResponse=false: command with TOTP credential + typed payload
+// isResponse=true: ack after TOTP validation (no ack sent if validation fails)
+interface RemoteCommandPayload {
+  commandId: string;           // UUID — echoed in ack for correlation
+  credential: string;          // TOTP code (6 digits) or seed (base32, 32 chars)
+  credential_type: "seed" | "code";
+  ttl: number;                 // seconds — command validity window
+  created_at: number;          // unix timestamp (freshness check)
+  isResponse: boolean;
+  accepted?: boolean;          // isResponse=true only
+  payload?: {                  // isResponse=false only
+    type: string;              // handler key: "relay-migrate-command", etc.
+    [key: string]: unknown;    // type-specific fields
+  };
+}
 ```
 
 **Transmission (all signal kinds):**
 
 ```
-Kind: 5001–5005 (one per signal type)
+Kind: 5001–5006, 5010–5011 (one per signal type)
 Pubkey: contact's inboundChannelPubkey (paired: ECDH-derived; temp: ephemeral)
 Content: NIP-44 encrypted kind-specific payload
 created_at: honest timestamp (not randomized)
 Relay: selected by RelayStateController from contact's outboundRelayList
 ```
+
+**Kind allocation:**
+
+| Range     | Purpose                                                                              |
+| --------- | ------------------------------------------------------------------------------------ |
+| 5001–5005 | Contact signals (RTC, status, relay migration)                                       |
+| 5006      | Remote Command (TOTP-authorized instruction)                                         |
+| 5007–5009 | Reserved                                                                             |
+| 5010–5011 | Action signals (trigger notifications, arm state)                                    |
+| 5100      | QR/Mailbox Acceptance (pairing)                                                      |
+| 5201      | TOTP Mailbox Delivery (pre-contact, one-shot)                                        |
+
+Kinds 5001–5006 and 5010–5011 are delivered through the signal router. Kind 5201 is handled by a separate one-shot mailbox subscription (`{ kinds: [5201], "#p": [mailboxPubkey] }`), not by the signal router.
 
 Callers use `nostrClient.publishSignal(contactId, kind, payload)` — relay and key selection is internal.
 
@@ -1420,6 +1547,7 @@ interface SignalWatermark {
     5003?: number; // RTC Hangup
     5004?: number; // Status
     5005?: number; // Relay Migration
+    5006?: number; // Remote Command
   };
 }
 
@@ -1520,14 +1648,14 @@ Viewer:  publishSignalDirect(monitorContactId, 5002, { sdp: answerSdp, sessionId
 Using naming that encodes device and version for clarity:
 
 ```
-DeviceA relays:
-  inbound (current) = [wss://relay-a-1.com]     (where DeviceA listens)
-  inbound (proposed) = [wss://relay-a-2.com]    (where DeviceA wants to listen)
-  outbound = [wss://relay-b-1.com]              (where DeviceB listens)
+ContactA relays:
+  inbound (current) = [wss://relay-a-1.com]     (where ContactA listens)
+  inbound (proposed) = [wss://relay-a-2.com]    (where ContactA wants to listen)
+  outbound = [wss://relay-b-1.com]              (where ContactB listens)
 
-DeviceB relays:
-  inbound (current) = [wss://relay-b-1.com]     (where DeviceB listens)
-  outbound = [wss://relay-a-1.com]              (where DeviceA listens; updates when DeviceA proposes)
+ContactB relays:
+  inbound (current) = [wss://relay-b-1.com]     (where ContactB listens)
+  outbound = [wss://relay-a-1.com]              (where ContactA listens; updates when ContactA proposes)
 
 Naming scheme: relay-X-Y where X=device (a/b) and Y=version number
 ```
@@ -1548,12 +1676,12 @@ When a device wants to migrate its listening relays:
 
 **Communications never break** because outbound (to peer) remains stable until peer acknowledges migration.
 
-### Migration Flow (DeviceA: relay-a-1 → relay-a-2)
+### Migration Flow (ContactA: relay-a-1 → relay-a-2)
 
-**Step 1: DeviceA proposes and dual-listens**
+**Step 1: ContactA proposes and dual-listens**
 
 ```
-DeviceA:
+ContactA:
   ├─ Starts dual-listening to: [relay-a-1.com] + [relay-a-2.com]
   ├─ Sends proposal to: [relay-b-1.com]
   │  Message: "I'm migrating from relay-a-1 to relay-a-2"
@@ -1561,48 +1689,47 @@ DeviceA:
   └─ State: waiting-for-acknowledgement
 ```
 
-**Step 2: DeviceB receives and acknowledges**
+**Step 2: ContactB receives and acknowledges**
 
 ```
-DeviceB receives on [relay-b-1.com]:
-  ├─ Learns: DeviceA wants to listen on [relay-a-2.com]
-  ├─ Updates: outbound = [relay-a-2.com] (where to send to DeviceA now)
-  ├─ Starts listening to: [relay-a-2.com]
+ContactB receives on [relay-b-1.com]:
+  ├─ Learns: ContactA wants to listen on [relay-a-2.com]
+  ├─ Updates: outbound = [relay-a-2.com] (where to send to ContactA now)
   └─ Sends acknowledgement to: [relay-a-2.com]
      Message: "I see you on relay-a-2, acknowledging your migration"
      (kind 5005, isResponse=true, sessionId: UUID)
 ```
 
-**Step 3: DeviceA receives acknowledgement and commits**
+**Step 3: ContactA receives acknowledgement and commits**
 
 ```
-DeviceA receives ack on [relay-a-2.com]:
-  ├─ Sees: DeviceB is listening to relay-a-2
+ContactA receives ack on [relay-a-2.com]:
+  ├─ Sees: ContactB is listening to relay-a-2
   ├─ Commits: inbound = [relay-a-2.com]
   ├─ Stops listening to: [relay-a-1.com]
   └─ State: committed
 
 Result:
-  DeviceA: inbound = [relay-a-2.com], outbound = [relay-b-1.com]
-  DeviceB: inbound = [relay-b-1.com], outbound = [relay-a-2.com]
+  ContactA: inbound = [relay-a-2.com], outbound = [relay-b-1.com]
+  ContactB: inbound = [relay-b-1.com], outbound = [relay-a-2.com]
   ✓ Communication over: [relay-b-1.com] ↔ [relay-a-2.com]
 ```
 
 **Why communications never break:**
 
-- DeviceA always sends to [relay-b-1.com] ✓ (unchanged throughout)
-- DeviceB always listens to [relay-b-1.com] ✓ (unchanged throughout)
-- Acknowledgement sent to new relay where both are already dual-listening
-- DeviceB starts sending to new relay **immediately** upon receiving proposal
+- ContactA always sends to [relay-b-1.com] ✓ (unchanged throughout)
+- ContactB always listens to [relay-b-1.com] ✓ (unchanged throughout)
+- Acknowledgement sent to ContactA's new inbound relay where ContactA is already dual-listening
+- ContactB starts sending to new relay **immediately** upon receiving proposal
 
-**Code: DeviceA proposes migration**
+**Code: ContactA proposes migration**
 
 ```typescript
 async function proposeInboundMigration(contact, newInbound) {
-  // Example: DeviceA proposing relay-a-1 → relay-a-2
+  // Example: ContactA proposing relay-a-1 → relay-a-2
   // contact.relays = [wss://relay-a-1.com]
   // newInbound = [wss://relay-a-2.com]
-  // contact.outbound = [wss://relay-b-1.com]  (DeviceB's inbound)
+  // contact.outbound = [wss://relay-b-1.com]  (ContactB's inbound)
 
   const sessionId = crypto.randomUUID();
 
@@ -1621,7 +1748,7 @@ async function proposeInboundMigration(contact, newInbound) {
         newInbound,
         proposedAt: since,
       };
-      await savePairedDevice(contact);
+      await savePairedContact(contact);
 
       // Step 1c: Send proposal — relay selection and encryption are internal
       nostrClient.publishSignalDirect(contactId, 5005, {
@@ -1635,15 +1762,15 @@ async function proposeInboundMigration(contact, newInbound) {
 }
 ```
 
-**Step 3: DeviceA waits for acknowledgement on dual-listened relays**
+**Step 3: ContactA waits for acknowledgement on dual-listened relays**
 
 ```typescript
 async function waitForInboundMigrationAck(contact) {
   const { sessionId, newInbound, proposedAt } = contact.relayProposal;
 
   // Listen on both old and new relays for acknowledgement
-  // DeviceA is dual-listening: [relay-a-1.com] + [relay-a-2.com]
-  // Acknowledgement will come from DeviceB on [relay-a-2.com] (where they just learned to send)
+  // ContactA is dual-listening: [relay-a-1.com] + [relay-a-2.com]
+  // Acknowledgement will come from ContactB on [relay-a-2.com] (where they just learned to send)
 
   try {
     // Ack arrives via signal router — dual-listening on old + new inbound is already active.
@@ -1662,7 +1789,7 @@ async function waitForInboundMigrationAck(contact) {
       // Commit migration — ContactManager updates relay list; signal router re-subscribes to new inbound only
       nostrClient.updatePairedRelays(contactId, newInbound);
 
-      await savePairedDevice(contact);
+      await savePairedContact(contact);
       return true;
     }
   } catch (err) {
@@ -1680,7 +1807,7 @@ async function waitForInboundMigrationAck(contact) {
 }
 ```
 
-**Step 4: DeviceB receives proposal and immediately acknowledges**
+**Step 4: ContactB receives proposal and immediately acknowledges**
 
 ```typescript
 // Signal router delivers: (contactId, kind, payload)
@@ -1688,20 +1815,20 @@ async function waitForInboundMigrationAck(contact) {
 nostrClient.startSignalRouter((contactId, kind, payload) => {
   if (kind === 5005 && !payload.isResponse) {
     const msg = payload as RelayMigrationPayload;
-    // contactId identifies DeviceA — relay/key lookup is internal to NostrClient
+    // contactId identifies ContactA — relay/key lookup is internal to NostrClient
 
     // Example scenario:
-    // DeviceB receives on [relay-b-1.com] (where we're listening):
+    // ContactB receives on [relay-b-1.com] (where we're listening):
     //   msg.newRelays = [relay-a-2.com]
     //   msg.sessionId = UUID
-    // DeviceA's proposal: "I'm moving to relay-a-2, start sending to me there"
+    // ContactA's proposal: "I'm moving to relay-a-2, start sending to me there"
 
-    // Step 4a: Update where WE send to DeviceA (our outbound = DeviceA's new inbound)
-    // ContactManager commits the new relay list; dual-listening on DeviceA's side resolves after receiving this ack
+    // Step 4a: Update where WE send to ContactA (our outbound = ContactA's new inbound)
+    // ContactManager commits the new relay list; dual-listening on ContactA's side resolves after receiving this ack
     nostrClient.updatePairedRelays(contactId, msg.newRelays);
 
     // Step 4b: Send acknowledgement — NostrClient routes to the updated relay list
-    // Sending to [relay-a-2.com] proves DeviceB can reach DeviceA on the new relay
+    // Sending to [relay-a-2.com] proves ContactB can reach ContactA on the new relay
     await nostrClient.publishSignalDirect(contactId, 5005, {
       isResponse: true,
       sessionId: msg.sessionId,
@@ -1715,9 +1842,9 @@ nostrClient.startSignalRouter((contactId, kind, payload) => {
 
 ```typescript
 async function resumePendingRelayMigrations() {
-  const devices = await getAllPairedDevices();
+  const contacts = await getAllPairedContacts();
 
-  for (const contact of devices) {
+  for (const contact of contacts) {
     // Check if migration was in-flight (proposal stored)
     if (!contact.relayProposal) continue;
 
@@ -1772,9 +1899,9 @@ async function resumePendingRelayMigrations() {
 
 **Communications never break:**
 
-- **DeviceA always sends to `[relay-b-1.com]`** (DeviceB's inbound) throughout migration — never changes
-- **DeviceB dual-listens to old+new inbound** during entire handshake — catches proposal and ack on either relay
-- All proposals reach destination; all acks reach source
+- **ContactA always sends to `[relay-b-1.com]`** (ContactB's inbound) throughout migration — never changes
+- **ContactB always listens to `[relay-b-1.com]`** (unchanged throughout; ContactA dual-listens to old+new inbound until ack received)
+- All proposals reach ContactB; all acks reach ContactA on its dual-listened new inbound
 
 **Multiple concurrent proposals are safe:**
 
@@ -1785,23 +1912,23 @@ async function resumePendingRelayMigrations() {
 
 **Cleanup happens only after acknowledgement:**
 
-- **Initiator** (e.g., DeviceA): dual-listens to `[relay-a-1.com, relay-a-2.com]` until ack received
-- **Acknowledger** (e.g., DeviceB): starts sending to new inbound `[relay-a-2.com]` immediately upon receiving proposal, sends ack as proof
+- **Initiator** (e.g., ContactA): dual-listens to `[relay-a-1.com, relay-a-2.com]` until ack received
+- **Acknowledger** (e.g., ContactB): starts sending to new inbound `[relay-a-2.com]` immediately upon receiving proposal, sends ack as proof
 - After ack, initiator commits and stops dual-listening
 
 **Each device autonomously controls only its own inbound:**
 
-- **DeviceA** can propose A→A2→A3→... without waiting for previous proposals to complete
-- **DeviceB** acknowledges **ONE** (latest with highest sessionId) and updates where it sends to DeviceA
+- **ContactA** can propose A→A2→A3→... without waiting for previous proposals to complete
+- **ContactB** acknowledges **ONE** (latest with highest sessionId) and updates where it sends to ContactA
 - No "agreement phase"—just proposal + proof of listening via acknowledgement
-- Example: DeviceA proposes A2, then proposes A3 before A2 ack arrives → DeviceB will eventually acknowledge A3 and ignore A2
+- Example: ContactA proposes A2, then proposes A3 before A2 ack arrives → ContactB will eventually acknowledge A3 and ignore A2
 
 ---
 
-## PairedDevice Data Model
+## PairedContact Data Model
 
 ```typescript
-interface PairedDevice {
+interface PairedContact {
   pubkey: string;
 
   // Relay lists (independent per device)
@@ -1839,7 +1966,7 @@ interface PairedDevice {
 
 ## Senstry Action Signals (Pipeline → Nostr)
 
-Action signals are the Nostr layer of the Senstry pipeline. When a sensor fires and the pipeline resolves an action that includes a Nostr notification, `TriggerPublisher` sends a targeted channel-key signal to specific paired contacts. There are no real pubkeys, no open subscriptions, no public broadcasts. Action signals use the same encryption and routing as all other post-pairing signals.
+Action signals are the Nostr layer of the Senstry pipeline. When a sensor fires and the pipeline resolves an action that includes a Nostr notification, `TriggerPublisher` sends a targeted channel-key signal to specific paired contacts. There are no real pubkeys, no open subscriptions, no public broadcasts. Action signals use the same encryption and routing as all other post-contact signals.
 
 **Pipeline flow:**
 
@@ -1965,79 +2092,18 @@ await connectToMonitor(privkey, viewerPubkey, monitorPubkey);
 
 ### In-band Control (RTC Data Channel)
 
-Once RTC is open, all data and control requests flow over the data channel. The monitor hosts a data channel server that responds to:
-
-```typescript
-// Over RTC controlChannel (JSON requests):
-{ type: 'segment-request', segmentId: 'xyz' }
-{ type: 'coverage-request', channelId: 'video-1', range: [from, to] }
-{ type: 'live-request', channelId: 'video-1' }
-{ type: 'metadata-request', kind: 'footage-refs' | 'photos' }
-```
-
-**Responses:**
-
-- `segment-data` — binary chunk of segment (over separate data channel)
-- `coverage` — coverage map for timeline
-- `metadata` — footage refs, photo list, etc.
+Once RTC is open, all data and control requests flow over the data channel. The monitor hosts a stateless request/response server on the control channel. Request types include coverage maps, segment metadata, segment blob chunks, channel lists, and live-upgrade negotiation. Full message types and protocol are specified in `docs/new/webrtc-communication-flow.md`.
 
 **Live upgrade renegotiation** (in-band):
 
 ```
-Viewer sends: { type: 'live-request', channelId: 'video-1' } over RTC data channel
-Monitor responds: sends new offer via kind 5001 (isResponse=true, SDP with media tracks)
+Viewer sends: { type: 'live-request', channelId: 'video-1' } over RTC control channel
+Monitor responds: sends renegotiation offer via kind 5001 (isResponse=true, SDP with media tracks)
 Viewer sends: answer via kind 5002 (isResponse=false, SDP answer)
-[media tracks added to existing RTC connection]
+[media tracks added to existing RTC connection — 2 Nostr events total]
 ```
 
 **Note:** All data requests happen AFTER RTC connection is established. No data is ever requested over Nostr.
-
----
-
-## Relay Management
-
-### Per-Device Relay Lists
-
-Each paired device stores two relay lists:
-
-```typescript
-interface PairedDevice {
-  pubkey: string;
-  relays: string[]; // my inbound (where I listen for signals)
-  outbound: string[]; // peer's inbound (where I send signals)
-  channelKeys: { inbound; outbound };
-  lastSeenAt?: number; // unix timestamp of last status signal (for health checking)
-
-  // Relay migration state (persistent)
-  relayProposal?: {
-    sessionId: string; // UUID tracking this proposal
-    newInbound: string[]; // relays I want to migrate to
-    proposedAt: number; // timestamp (for debugging/observability)
-  };
-
-  // ... other fields ...
-}
-```
-
-### Relay List Updates (Dual-Channel Migration)
-
-When a device wants to migrate its listening relays (e.g., relay shutting down, provider switch), it initiates a **dual-listening migration**:
-
-**Key property:** Each device **independently controls its own inbound** (listening relays). When proposing a change:
-
-1. Initiator proposes new inbound over peer's inbound (outbound)
-2. Both devices dual-listen to old+new inbound during negotiation
-3. Peer acknowledges by sending to new inbound (proof it's listening)
-4. Initiator commits migration after acknowledgement
-
-**Why this works:**
-
-- ✅ Communications never break (outbound to peer is unchanged)
-- ✅ Both devices can independently propose inbound changes
-- ✅ No "agreement phase" needed—proposal + proof of listening is sufficient
-- ✅ Latest proposal implicitly wins (sessionId matching)
-- ✅ Offline-tolerant (relayProposal persisted in IDB; retry on startup)
-- ✅ **Survives reloads at any stage** (`relayProposal` stored in IDB; resume by checking for matching ack)
 
 ---
 
@@ -2110,34 +2176,54 @@ Online targets receive immediately via T+0 signal router subscription
 Offline targets fetch on reconnect via fetchKindHistory(contactId, 5010, { windowStart: lastOnline })
 ```
 
+### Remote Command (Kind 5006, TOTP-Authorized)
+
+```
+ContactA: publishSignal(contactBId, 5006, { relay-migrate-command, TOTP credential, newRelays })
+  → kind 5006 (isResponse=false) over ContactB's contact channel
+  ↓
+ContactB: RemoteCommandController validates freshness + TOTP credential
+  ↓
+ContactB: publishSignal(contactAId, 5006, { isResponse=true, commandId, accepted=true })
+  ↓
+ContactB: dispatches to "relay-migrate-command" handler
+  → proposeInboundMigration(contactAId, newRelays)
+  → kind 5005 (isResponse=false) to ContactA's inbound
+  ↓
+ContactA: receives kind 5005 proposal → normal dual-channel migration ack flow
+  → updates outbound = ContactB's newRelays
+  → kind 5005 (isResponse=true) to newRelays (proof of listening)
+  ↓
+ContactB: receives kind 5005 ack → commits migration, stops dual-listening
+```
+
 ### Relay Migration (Dual-Listening, Autonomous Inbound)
 
 ```
-DeviceA wants to migrate from [relay-a-1] to [relay-a-2]
+ContactA wants to migrate from [relay-a-1] to [relay-a-2]
   ↓
-DeviceA stores relayProposal in IDB (survive reload)
+ContactA stores relayProposal in IDB (survive reload)
   ├─ relayProposal.sessionId = UUID
   ├─ relayProposal.newInbound = [relay-a-2]
   └─ relayProposal.proposedAt = now
   ↓
-DeviceA starts dual-listening: [relay-a-1] + [relay-a-2]
+ContactA starts dual-listening: [relay-a-1] + [relay-a-2]
   ↓
-DeviceA sends proposal over [relay-b-1] (DeviceB's inbound):
+ContactA sends proposal over [relay-b-1] (ContactB's inbound):
   "I'm moving to [relay-a-2], please start sending there"
   ↓
-DeviceB receives on [relay-b-1]
-  ├─ Starts dual-listening: [relay-a-1] + [relay-a-2]
-  ├─ Updates outbound = [relay-a-2] (where to send to DeviceA now)
-  └─ Sends acknowledgement to [relay-a-2] (proves it's listening)
+ContactB receives on [relay-b-1]
+  ├─ Updates outbound = [relay-a-2] (where to send to ContactA now)
+  └─ Sends acknowledgement to [relay-a-2] (proves ContactA's new relay is reachable)
   ↓
-DeviceA receives ack on [relay-a-2]
+ContactA receives ack on [relay-a-2]
   ├─ Commits: relays = [relay-a-2]
   ├─ Clears: relayProposal = null
   ├─ Stops dual-listening, keeps only [relay-a-2]
   └─ Updates signal subscriptions
   ↓
 Both now communicating over new relays
-  [DeviceA.outbound = [relay-b-1], DeviceB.outbound = [relay-a-2]]
+  [ContactA.outbound = [relay-b-1], ContactB.outbound = [relay-a-2]]
   ↓
 If either device offline: relayProposal survives reload, retry on next startup
 ```
@@ -2146,8 +2232,8 @@ If either device offline: relayProposal survives reload, retry on next startup
 
 ## Key Principles
 
-✅ **All post-pairing communication uses channel keys** — real pubkeys never appear on Nostr after pairing; this applies to RTC signals, status, relay migration, and action notifications alike  
-✅ **Encrypted** — NIP-44 ChaCha20-Poly1305 over ECDH channel keys for all post-pairing events  
+✅ **All post-contact communication uses channel keys** — real pubkeys never appear on Nostr after contact establishment; this applies to RTC signals, status, relay migration, remote commands, and action notifications alike  
+✅ **Encrypted** — NIP-44 ChaCha20-Poly1305 over ECDH channel keys for all post-contact events  
 ✅ **Targeted action signals** — TriggerPublisher sends kind 5010/5011 via `publishSignal(contactId, ...)` to specific paired contacts; no open subscriptions  
 ✅ **Relay-agnostic** — Each contact entry has its own relay lists; `RelayStateController` handles selection  
 ✅ **Offline-resilient** — Missed action signals retrieved via `fetchKindHistory` on reconnect  

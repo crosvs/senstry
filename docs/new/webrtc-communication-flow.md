@@ -14,7 +14,7 @@ WebRTC provides low-latency peer-to-peer communication between paired monitor an
 Both use the same `RTCPeerConnection` infrastructure. The mode (`'live'` or `'data'`) is declared in the initial `offer-request` signal. A data-only connection skips media tracks entirely, reducing unnecessary bandwidth.
 
 **Key Properties:**
-- Signaling occurs over Nostr (kind 5001) using ECDH-derived channel keys and NIP-44 encryption
+- Signaling occurs over Nostr (kinds 5001–5006, 5010, 5011) using ECDH-derived channel keys and NIP-44 encryption
 - All media travels P2P; relays carry only tiny JSON control messages
 - Non-trickle ICE reduces handshake from ~15 relay events to 3 (offer-request, offer, answer)
 - Live upgrade path: existing data session → send `live-request` on control channel → 2 Nostr events total for renegotiation
@@ -43,14 +43,13 @@ No TURN server is configured. Cross-network connections behind symmetric NAT may
 - Compresses WebRTC handshake into minimal relay traffic
 - 5s timeout guards against STUN failure; proceeds with partial candidates if STUN is unreachable
 
-**Example:**
+**Example (monitor creating initial offer; same pattern for viewer creating answer):**
 ```typescript
-// Viewer side: create peer, wait for complete ICE gathering before sending SDP
 const pc = createPeer();
-const offer = await pc.createOffer();
-await pc.setLocalDescription(offer);
+const sdp = await pc.createOffer();   // pc.createAnswer() on the viewer side
+await pc.setLocalDescription(sdp);
 await waitForIceGathering(pc);  // All candidates are now embedded in pc.localDescription.sdp
-await sendOfferRequest(offerSdp);  // Single Nostr event with complete SDP
+await sendSdp(pc.localDescription.sdp);  // Single Nostr event with complete SDP
 ```
 
 ### RTCPeerConnection Factory
@@ -79,11 +78,12 @@ Signals use dedicated Nostr kinds — one per signal type. `isResponse` distingu
 | 5003 | RTC Hangup | Hangup initiation | Ack (optional) |
 | 5004 | Status | Announcement or solicitation | Reply |
 | 5005 | Relay Migration | Proposal | Acknowledgement |
+| 5006 | Remote Command | TOTP-authorized instruction | Ack (credential accepted) |
 
 ### Signal Transmission
 
 ```
-Kinds: 5001–5005 (one per signal type)
+Kinds: 5001–5006, 5010, 5011 (one per signal type)
 Pubkey: ECDH-derived channel key (not real identity)
 Content: NIP-44 encrypted kind-specific payload
 created_at: honest timestamp (not randomized)
@@ -112,17 +112,20 @@ const viewerOutbound = deriveChannelKey(sharedSecret, viewerPubkey, monitorPubke
 **Key Properties:**
 - Deterministic: same inputs always produce same output
 - Directional: swapping sender/recipient produces a different key
-- Ephemeral: not stored; re-derived on app restart from real pubkeys in `pairedDevices`
+- Ephemeral: not stored; re-derived on app restart from real pubkeys in `pairedContacts`
 
 ### Signal TTL
 
 **TTL per kind:**
 - RTC handshake (kinds 5001, 5002, 5003): `SIGNAL_TTL_S = 10` — stale offers, answers, hangups are discarded
 - Presence (kind 5004): `STATUS_TTL_S = 3600` (1 hour) — status is meaningful for up to 1 hour
+- Relay migration (kind 5005): ~300s — proposals stay valid while the migration negotiation completes
+- Remote command (kind 5006): ~30s — commands must be acted on promptly; stale commands discarded silently
+- Action signals (kinds 5010, 5011): ~10s — trigger and arm-state signals are discarded if stale
 
 Kind 5004 with `isResponse: false` acts as both announcement and solicitation — there is no separate status-request kind. `ping`/`pong` are not signal kinds; connectivity checks happen at the WebRTC or relay-connection layer, not via Nostr signals.
 
-TTL is checked against the event's honest `created_at` (not randomized like gift-wrap).
+TTL is checked against the event's honest `created_at` timestamp.
 
 ### Deduplication
 
@@ -257,8 +260,8 @@ const seg2 = await requestSegment(time, ..., monitorBKey);
 
 **Key invariant: Multi-device coverage overwrites prevented by three-part key**
 - Each segment is uniquely identified by `originMonitor` (source device) + `channelId` (which source was recorded) + dedup key (`backupOf ?? segmentId`)
-- **Canonical segment ID is consistent across devices**: the segmentId is derived from recording time/position (e.g., timestamp-based or UUID), not device-local. This ensures cross-device dedup works: DeviceA's canonical segment `seg-2024-05-28T100000Z` is stored with the same ID on DeviceB's remote copy.
-- **Remote copies preserve canonical reference**: when DeviceB stores a copy, `backupOf` points to the full canonical key `${originMonitor}-${channelId}-${canonicalSegmentId}`, unambiguously tracking the canonical segment even if channel names differ between devices
+- **Canonical segment ID is consistent across devices**: the segmentId is derived from recording time/position (e.g., timestamp-based or UUID), not device-local. This ensures cross-device dedup works: ContactA's canonical segment `seg-2024-05-28T100000Z` is stored with the same ID on ContactB's remote copy.
+- **Remote copies preserve canonical reference**: when ContactB stores a copy, `backupOf` points to the full canonical key `${originMonitor}-${channelId}-${canonicalSegmentId}`, unambiguously tracking the canonical segment even if channel names differ between devices
 - Segments from different devices are never mixed even if they have the same `channelId` name, because `originMonitor` differs
 - Quota accounting: only canonical segments (`backupOf = null`) count; remote copies (`backupOf = <key>`) are metadata-only
 - See `docs/new/sentry-pipeline-foundation.md` for full segment structure and quota semantics
@@ -495,7 +498,7 @@ for (let attempt = 0; attempt <= ANSWER_RETRY_DELAYS_MS.length; attempt++) {
 
 ## 9. Signal Router (`signal-router.ts`)
 
-A single global subscription to all signal kinds (5001–5005, 5010, 5011) handles incoming signals and routes them by kind:
+A single global subscription to all signal kinds (5001–5006, 5010, 5011) handles incoming signals and routes them by kind:
 
 | Kind | isResponse | Handler |
 |------|-----------|---------|
@@ -507,6 +510,7 @@ A single global subscription to all signal kinds (5001–5005, 5010, 5011) handl
 | 5004 | true (reply) | `updatePeerStatus()` only (no further reply — prevents loops) |
 | 5005 | false (relay proposal) | `handleRelayMigrationProposal()` |
 | 5005 | true (relay ack) | `handleRelayMigrationAck()` |
+| 5006 | — | Delivered to `RemoteCommandController` for TOTP validation and dispatch |
 | 5010 | — | Delivered to caller via `onSignal(contactId, 5010, payload)` — viewer handles as trigger notification |
 | 5011 | — | Delivered to caller via `onSignal(contactId, 5011, payload)` — viewer handles as arm state update |
 
@@ -524,17 +528,18 @@ A single global subscription to all signal kinds (5001–5005, 5010, 5011) handl
 User clicks "Connect to Monitor"
   │
   1. Viewer: ensureConnection(privkey, myPubkey, monitorPubkey, mode='data')
-  2. Viewer: createPeer() → createOffer() → setLocalDescription()
-  3. Viewer: waitForIceGathering() [~100-500ms]
-  4. Viewer: sendOfferRequest(mode='data') [Nostr event 1]
-  5. Monitor: receives on signal router → handleOfferRequest()
-  6. Monitor: createPeer() [NO media tracks for data mode]
-  7. Monitor: createDataChannels('control', 'data')
-  8. Monitor: createOffer() → sendOffer() [Nostr event 2]
-  9. Viewer: receives 'offer' signal → setRemoteDescription()
-  10. Viewer: createAnswer() → sendAnswer() [Nostr event 3]
-  11. Monitor: receives 'answer' signal → setRemoteDescription()
-  12. Both: data channels open, control channel fires onopen → connection ready
+  2. Viewer: createPeer()
+  3. Viewer: sendOfferRequest(mode='data') [Nostr event 1]
+  4. Monitor: receives on signal router → handleOfferRequest()
+  5. Monitor: createPeer() [NO media tracks for data mode]
+  6. Monitor: createDataChannels('control', 'data')
+  7. Monitor: createOffer() → setLocalDescription() → waitForIceGathering() [~100-500ms]
+  8. Monitor: sendOffer() [Nostr event 2]
+  9. Viewer: receives 'offer' signal → setRemoteDescription() → createAnswer() → setLocalDescription()
+  10. Viewer: waitForIceGathering() [~100-500ms]
+  11. Viewer: sendAnswer() [Nostr event 3]
+  12. Monitor: receives 'answer' signal → setRemoteDescription()
+  13. Both: data channels open, control channel fires onopen → connection ready
   
 Result: 3 Nostr events, ~2-5 seconds elapsed
 Viewer can now: request coverage maps, segment lists, download archived segments

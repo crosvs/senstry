@@ -136,28 +136,25 @@ plaintext = decrypt(receiverPrivkey, senderPubkey, ciphertext)
 - Content is opaque
 - Requires both sender's privkey (to encrypt) and recipient's pubkey
 
-**Used by:** All encrypted events in Senstry (signals, action signals, pairing acks, gift wraps).
+**Used by:** All encrypted events in Senstry (signals, action signals, pairing acks).
 
 ### NIP-59: Gift Wrap
 
 Three-layer wrapping scheme for obscuring sender, recipient, and content from relays:
 
-1. **Rumor** — unsigned event carrying the actual payload (replyKey, replyRelays, instruction)
+1. **Rumor** — unsigned event carrying the actual payload
 2. **Seal** (kind 13) — rumor encrypted with sender's real key to recipient's pubkey; signed by sender's real key; no `p` tag
 3. **Gift Wrap** (kind 1059) — seal encrypted with a random one-time key; `p` tag = recipient pubkey for relay routing; signed by the random key
 
-**Timestamps:** the seal and gift wrap layers use randomized timestamps (±30 minutes) to protect against time-analysis. Only the rumor's `created_at` is honest. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
+**Timestamps:** the seal and gift wrap layers use randomized timestamps (±30 minutes) to protect against time-analysis. Gift-wrapped events are found via `#p` tag filtering, not `since` filtering.
 
-**Status in Senstry:**
-- **Not used** for signals between paired devices — replaced by ECDH channel keys (more efficient, supports `since` filtering)
-- **Used** for all non-paired communication: Nostr-delivered pairing invites, TOTP-secured instructions, and any contact initiation where no channel key exists yet
-- After a gift wrap is received and decrypted, further communication uses the ephemeral reply key extracted from the rumor — functionally identical to a channel key for the duration of that interaction
+**Status in Senstry: Not used.** Senstry does not use NIP-59 gift wrap. Pre-contact Nostr delivery uses the TOTP Mailbox pattern (kind 5201) instead — a deterministic mailbox keypair derived via HKDF from a shared TOTP seed. This avoids exposing real pubkeys in relay routing tags and removes the three-layer encryption overhead of gift wrap.
 
 ## 5. Encryption in Senstry: Three Models
 
-### Model 1: NIP-44 over ECDH Channel Keys – All Post-Pairing Events
+### Model 1: NIP-44 over ECDH Channel Keys – All Post-Contact Events
 
-Used for all events sent between paired devices: signals (5001–5005) and action signals (5010, 5011).
+Used for all events sent between contacts (both TempContact and PairedContact): signals (5001–5006) and action signals (5010, 5011).
 
 ```
 Event sender: Monitor (outbound channel privkey — not identity key)
@@ -168,13 +165,20 @@ Relay visibility: Channel pubkeys only — real identities are not visible
 
 **Advantage:** Privacy-preserving. Relay operator cannot correlate events to real device identities. Channel pubkeys are pseudonymous — unrelated to real pubkeys without the ECDH shared secret.
 
-### Model 2: Gift-Wrap – Non-Paired Communication Only
+### Model 2: NIP-44 over TOTP Mailbox Key – Pre-Contact Delivery
 
-Not used for WebRTC signaling. The design was evaluated and rejected in favor of ECDH channel keys.
+Used only for kind 5201 (TOTP Mailbox Delivery): one-shot pre-contact messages where no channel key exists yet.
 
-**The appeal:** Relay cannot see sender/recipient (ephemeral outer key). Offered sender deniability.
+```
+mailboxPrivkey = HKDF(totpSeed, "senstry-v1-mailbox")
+mailboxPubkey  = secp256k1(mailboxPrivkey)
+Sender:    fresh ephemeral keypair; NIP-44 encrypt to mailboxPubkey; #p tag = mailboxPubkey
+Recipient: derives mailboxPrivkey, subscribes { kinds: [5201], "#p": [mailboxPubkey] }
+```
 
-**Why rejected:** Two critical flaws: (1) Expensive to query—relay cannot filter by `authors`, forcing full table scans over ~1.6 hour windows, burning rate limits; (2) Randomized timestamps break relay `since` filtering, defeating efficient subscription windows. These costs made it unsuitable for frequent WebRTC handshakes.
+**Why not gift wrap (NIP-59):** Gift wrap exposes real pubkeys in the `#p` routing tag of the outer wrapper, has three encryption layers versus one, and randomized timestamps break relay `since` filtering — requiring expensive full-table scans over ~1.6-hour windows. The TOTP mailbox achieves the same pre-contact delivery with a single encryption layer, deterministic routing without real pubkeys, and honest timestamps.
+
+**Lifecycle:** The mailbox subscription is closed and the mailbox keypair discarded once a TempContact is established.
 
 ### Model 3: ECDH-Derived Channel Keys – How Channel Keys Work
 
@@ -183,8 +187,8 @@ Not used for WebRTC signaling. The design was evaluated and rejected in favor of
 #### Key Derivation
 
 ```
-// Both devices compute independently; no key exchange
-sharedSecret = ECDH(myPrivkey, pairedDevicePubkey)
+// Both contacts compute independently; no key exchange
+sharedSecret = ECDH(myPrivkey, pairedContactPubkey)
 
 // Directional derivation
 outboundChannelPrivkey = deriveChannelKey(sharedSecret, myPubkey, pairedPubkey)
@@ -206,11 +210,11 @@ outboundChannelPubkey = deriveChannelPubkey(outboundChannelPrivkey)
 
 **Viewer receives:**
 1. Sees event with `pubkey = outboundChannelPubkey` (unknown, but subscribed to it)
-2. Subscribed via `{ kinds: [5001, 5002, 5003, 5004, 5005], authors: [outboundChannelPubkey] }` — all signal kinds for this channel
+2. Subscribed via `{ kinds: [5001,5002,5003,5004,5005,5006,5010,5011], authors: [outboundChannelPubkey] }` — all signal kinds for this channel
 3. Decrypts content using `inboundChannelPrivkey` (independently derived from shared secret — same key as monitor's `outboundChannelPrivkey`)
 
 **Relay perspective:**
-- Sees two channel pubkeys (outbound, inbound) that look like pseudonyms
+- Sees two channel pubkeys (outbound, inbound) that look like pseudonyms; no real identity pubkeys
 - Cannot correlate to real identities without breaking ECDH (computationally infeasible)
 - Can use `authors` filter (efficient)
 - Honest timestamps enable 1-hour `since` filtering (instead of ~1.6 hours)
@@ -239,6 +243,7 @@ Each signal type has its own Nostr kind. Relays cannot filter by encrypted conte
 | 5003 | RTC Hangup | NIP-44 | ECDH channel | ~10s | `false` = hangup initiation, `true` = ack (optional) |
 | 5004 | Status | NIP-44 | ECDH channel | ~3600s | `false` = presence announcement, `true` = reply to announcement |
 | 5005 | Relay Migration | NIP-44 | ECDH channel | ~300s | `false` = relay proposal, `true` = acknowledgement |
+| 5006 | Remote Command | NIP-44 | ECDH channel | ~30s | `false` = TOTP-authorized command, `true` = ack after TOTP validation |
 
 ### Action Signals
 
@@ -251,16 +256,16 @@ Pipeline-driven notifications sent from monitor to specific paired viewers. Same
 
 Footage and segment data are never sent over Nostr. The kind 5010 payload carries only what happened and when; the viewer requests media over the RTC data channel.
 
-### Pairing
+### Pairing and Pre-Contact
 
-These kinds handle device discovery and initial identity exchange. They are distinct from all post-pairing kinds (5001–5011) — the only layer where real pubkeys appear on Nostr.
+These kinds handle device discovery, initial identity exchange, and pre-contact delivery. They are distinct from all post-contact kinds (5001–5011) — the only layer where real pubkeys may appear on Nostr.
 
 | Kind | Name | Encrypted | Purpose |
 |------|------|-----------|---------|
-| 5100 | QR Acceptance | NIP-44 (temp channel key) | Acceptance event signed with ephemeral viewer key; monitor decrypts with invite privkey |
-| 5200 | Nostr Invite | NIP-59 gift wrap | Nostr-delivered pairing invite; 3-layer gift wrap containing ephemeral reply key + TOTP credential |
+| 5100 | QR/Mailbox Acceptance | NIP-44 (temp channel key) | Acceptance event signed with ephemeral viewer key; triggered by QR scan or Nostr-delivered invite (TempContact channel); monitor decrypts with invite privkey |
+| 5201 | TOTP Mailbox Delivery | NIP-44 to HKDF-derived mailbox pubkey | Pre-contact one-shot delivery; `#p` tag routes to mailboxPubkey (not real pubkey); closed after TempContact is established |
 
-**Note:** Kinds 5100 and 5200 are not signal kinds. They use different encryption models (temp channel key, gift wrap) and are fetched via `#p` tag filtering, not `since` filtering. They do not flow through the signal router.
+**Note:** Kinds 5100 and 5201 are not signal kinds. They use different encryption models and are fetched via `#p` tag filtering, not `since` filtering. They do not flow through the signal router.
 
 ## 7. Subscriptions and Filters
 
@@ -306,16 +311,22 @@ A **subscription** is a long-lived query that returns both historical events and
 **Signal subscription (all signal kinds, T+0 only):**
 ```json
 {
-  "kinds": [5001, 5002, 5003, 5004, 5005, 5010, 5011],
+  "kinds": [5001, 5002, 5003, 5004, 5005, 5006, 5010, 5011],
   "authors": ["inboundChannelPubkey"],
   "since": now
 }
 ```
 Subscribe to future signals and action signals from a specific contact (by channel pubkey). `since: now` is always used — no history replay. History for action signals (5010, 5011) is fetched via `fetchKindHistory(contactId, kind, { windowStart: lastOnline })` on reconnect.
 
+**TOTP mailbox subscription (one-shot, pre-contact):**
+```json
+{ "kinds": [5201], "#p": ["mailboxPubkey"] }
+```
+Opened when no channel key exists yet. Closed after a TempContact is established and the mailbox keypair is discarded. Kind 5201 is not part of the signal router — it is a separate, short-lived subscription.
+
 **Action signal subscription (kinds 5010, 5011):**
 
-Action signals flow through the signal router — no separate subscription needed. They arrive via `onSignal(contactId, kind, payload)` alongside all other post-pairing signals. History is fetched via `fetchKindHistory(contactId, 5010, opts)` using the same fan-fetch mechanism.
+Action signals flow through the signal router — no separate subscription needed. They arrive via `onSignal(contactId, kind, payload)` alongside all other post-contact signals. History is fetched via `fetchKindHistory(contactId, 5010, opts)` using the same fan-fetch mechanism.
 
 ## 8. Keypairs and Derivation
 
@@ -326,19 +337,30 @@ Every device has one **identity keypair:**
 - **Privkey:** 32-byte random value (Uint8Array), stored in IndexedDB (browser sandbox provides encryption at rest)
 - **Pubkey:** 64-character hex string, derived via secp256k1 from privkey
 
-This keypair is used only for pairing events (5100, 5200) and as input to ECDH shared secret derivation. It never appears as the `pubkey` field on any post-pairing Nostr event.
+This keypair is used only for pairing events (kind 5100) and as input to ECDH shared secret derivation. It never appears as the `pubkey` field on any post-contact Nostr event.
 
 ### ECDH Shared Secret
 
 When pairing two devices, a **shared secret** is computed:
 
 ```
-sharedSecret = ECDH(myPrivkey, pairedDevicePubkey)
+sharedSecret = ECDH(myPrivkey, pairedContactPubkey)
 ```
 
 - Computed once per pair, not persisted
 - Only the paired devices can compute it (requires one privkey + other pubkey)
 - Used as input to channel key derivation
+
+### Mailbox Keypair
+
+Derived from a TOTP seed when no channel key exists yet:
+
+```
+mailboxPrivkey = HKDF(totpSeed, "senstry-v1-mailbox")   // secp256k1 privkey
+mailboxPubkey  = secp256k1(mailboxPrivkey)
+```
+
+The mailboxPubkey is used as the `#p` routing target and NIP-44 recipient key in kind 5201 events. The mailboxPrivkey is used to decrypt incoming kind 5201 deliveries. This keypair is ephemeral — discarded once a TempContact is established from the received message. The relay sees only the derived mailboxPubkey (not the device's real identity pubkey) in the `#p` tag.
 
 ### Channel Keys
 
@@ -360,7 +382,21 @@ inboundChannelPubkey = secp256k1(inboundChannelPrivkey)
 - Non-persisted: recomputed each session from pairing data
 - Pseudonymous: relay sees channel pubkey, not identity
 
-## 9. Event Tags and Conventions
+## 9. Contact Model
+
+Senstry uses two contact types. Both expose the same signal API — `publishSignal(contactId, kind, payload)` — and are handled identically by the signal router.
+
+| Property | TempContact | PairedContact |
+|----------|-------------|---------------|
+| Origin | Created from a TOTP mailbox delivery (kind 5201) | Created from a QR/URI/Nostr pairing invite |
+| Channel keys | Fresh ephemeral keypair (sender's `replyKey`) | ECDH-derived from shared invite secret |
+| Persistence | Memory-only; TTL-bound | IDB-backed; persistent across sessions |
+| Identified by | `contactId` | `contactId` |
+| Signal kinds | 5001–5006, 5010, 5011 | 5001–5006, 5010, 5011 |
+
+Both contact types always have a non-null `outboundChannelPubkey`. The null case does not exist — there is no code path that publishes a signal without a channel key.
+
+## 10. Event Tags and Conventions
 
 Tags are optional metadata attached to events. Format is an array of arrays: `["tag-name", "value-1", "value-2"]`.
 
@@ -369,6 +405,7 @@ Tags are optional metadata attached to events. Format is an array of arrays: `["
 | Tag | Format | Purpose |
 |-----|--------|---------|
 | `p` | `["p", "pubkey"]` | NIP-44 recipient; also marks a pubkey mention |
+| `p` | `["p", mailboxPubkey]` | TOTP mailbox routing — present only in kind 5201 pre-contact events; the value is the HKDF-derived mailboxPubkey, not a real identity pubkey; absent from all post-contact signals |
 | `e` | `["e", "event-id"]` | Reference to another event |
 | `relay` | `["relay", "url"]` | Relay hint (where to fetch related events) |
 | `t` | `["t", "tag"]` | Hashtag (e.g., `["t", "motion-detection"]`) |
@@ -393,7 +430,7 @@ Tags are optional metadata attached to events. Format is an array of arrays: `["
 }
 ```
 
-## 10. Timestamps and TTL
+## 11. Timestamps and TTL
 
 ### created_at Field
 
@@ -413,6 +450,7 @@ The client discards received events if they are older than a threshold:
 | 5001–5003 (RTC handshake) | ~10s | Stale offers and answers are unusable |
 | 5004 (status) | ~3600s | Presence is meaningful for up to 1 hour |
 | 5005 (relay migration) | ~300s | Stale proposals are ignored |
+| 5006 (remote command) | ~30s | Commands must be acted on promptly; stale commands discarded silently |
 | 5010 (trigger) | ~10s | Notifications must be acted on promptly |
 | 5011 (arm state) | ~10s | State changes must be recent |
 
@@ -427,11 +465,11 @@ if (now - event.created_at > TTL_SECONDS) {
 
 **Scope:** TTL applies to live signal router delivery — events arriving on a T+0 subscription that exceed their TTL are discarded as stale. `fetchKindHistory()` bypasses TTL entirely; it is an intentional request for historical data with a caller-controlled time window (default 2 days). Missed action signals (kinds 5010, 5011) are retrieved this way on reconnect.
 
-## 11. Event Immutability and Replaceable Events
+## 12. Event Immutability and Replaceable Events
 
 ### Standard Events (Immutable)
 
-All signal and action signal kinds (5001–5005, 5010, 5011) and pairing kinds (5100, 5200) are standard (non-replaceable) events:
+All signal and action signal kinds (5001–5006, 5010, 5011) and pairing kinds (5100, 5201) are standard (non-replaceable) events:
 - Once published, content cannot change
 - Multiple events with the same `(pubkey, kind)` can coexist
 - Relay returns all matching events unless further filtered
@@ -442,7 +480,7 @@ All signal and action signal kinds (5001–5005, 5010, 5011) and pairing kinds (
 
 Senstry does not use replaceable event kinds (kind ≥ 30000). Footage metadata, segment references, and coverage maps are exchanged over the RTC data channel, not over Nostr.
 
-## 12. Privacy Model
+## 13. Privacy Model
 
 ### Public Information on Relay
 
@@ -450,23 +488,29 @@ Relays store all events. An observer with access to a relay (relay operator, net
 
 - **Event metadata:** id, pubkey, kind, created_at, tags (unencrypted)
 - **Event signature:** verifiable proof of signer
-- **Unencrypted tags:** `p` tags (recipient pubkey), `e` tags (referenced event), `d` tags (dedup key), etc.
+- **Unencrypted tags:** `p` tags (routing target), `e` tags (referenced event), `d` tags (dedup key), etc.
+
+### What Real Pubkeys Touch
+
+Real device identity pubkeys appear only in kind 5100 events — the pairing acceptance event, which is signed with an ephemeral viewer key (not the device's long-term identity key). In TOTP mailbox delivery (kind 5201), the relay sees only the HKDF-derived `mailboxPubkey` in the `#p` tag — never the device's real identity pubkey. All post-contact signals (kinds 5001–5006, 5010, 5011) use channel pubkeys only; real pubkeys are never present.
 
 ### Private Information (Encrypted)
 
-- **Event content:** encrypted with NIP-44 (or other encryption)
-- **Signal identities:** Channel pubkeys are pseudonymous; real pubkey is not visible in signal events
+- **Event content:** encrypted with NIP-44 in all signal and pairing kinds
+- **Signal identities:** Channel pubkeys are pseudonymous; real pubkey is not visible in any post-contact event
+- **Mailbox routing:** kind 5201 `#p` tag contains only the derived mailboxPubkey, not a real identity
 
 ### Threat Model: Relay Operator
 
 A relay operator can:
-- **Correlate:** "Device X (pubkey A) sent to Device Y (pubkey B) at time Z"
-- **Infer:** trigger patterns, arm/disarm times, message volume
-- **Cannot see:** event content, WebRTC media, true identities of channel key users
+- **Observe:** pseudonymous channel pubkeys, kind numbers, timestamps, encrypted content
+- **Infer:** relative timing and volume of signaling, pairing events (kind 5100 — signed with ephemeral key)
+- **Cannot see:** real device identities, event plaintext, WebRTC media, TOTP seeds, or channel key derivation inputs
 
 **Mitigations:**
 - Content encrypted with NIP-44
-- Channel keys pseudonymous
+- Post-contact events use channel pubkeys only (pseudonymous)
+- Pre-contact (TOTP mailbox) uses derived mailboxPubkey — not real identity
 - Media never on relay (P2P only)
 
 ### Media Privacy
@@ -479,14 +523,14 @@ Relays see only:
 
 Media content is unknown to relays.
 
-## 13. Scalability Considerations
+## 14. Scalability Considerations
 
 ### Event Growth
 
 Nostr relays by default retain all events indefinitely. This can lead to unbounded storage growth.
 
 **Senstry mitigations:**
-- **Kinds 5001–5005 (signals):** Short TTL and honest timestamps mean relays can prune old events; client subscriptions use a bounded `since` window
+- **Kinds 5001–5006 (signals):** Short TTL and honest timestamps mean relays can prune old events; client subscriptions use a bounded `since` window
 - **Kinds 5010, 5011 (action signals):** Accumulate on relay per contact's relay list; relay operators can prune based on retention policy
 
 ### Query Efficiency
@@ -509,7 +553,7 @@ Relays may enforce rate limits to prevent spam:
 - Subscription coalescing: multiple related queries are merged into single subscription
 - Single-relay publish: each event goes to one relay (LRU-eligible, selected by RelayStateController); history fan-fetches from all relays to find it regardless of which one was used
 
-## 14. Nostr Ecosystem Context
+## 15. Nostr Ecosystem Context
 
 Nostr powers diverse applications:
 - **Social networks:** Damus, Amethyst (Twitter clone with notes)
@@ -521,7 +565,7 @@ Nostr powers diverse applications:
 
 **Senstry is independent:** Does not interact with social apps, does not use Nostr for media transport, focuses narrowly on signaling and notifications.
 
-## 15. Event Lifecycle Example: Trigger Fired
+## 16. Event Lifecycle Example: Trigger Fired
 
 Walk-through of a complete trigger event from sensor to viewer UI.
 
@@ -544,7 +588,7 @@ Walk-through of a complete trigger event from sensor to viewer UI.
    - Signed with outbound channel privkey — real identity never exposed
 5. **RelayStateController:** Selects next available relay from contact's outbound relay list (LRU)
 6. **Relay:** Receives event, validates signature, stores, notifies subscribers
-7. **Viewer:** T+0 subscription matches `{ kinds: [5010, ...], authors: [monitor-outbound-channel-pubkey] }` — event delivered
+7. **Viewer:** T+0 subscription matches `{ kinds: [5001,5002,5003,5004,5005,5006,5010,5011], authors: [monitor-outbound-channel-pubkey] }` — event delivered
 8. **NostrClient (viewer):** Decrypts with inbound channel privkey, delivers `onSignal(monitorContactId, 5010, payload)`
 9. **Viewer UI:** Receives `(monitorContactId, 5010, { sensorType, level, detectedAt })` — adds alert marker to timeline
 10. **Viewer:** Requests pre/post-roll footage from monitor over the existing RTC data channel
@@ -556,7 +600,7 @@ Walk-through of a complete trigger event from sensor to viewer UI.
 - **Relay operator cannot infer:** Which devices are communicating (channel pubkeys are unlinkable to real pubkeys without the ECDH secret)
 - **Media:** Never on relay — transferred P2P via WebRTC only
 
-## 16. Architecture Principles
+## 17. Architecture Principles
 
 ### Immutability First
 
@@ -582,14 +626,14 @@ Filtering, dedup, verification, rate limiting all client-side. Relays are dumb. 
 
 Pubkey is derived from privkey via secp256k1. No usernames, no accounts, no servers. Consequence: identity is cryptographic; can be verified anywhere.
 
-## 17. Summary: Why Nostr for Senstry
+## 18. Summary: Why Nostr for Senstry
 
 | Need | Nostr Feature | Benefit |
 |------|---------------|---------|
 | P2P signaling without central server | Relay is stateless, events are signed | No account creation, no server trust required |
 | Scalable WebRTC handshake | Kinds 5001–5003 with ECDH channel keys | 3 events for initial connection, 2 for live upgrade |
 | Targeted action notifications | Kinds 5010, 5011 over channel keys | Trigger and arm-state signals reach specific paired viewers; relay sees no real identities |
-| Privacy from relay | NIP-44 + ECDH channel keys for all post-pairing events | Real pubkeys never appear after pairing; relay cannot correlate device identities |
+| Privacy from relay | NIP-44 + ECDH channel keys for all post-contact events; TOTP mailbox for pre-contact | Real pubkeys never appear in post-contact signals; relay cannot correlate device identities |
 | Media NOT on relay | P2P WebRTC only | Relays see only signaling; all footage stays on edge |
 
 Nostr is a messaging layer optimized for **signed, queryable, immutable events with optional encryption.** It is not optimized for media streaming (hence WebRTC for media) or high-frequency state sync (hence WebRTC data channels for commands).

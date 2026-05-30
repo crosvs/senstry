@@ -8,10 +8,11 @@ SentrySection.svelte  (thin UI layer)
   │  renders arm/disarm button, status, sensor readings
   │  forwards user gestures (arm, disarm) to controllers
   │
-  ├── DetectorController       manages detector instances + sensorStates
-  ├── ActionController         manages actionStates, evaluates links
-  ├── RecordingController      manages MediaRecorder sessions
-  └── TriggerPublisher         sends action signals (kind 5010/5011) to targeted paired contacts via channel keys
+  ├── DetectorController         manages detector instances + sensorStates
+  ├── ActionController           manages actionStates, evaluates links
+  ├── RecordingController        manages MediaRecorder sessions
+  ├── TriggerPublisher           sends action signals (kind 5010/5011) to targeted paired contacts via channel keys
+  └── RemoteCommandController    receives kind 5006 from signal router, validates TOTP, dispatches to handlers
 ```
 
 Each controller is a plain TypeScript class (no Svelte dependency). SentrySection instantiates them and passes config/identity as plain values — no store references inside controllers.
@@ -230,6 +231,66 @@ Calls `capturePhoto(stream, options)` and `saveSegment(blob, 'image/...', ...)` 
 
 ---
 
+## RemoteCommandController
+
+Receives kind 5006 (Remote Command) events from the signal router, validates the TOTP credential, and dispatches to the registered handler by `payload.payload.type`. Sends an ack over the same `contactId` before handler execution.
+
+```typescript
+class RemoteCommandController {
+  constructor(
+    nostrClient: NostrClient,
+    totpStore: TOTPCredentialStore,
+    onSignal: SignalRouterCallback,
+  ) {}
+
+  registerHandler(type: string, handler: RemoteCommandHandler): void
+  start(): void
+  stop(): void
+}
+
+interface RemoteCommandHandler {
+  handle(contactId: string, payload: unknown): Promise<void>;
+}
+```
+
+**Constructor arguments:**
+- `nostrClient` — used to publish ack signals via `publishSignal`
+- `totpStore` — provides credential lookup and rate limiting per contact
+- `onSignal` — `SignalRouterCallback` that delivers kind 5006 events from the signal router. The application's top-level `onSignal` handler fans out by kind — kind 5006 events are forwarded to `RemoteCommandController.handleCommand(contactId, payload)`; other kinds go to their respective handlers.
+
+**Responsibilities:**
+- Subscribes to the signal router for kind 5006 events via `onSignal`
+- Validates freshness: if `now - payload.created_at > payload.ttl`, discard silently
+- Looks up the TOTP credential for `contactId` from `totpStore`
+- Validates via `verifyRawSeed` or `verifyTOTPCode` depending on `payload.credential_type`
+- Records every attempt via `recordTOTPAttempt` (both success and failure)
+- If invalid: discard silently, no ack sent, rate limiting applied
+- If valid: `publishSignal(contactId, 5006, { isResponse: true, commandId, accepted: true, created_at: now })`, then call the registered handler
+- Dispatches by `payload.payload.type` — one registered handler per type
+- Ack confirms credential validity only; handler execution result is not part of the ack
+
+**Rules:**
+- No Svelte imports
+- Does not validate command semantics — only credential and freshness
+- Does not own TOTP seeds — receives `totpStore` at construction
+- Handler registration is explicit — no auto-discovery
+- One instance per app; shared across all contacts
+- Works with any contact type — does not distinguish `TempContact` from `PairedContact`; the TOTP credential in the payload is always the authorization mechanism regardless of how the contact was established
+
+**Handler registration example:**
+
+```typescript
+remoteCommandController.registerHandler("relay-migrate-command", {
+  handle: async (contactId, payload) => {
+    const { newRelays } = payload;
+    await nostrClient.requestRelayMigrationListening(contactId, newRelays, () => { /* dual-listen confirmed active */ });
+    // kind 5005 dual-channel migration proceeds from here; unchanged
+  },
+});
+```
+
+---
+
 ## SentrySection.svelte
 
 After extraction, `SentrySection.svelte` becomes:
@@ -243,8 +304,11 @@ After extraction, `SentrySection.svelte` becomes:
   let actionCtrl: ActionController | null = null;
   let recordingCtrl: RecordingController | null = null;
   let publishCtrl: TriggerPublisher | null = null;
+  let remoteCommandCtrl: RemoteCommandController | null = null;
 
   // Arm / disarm
+  // startMonitor: opens streams, instantiates all controllers (including remoteCommandCtrl), calls start() on each
+  // stopMonitor: calls stop() on all controllers (including remoteCommandCtrl.stop()), closes streams
   function startMonitor() { /* open streams, instantiate controllers, start all */ }
   function stopMonitor()  { /* stop all controllers, close streams */ }
 

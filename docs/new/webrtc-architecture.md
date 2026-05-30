@@ -17,7 +17,7 @@ Both cases share a single `RTCPeerConnection` per viewer per monitor. The mode (
 |--------|------|---|
 | `peer` | `RTCPeerConnection` factory, ICE gathering helpers | Symmetric (both sides use) |
 | `signaling` | Signal send/receive, encryption (ECDH channel keys), TTL + dedup | Symmetric |
-| `signal-router` | Single global subscription to all signal kinds (5001–5005, 5010, 5011), routing to handlers | Symmetric |
+| `signal-router` | Single global subscription to all signal kinds (5001–5006, 5010, 5011), routing to handlers; kind 5006 events are routed to RemoteCommandController | Symmetric |
 | `viewer-peer` | Viewer session management, Promise-based request API, session state | Viewer side |
 | `monitor-peer` | Monitor session management, data channel message server, connection setup | Monitor side |
 
@@ -51,11 +51,13 @@ interface RtcHangupPayload {
 ```
 
 **Nostr Transmission (all RTC signal kinds):**
-- Kinds: 5001 (session initiation), 5002 (answer), 5003 (hangup)
+- Kinds: 5001–5006, 5010, 5011 (see per-kind sections and nostr-communication-flow.md for payload types)
 - Encryption: NIP-44 ChaCha20-Poly1305 over ECDH-derived channel keys
 - Pubkey: ECDH channel key (not real identity key)
-- `created_at`: Honest timestamp (not randomized like gift-wrap)
+- `created_at`: Honest timestamp (not randomized)
 - Subscription: T+0 only (`since: now`); no history replay in subscribe
+
+**Gift wrap (NIP-59) is not used anywhere in Senstry.** All signals — both during pairing and post-contact — use single-layer NIP-44 encryption over ECDH-derived channel keys. Pre-contact delivery uses the TOTP mailbox (kind 5201), not NIP-59 gift wrap. See `nostr-communication-flow.md` for the full contact model and signal flow.
 
 ### Handshake Signal Kinds
 
@@ -145,6 +147,8 @@ interface RtcHangupPayload {
 **Handling:**
 - Auto-replied immediately with kind 5004 `isResponse=true, state: 'online'` (bypasses startup grace)
 - Signal router only auto-replies to `isResponse=false` events — prevents reply loops
+
+Kinds 5005 (Relay Migration) and 5006 (Remote Command) are handled by the signal router (see Module Responsibilities table); their payload structures are defined in `nostr-communication-flow.md`.
 
 ## ICE Gathering (Non-trickle)
 
@@ -484,7 +488,7 @@ The router derives inbound channel pubkeys from all paired devices (one per dire
 
 ```typescript
 // Conceptual subscription the router maintains per paired device:
-// { kinds: [5001, 5002, 5003, 5004, 5005, 5010, 5011], authors: [inboundChannelPubkey], since: now }
+// { kinds: [5001, 5002, 5003, 5004, 5005, 5006, 5010, 5011], authors: [inboundChannelPubkey], since: now }
 ```
 
 **Transmission:** `sendSignal()`
@@ -498,9 +502,9 @@ const plaintext = JSON.stringify(msg);
 const content = encryptSignalContent(plaintext, outboundChannelPrivkey, outboundChannelPubkey);
 
 const event = finalizeEvent({
-  kind: kind,  // 5001–5005 depending on signal type
+  kind: kind,  // 5001–5006, 5010, 5011 depending on signal type
   created_at: Math.floor(Date.now() / 1000),  // honest timestamp (not randomized)
-  tags: [['p', outboundChannelPubkey]],
+  tags: [],
   content
 }, outboundChannelPrivkey);
 ```
@@ -509,7 +513,7 @@ const event = finalizeEvent({
 
 - **No key exchange:** Channel keys are derived from already-known shared secret (real ECDH)
 - **Honest timestamps:** No randomization; `since` filters become reliable, subscription window shrinks to ~1h
-- **Single-layer encryption:** One NIP-44 layer instead of two (gift-wrap outer + inner)
+- **Single-layer encryption:** One NIP-44 layer over ECDH-derived channel keys
 - **Backward compatible:** No re-pairing needed; all existing paired devices benefit automatically
 
 ### Implementation Detail

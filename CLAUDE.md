@@ -68,9 +68,8 @@ Nothing is auto-discovered or implicitly connected. Every pipeline component is 
 
 | File                                     | What it covers                                                                                     |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `docs/new/nostr-foundation.md`           | Core Nostr protocol concepts, event model, NIPs used                                               |
-| `docs/new/nostr-redesign.md`             | ECDH channel key design rationale and relay management                                             |
-| `docs/new/nostr-controller.md`           | NostrController architecture: RelayPool, PublishQueue, SubscriptionManager, RateLimiter            |
+| `docs/new/nostr-foundation.md`           | Core Nostr protocol concepts, event model, NIPs used, ECDH channel key design, contact model       |
+| `docs/new/nostr-controller.md`           | NostrClient architecture: RelayPool, PublishQueue, SubscriptionManager, RelayStateController       |
 | `docs/new/nostr-communication-flow.md`   | Device pairing, signal exchange, relay migration, TOTP, Nostr actions                              |
 | `docs/new/sentry-pipeline-foundation.md` | Sentry pipeline: sources, sensors, channels, links, actions, segments                              |
 | `docs/new/sentry-controller.md`          | Controller extraction: DetectorController, ActionController, RecordingController, TriggerPublisher |
