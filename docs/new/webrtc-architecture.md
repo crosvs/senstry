@@ -78,7 +78,7 @@ interface RtcHangupPayload {
 - Sends back an `offer` signal (with SDP)
 - Resets idle timeout
 
-**Rate limiting:** Data-mode offer-requests are rate-limited to 1 per 5s per viewer to absorb relay replays on startup. Live-mode bypasses this since it's user-initiated.
+**Stale event protection:** Relay replay of buffered offer-requests cannot reach the monitor. The signal router opens a T+0 subscription (`since: now`), so events published before the subscription opened are never delivered. The 10-second TTL on kind 5001 discards any event that somehow arrives outside that window. A new offer-request from a viewer always closes the existing session before creating a new one, so rapid reconnects are safe without a per-viewer gate.
 
 #### Kind 5001 isResponse=true — Offer (SDP)
 **Direction:** Monitor → Viewer (initial, or renegotiation)  
@@ -595,7 +595,6 @@ const globalGeneration = number;
 - One session per viewer pubkey
 - `generation` tracks connection version (incremented on closeSession); allows stale signal handlers to ignore outdated work
 - `idleTimer` resets on every control-channel message; fires hangup after timeout
-- Rate-limit map: `offerRequestTimes: Map<viewerPubkey, timestamp>` tracks data-mode offer-request spam
 
 ### Cross-Role Coordination
 
