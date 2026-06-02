@@ -120,7 +120,7 @@ const viewerOutbound = deriveChannelKey(sharedSecret, viewerPubkey, monitorPubke
 - RTC handshake (kinds 5001, 5002, 5003): `SIGNAL_TTL_S = 10` — stale offers, answers, hangups are discarded
 - Presence (kind 5004): `STATUS_TTL_S = 3600` (1 hour) — status is meaningful for up to 1 hour
 - Relay migration (kind 5005): ~300s — proposals stay valid while the migration negotiation completes
-- Remote command (kind 5006): ~30s — commands must be acted on promptly; stale commands discarded silently
+- Remote command (kind 5006): ~30s signal TTL (live delivery filter); `RemoteCommandController` additionally validates `payload.ttl` per command (e.g. 300s) — governs both live and history-fetched commands
 - Action signals (kinds 5010, 5011): ~10s — trigger and arm-state signals are discarded if stale
 
 Kind 5004 with `isResponse: false` acts as both announcement and solicitation — there is no separate status-request kind. `ping`/`pong` are not signal kinds; connectivity checks happen at the WebRTC or relay-connection layer, not via Nostr signals.
@@ -392,6 +392,8 @@ Two channels per connection:
 | `segment-channels` | M→V | `{ type, channels: [string] }` | Array of channel names |
 | `coverage-channels-request` | V→M | `{ type, mimePrefix? }` | Per-channel coverage |
 | `coverage-channels` | M→V | `{ type, coverage: {[channelId]: [[start, end], ...]} }` | Coverage by channel |
+| `segments-in-range-request` | V→M | `{ type, from, to, limit, order, knownIds, mimePrefix?, channelId? }` | Metadata for segments in a time range, excluding known IDs |
+| `segments-in-range` | M→V | `{ type, segments: [SegmentMeta] }` | Response: metadata array (up to limit) |
 | `channel-list-request` | V→M | `{ type }` | Monitor's live ChannelConfig list |
 | `channel-list` | M→V | `{ type, channels: [ChannelConfig] }` | Response with config array |
 

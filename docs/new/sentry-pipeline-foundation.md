@@ -292,7 +292,7 @@ type ActionState =
 - **RecordSegmentsAction per-track arbitration** (recording decisions): Higher priority wins; if priorities are equal, **insertion order into `ActionController.recordingActions` determines precedence** (first action added to config wins). This applies only to recording decisions.
 - **SourceOverrideAction per-track arbitration** (configuration overrides): Higher priority wins; if priorities are equal, **earliest activation timestamp determines precedence** (independent of insertion order). This applies to non-recording configuration overrides.
 
-Both rules ensure deterministic resolution even when actions activate simultaneously. (Note: Future RecordSegmentsActions may include a "parallel segmenting" setting, exempting them from these priority checks)
+Both rules ensure deterministic resolution even when actions activate simultaneously.
 
 ### RecordSegmentsAction
 
@@ -374,7 +374,7 @@ Channel records with: lowres-video (from B), rolling-buffer-audio (fallback)
 
 ### SourceOverrideAction
 
-**Purpose:** temporarily override a channel's source selection (e.g., switch to backup camera, switch to external microphone). A general-purpose config-change action that may affect other pipeline nodes in future extensions.
+**Purpose:** temporarily override a channel's source selection (e.g., switch to backup camera, switch to external microphone). A general-purpose config-change action that can affect downstream pipeline nodes that read from the channel's active source.
 
 **Configuration:**
 ```typescript
@@ -512,12 +512,12 @@ T=10s:  MotionSensor stops
         - activeRecordSegmentRequests.audio: undefined
         - Channel records with: lowres-video (from B), rolling-audio (fallback)
 
-T=20s:  RecordSegmentsAction A post-roll expires
-        - RecordSegmentsAction A: cooldown → idle
-
 T=15s:  AudioSensor stops
         - Link B evaluates: false
         - RecordSegmentsAction B: active → cooldown
+
+T=20s:  RecordSegmentsAction A post-roll expires
+        - RecordSegmentsAction A: cooldown → idle
 
 T=25s:  RecordSegmentsAction B post-roll expires
         - RecordSegmentsAction B: cooldown → idle

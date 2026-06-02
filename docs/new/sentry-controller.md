@@ -119,7 +119,7 @@ A general-purpose action that temporarily changes pipeline configuration during 
 - Per-track independent arbitration: video and audio can have different active overrides (handled by RecordingController)
 - Fires `onActivate` callback when transitioning to `active`; fires `onDeactivate` when post-roll expires
 - Post-roll semantics identical to RecordSegmentsAction: extends active window for configurable duration after trigger ends
-- **Tiebreaker (equal priority):** If two SourceOverrideActions target the same track with identical priority, the action with the earliest activation timestamp wins. Within RecordingController's per-track arbitration, this is consistent with RecordSegmentsAction behavior: earliest activation time determines precedence (not insertion order into config). This ensures deterministic resolution even when actions activate simultaneously.
+- **Tiebreaker (equal priority):** If two SourceOverrideActions target the same track with identical priority, the action with the earliest activation timestamp wins. This differs from RecordSegmentsAction tiebreaker, which uses insertion order into config (first action added to config wins) rather than activation timestamp. Both rules ensure deterministic resolution even when actions activate simultaneously.
 
 ---
 
@@ -256,7 +256,7 @@ interface RemoteCommandHandler {
 **Constructor arguments:**
 - `nostrClient` — used to publish ack signals via `publishSignal`
 - `totpStore` — provides credential lookup and rate limiting per contact
-- `onSignal` — `SignalRouterCallback` that delivers kind 5006 events from the signal router. The application's top-level `onSignal` handler fans out by kind — kind 5006 events are forwarded to `RemoteCommandController.handleCommand(contactId, payload)`; other kinds go to their respective handlers.
+- `onSignal` — `SignalRouterCallback` that delivers kind 5006 events from the signal router. The application's top-level `onSignal` handler fans out by kind — kind 5006 events are delivered to `RemoteCommandController` via this callback; other kinds go to their respective handlers.
 
 **Responsibilities:**
 - Subscribes to the signal router for kind 5006 events via `onSignal`

@@ -35,6 +35,8 @@ await nostrClient.publishSignal(contactId, kind, payload);
 
 `publishSignal` resolves the contact's outbound channel keypair and relay list, NIP-44 encrypts the payload, signs the event with the channel key, and delivers to the selected relay. The kind number determines the signal type; the contactId determines routing.
 
+`publishSignalDirect` has the same `(contactId, kind, payload)` signature but bypasses the queue and publishes immediately. Use it for time-sensitive signals — status announcements (kind 5004) and RTC handshake (kinds 5001, 5002) — where delay makes the signal useless. `publishSignal` is the default for everything else: trigger notifications, arm state, remote commands, relay migration proposals. All relay selection and encryption are internal regardless of which variant is used.
+
 ### What the Relay Sees
 
 For any post-contact signal — whether from a TempContact or PairedContact — the relay sees only:
@@ -434,7 +436,7 @@ const payload: QRPayload = {
   pk: monitorRealPubkey, // monitor's identity
   relays: ["wss://relay1.com", "wss://relay2.com"],
   id: crypto.randomUUID(),
-  ttl: 300, // 5 minutes
+  ttl: Math.floor(Date.now() / 1000) + 300, // unix expiry timestamp (now + 5 min)
   label: "Living Room Camera",
 };
 
@@ -741,7 +743,7 @@ export async function generateQRAndListenForAcceptance(
     (_since) => {}, // long-lived until QR is cancelled; no history fetch needed
   );
 
-  return { qrDataUrl, uri, unsubscribe: () => acceptanceHandle.unsubscribe() };
+  return { qrDataUrl, uri, cleanup: () => acceptanceHandle.unsubscribe() };
 }
 ```
 
@@ -801,6 +803,202 @@ const viewerOutbound = deriveChannelKey(
 - No key exchange is needed — both sides compute from existing identities
 - The temporary channel key for acceptance is **ephemeral** — only used once, then discarded
 - The post-pairing keys are **derived from real identities**, not stored — re-derived on app restart
+
+### Acceptance Message Format
+
+The acceptance payload (encrypted and published by viewer) contains all information needed for the monitor to complete pairing:
+
+```typescript
+interface QRAcceptancePayload {
+  type: "qr-acceptance";
+  viewerPubkey: string; // viewer's real pubkey (hex, 64 chars)
+  viewerRelays: string[]; // where monitor should send signals to viewer
+  timestamp: number; // unix seconds (creation time)
+  inviteId: string; // echoed from QR payload; secondary correlation check
+}
+```
+
+**Correlation:** Successful decryption with the `ephemeral_invite_privkey` already identifies which QR the acceptance belongs to — each active QR has a distinct ephemeral key and only that key can decrypt. The `inviteId` field provides an additional explicit check (`acceptance.inviteId !== qrPayload.id → reject`) so the monitor never accidentally processes an acceptance from a different concurrent invite.
+
+**Encryption and signing:**
+
+```
+┌─────────────────────────────────────────────┐
+│ QR Acceptance Event (Kind 5100)             │
+├─────────────────────────────────────────────┤
+│ pubkey: ephemeralViewerPubkey               │
+│ (random key, never reused)                  │
+│                                             │
+│ tags:                                       │
+│   ['p', monitor_real_pubkey]                │
+│   ['v', '2']                                │
+│                                             │
+│ content: (encrypted with temporary key)     │
+│   NIP-44 ChaCha20-Poly1305 {                │
+│     type: 'qr-acceptance',                  │
+│     viewerPubkey,                           │
+│     viewerRelays,                           │
+│     timestamp,                              │
+│     inviteId                                │
+│   }                                         │
+│                                             │
+│ created_at: honest unix timestamp           │
+│ sig: ephemeralViewerPrivkey signature       │
+└─────────────────────────────────────────────┘
+```
+
+### Recovery & Error Scenarios
+
+**Scenario 1: Acceptance event lost to relay**
+
+- Viewer published acceptance to all relays in QR
+- If some/all relays lose the event, monitor never receives it
+- **Recovery:** Viewer can rescan QR and retry. Since inviteId is echoed, retries are safe (idempotent).
+- **Timeout:** Monitor's listening window is typically 5 minutes (QR TTL). After that, it stops listening for that invite.
+
+**Scenario 2: Network lag (late acceptance)**
+
+- Viewer publishes acceptance but it reaches relay after QR TTL expires
+- Monitor already stopped listening
+- **Recovery:** Viewer should rescan QR or ask monitor to generate a fresh invite. TTL validation on viewer side prevents accepting stale QRs.
+
+**Scenario 3: Duplicated acceptance event**
+
+- Relay redelivers the same acceptance event (replay)
+- Monitor receives it twice (same event ID)
+- **Recovery:** Monitor deduplicates by event ID: `if (acceptanceHandlers.has(event.id)) return;`
+
+**Scenario 4: Acceptance signed with wrong key**
+
+- Event signature doesn't match the pubkey
+- **Recovery:** Nostr clients validate signatures automatically. Invalid events are rejected before reaching decryption logic.
+
+**Scenario 5: Viewer loses QR before acceptance**
+
+- Viewer scanned QR but app crashed before publishing acceptance
+- **Recovery:** Viewer needs to rescan (or ask monitor to regenerate). There's no state to recover; just redo the scan and accept.
+
+**Scenario 6: Monitor loses invite privkey**
+
+- Monitor generated QR, then app crashed before storing ephemeralInvitePrivkey
+- Monitor can no longer decrypt acceptances for that QR
+- **Recovery:** Monitor stops listening for that QR after TTL expires. Viewer will notice pairing didn't complete and should ask monitor to generate a new invite.
+
+### Post-Contact Transition to Channel Keys
+
+After successful invite acceptance (whether QR or Nostr delivery), both devices have:
+
+- Each other's **real pubkeys** (from QR payload and acceptance message)
+- **Relay lists** (from QR and acceptance)
+- **Shared ECDH secret** (computed from their privkeys)
+
+Now they can **independently derive post-pairing channel keys**:
+
+```typescript
+// Monitor's computation:
+const monitorSharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
+const monitorInbound = deriveChannelKey(
+  monitorSharedSecret,
+  viewerPubkey,
+  monitorPubkey,
+);
+const monitorOutbound = deriveChannelKey(
+  monitorSharedSecret,
+  monitorPubkey,
+  viewerPubkey,
+);
+
+// Viewer's computation:
+const viewerSharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
+const viewerInbound = deriveChannelKey(
+  viewerSharedSecret,
+  monitorPubkey,
+  viewerPubkey,
+);
+const viewerOutbound = deriveChannelKey(
+  viewerSharedSecret,
+  viewerPubkey,
+  monitorPubkey,
+);
+
+// Both derive identical keys:
+// monitorOutbound === viewerInbound  ✓
+// monitorInbound === viewerOutbound  ✓
+```
+
+All subsequent signals (status, RTC handshake, relay updates, etc.) are published with these **channel key pubkeys** and **single-layer NIP-44 encryption**. Real pubkeys never appear on Nostr again.
+
+### Security Considerations
+
+**Threat 1: QR Code Interception**
+
+- **Risk:** Attacker sees QR on screen and scans it before intended viewer
+- **Mitigation:** QR should be displayed in a physically secure context (locked room, private screen). Same as WiFi QR — user responsibility.
+- **Expiration:** TTL (e.g., 5 minutes) means old screenshots are useless
+
+**Threat 2: Relay Eavesdropping**
+
+- **Risk:** Relay operator sees acceptance event on relay and tries to decrypt
+- **Mitigation:** Acceptance is encrypted with temporary channel key; relay can't decrypt it. Even if they somehow decrypt it, they only see viewer's real pubkey + relays — can't act on it without the invite privkey.
+
+**Threat 3: Acceptance Forgery**
+
+- **Risk:** Attacker publishes a fake acceptance event claiming to be a different viewer
+- **Mitigation:** Acceptance is signed (Nostr signature) and encrypted. Forger would need:
+  1. Know the ephemeral invite pubkey (from QR) ✓ (attacker can scan)
+  2. Derive the temporary channel key ✓ (same ECDH derivation)
+  3. Encrypt valid acceptance JSON ✓ (encrypt())
+  4. But... signature is wrong (doesn't match ephemeral pubkey) — **Nostr rejects invalid signatures**
+  5. Even if signature is valid, monitor checks `inviteId` in acceptance payload — must match the specific QR
+  6. Attacker can only accept on behalf of the ephemeral key they sign with, not claim to be someone else
+
+  **Result:** Forged acceptance either has invalid signature (rejected) or creates a pairing with a wrong viewer pubkey (attacker's, not the intended viewer's). Monitor would need to trust the acceptance content; but acceptance contains an explicit `viewerPubkey` field, so attacker can't trick monitor into pairing with someone else.
+
+**Threat 4: Private Key Theft**
+
+- **Risk:** Attacker steals monitor's or viewer's privkey, then generates new QRs or acceptances
+- **Mitigation:** Same as any key-based system. Private keys must be protected by the device's OS (Keychain, Android Keystore, etc.). Out of scope for Nostr protocol.
+
+**Threat 5: Relay Censorship**
+
+- **Risk:** Relay blocks acceptance event (DOSes pairing)
+- **Mitigation:** Fanout to multiple relays. If at least one relay accepts, acceptance succeeds. Monitor listens on all relays listed in QR.
+
+**Why real pubkeys are safe in acceptance payload:**
+
+- Acceptance is **encrypted** — relay can't see it
+- Acceptance is **ephemeral** — lives only on relays for ~5 minutes
+- Acceptance includes **inviteId** — only valid for this specific QR
+- Acceptance is **idempotent** — retrying doesn't cause problems
+- After pairing, real pubkeys are **never used on Nostr** — all signals use channel keys
+
+### Nostr Event Kind: QR Acceptance (Kind 5100)
+
+A new event kind is used for QR acceptance events to distinguish them from other pairing/signaling events:
+
+```typescript
+export const KIND_QR_ACCEPTANCE = 5100;
+
+// Example event structure
+{
+  kind: 5100,
+  pubkey: ephemeralViewerPubkey,    // temporary key, never reused
+  content: nip44Encrypt({
+    type: 'qr-acceptance',
+    viewerPubkey: '...',            // viewer's real pubkey
+    viewerRelays: ['wss://...'],
+    timestamp: 1234567890,
+    inviteId: 'uuid-...'
+  }, temporaryChannelKey),
+  tags: [
+    ['p', monitorRealPubkey],
+    ['invite', inviteId],
+    ['v', '2']
+  ],
+  created_at: 1234567890,
+  sig: '...'  // signed with ephemeralViewerPrivkey
+}
+```
 
 ### Architectural Clarity: TOTP is NOT a Pairing Method
 
@@ -975,8 +1173,7 @@ async function subscribeToTOTPMailbox(
           return;
         }
 
-        // Create TempContact — ephemeral channel keypair, memory-only
-        const inboundChannelKey = generateKeypair(); // fresh ephemeral key
+        // Create TempContact — registerTempFromMailbox generates the inbound channel keypair internally
         const tempContactId = nostrClient.registerTempFromMailbox({
           senderEphemeralPubkey: payload.replyKey, // sender's return address = our outbound
           senderRelays: payload.replyRelays,
@@ -1077,86 +1274,6 @@ When a monitor wants to send a pairing invite over Nostr (rather than via QR), t
 | Nostr-delivered | Required | TOTP seed derives mailbox keypair for delivery; credential in payload authorizes the action |
 | Programmatic API | Required | Stateless; TOTP is the shared secret |
 
-### Acceptance Message Format
-
-The acceptance payload (encrypted and published by viewer) contains all information needed for the monitor to complete pairing:
-
-```typescript
-interface QRAcceptancePayload {
-  type: "qr-acceptance";
-  viewerPubkey: string; // viewer's real pubkey (hex, 64 chars)
-  viewerRelays: string[]; // where monitor should send signals to viewer
-  timestamp: number; // unix seconds (creation time)
-  inviteId: string; // echoed from QR payload; secondary correlation check
-}
-```
-
-**Correlation:** Successful decryption with the `ephemeral_invite_privkey` already identifies which QR the acceptance belongs to — each active QR has a distinct ephemeral key and only that key can decrypt. The `inviteId` field provides an additional explicit check (`acceptance.inviteId !== qrPayload.id → reject`) so the monitor never accidentally processes an acceptance from a different concurrent invite.
-
-**Encryption and signing:**
-
-```
-┌─────────────────────────────────────────────┐
-│ QR Acceptance Event (Kind 5100)             │
-├─────────────────────────────────────────────┤
-│ pubkey: ephemeralViewerPubkey               │
-│ (random key, never reused)                  │
-│                                             │
-│ tags:                                       │
-│   ['p', monitor_real_pubkey]                │
-│   ['v', '2']                                │
-│                                             │
-│ content: (encrypted with temporary key)     │
-│   NIP-44 ChaCha20-Poly1305 {                │
-│     type: 'qr-acceptance',                  │
-│     viewerPubkey,                           │
-│     viewerRelays,                           │
-│     timestamp,                              │
-│     inviteId                                │
-│   }                                         │
-│                                             │
-│ created_at: honest unix timestamp           │
-│ sig: ephemeralViewerPrivkey signature       │
-└─────────────────────────────────────────────┘
-```
-
-### Recovery & Error Scenarios
-
-**Scenario 1: Acceptance event lost to relay**
-
-- Viewer published acceptance to all relays in QR
-- If some/all relays lose the event, monitor never receives it
-- **Recovery:** Viewer can rescan QR and retry. Since inviteId is echoed, retries are safe (idempotent).
-- **Timeout:** Monitor's listening window is typically 5 minutes (QR TTL). After that, it stops listening for that invite.
-
-**Scenario 2: Network lag (late acceptance)**
-
-- Viewer publishes acceptance but it reaches relay after QR TTL expires
-- Monitor already stopped listening
-- **Recovery:** Viewer should rescan QR or ask monitor to generate a fresh invite. TTL validation on viewer side prevents accepting stale QRs.
-
-**Scenario 3: Duplicated acceptance event**
-
-- Relay redelivers the same acceptance event (replay)
-- Monitor receives it twice (same event ID)
-- **Recovery:** Monitor deduplicates by event ID: `if (acceptanceHandlers.has(event.id)) return;`
-
-**Scenario 4: Acceptance signed with wrong key**
-
-- Event signature doesn't match the pubkey
-- **Recovery:** Nostr clients validate signatures automatically. Invalid events are rejected before reaching decryption logic.
-
-**Scenario 5: Viewer loses QR before acceptance**
-
-- Viewer scanned QR but app crashed before publishing acceptance
-- **Recovery:** Viewer needs to rescan (or ask monitor to regenerate). There's no state to recover; just redo the scan and accept.
-
-**Scenario 6: Monitor loses invite privkey**
-
-- Monitor generated QR, then app crashed before storing ephemeralInvitePrivkey
-- Monitor can no longer decrypt acceptances for that QR
-- **Recovery:** Monitor stops listening for that QR after TTL expires. Viewer will notice pairing didn't complete and should ask monitor to generate a new invite.
-
 ## TOTP: Remote Instruction Authorization
 
 ### Overview
@@ -1204,7 +1321,7 @@ interface RemoteInstructionPayload {
 
 ### Example: Pairing Acceptance with TOTP
 
-Pairing invite authorization is **one use case** of the TOTP protocol. For Nostr-delivered invite delivery via the TOTP mailbox, see "Contact Creation: TOTP Mailbox" below. The credential validation pattern — derive seed, validate freshness, call `verifyRawSeed` or `verifyTOTPCode`, record attempt — applies to any TOTP-secured instruction.
+Pairing invite authorization is **one use case** of the TOTP protocol. For Nostr-delivered invite delivery via the TOTP mailbox, see "Contact Creation: TOTP Mailbox" above. The credential validation pattern — derive seed, validate freshness, call `verifyRawSeed` or `verifyTOTPCode`, record attempt — applies to any TOTP-secured instruction.
 
 ---
 
@@ -1311,124 +1428,6 @@ ContactB: receives kind 5005 ack → commits migration
 
 ---
 
-### Post-Contact Transition to Channel Keys
-
-After successful invite acceptance (whether QR or Nostr delivery), both devices have:
-
-- Each other's **real pubkeys** (from QR payload and acceptance message)
-- **Relay lists** (from QR and acceptance)
-- **Shared ECDH secret** (computed from their privkeys)
-
-Now they can **independently derive post-pairing channel keys**:
-
-```typescript
-// Monitor's computation:
-const monitorSharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
-const monitorInbound = deriveChannelKey(
-  monitorSharedSecret,
-  viewerPubkey,
-  monitorPubkey,
-);
-const monitorOutbound = deriveChannelKey(
-  monitorSharedSecret,
-  monitorPubkey,
-  viewerPubkey,
-);
-
-// Viewer's computation:
-const viewerSharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
-const viewerInbound = deriveChannelKey(
-  viewerSharedSecret,
-  monitorPubkey,
-  viewerPubkey,
-);
-const viewerOutbound = deriveChannelKey(
-  viewerSharedSecret,
-  viewerPubkey,
-  monitorPubkey,
-);
-
-// Both derive identical keys:
-// monitorOutbound === viewerInbound  ✓
-// monitorInbound === viewerOutbound  ✓
-```
-
-All subsequent signals (status, RTC handshake, relay updates, etc.) are published with these **channel key pubkeys** and **single-layer NIP-44 encryption**. Real pubkeys never appear on Nostr again.
-
-### Security Considerations
-
-**Threat 1: QR Code Interception**
-
-- **Risk:** Attacker sees QR on screen and scans it before intended viewer
-- **Mitigation:** QR should be displayed in a physically secure context (locked room, private screen). Same as WiFi QR — user responsibility.
-- **Expiration:** TTL (e.g., 5 minutes) means old screenshots are useless
-
-**Threat 2: Relay Eavesdropping**
-
-- **Risk:** Relay operator sees acceptance event on relay and tries to decrypt
-- **Mitigation:** Acceptance is encrypted with temporary channel key; relay can't decrypt it. Even if they somehow decrypt it, they only see viewer's real pubkey + relays — can't act on it without the invite privkey.
-
-**Threat 3: Acceptance Forgery**
-
-- **Risk:** Attacker publishes a fake acceptance event claiming to be a different viewer
-- **Mitigation:** Acceptance is signed (Nostr signature) and encrypted. Forger would need:
-  1. Know the ephemeral invite pubkey (from QR) ✓ (attacker can scan)
-  2. Derive the temporary channel key ✓ (same ECDH derivation)
-  3. Encrypt valid acceptance JSON ✓ (encrypt())
-  4. But... signature is wrong (doesn't match ephemeral pubkey) — **Nostr rejects invalid signatures**
-  5. Even if signature is valid, monitor checks `inviteId` in acceptance payload — must match the specific QR
-  6. Attacker can only accept on behalf of the ephemeral key they sign with, not claim to be someone else
-
-  **Result:** Forged acceptance either has invalid signature (rejected) or creates a pairing with a wrong viewer pubkey (attacker's, not the intended viewer's). Monitor would need to trust the acceptance content; but acceptance contains an explicit `viewerPubkey` field, so attacker can't trick monitor into pairing with someone else.
-
-**Threat 4: Private Key Theft**
-
-- **Risk:** Attacker steals monitor's or viewer's privkey, then generates new QRs or acceptances
-- **Mitigation:** Same as any key-based system. Private keys must be protected by the device's OS (Keychain, Android Keystore, etc.). Out of scope for Nostr protocol.
-
-**Threat 5: Relay Censorship**
-
-- **Risk:** Relay blocks acceptance event (DOSes pairing)
-- **Mitigation:** Fanout to multiple relays. If at least one relay accepts, acceptance succeeds. Monitor listens on all relays listed in QR.
-
-**Why real pubkeys are safe in acceptance payload:**
-
-- Acceptance is **encrypted** — relay can't see it
-- Acceptance is **ephemeral** — lives only on relays for ~5 minutes
-- Acceptance includes **inviteId** — only valid for this specific QR
-- Acceptance is **idempotent** — retrying doesn't cause problems
-- After pairing, real pubkeys are **never used on Nostr** — all signals use channel keys
-
-### Nostr Event Kind: QR Acceptance (Kind 5100)
-
-A new event kind is used for QR acceptance events to distinguish them from other pairing/signaling events:
-
-```typescript
-export const KIND_QR_ACCEPTANCE = 5100;
-
-// Example event structure
-{
-  kind: 5100,
-  pubkey: ephemeralViewerPubkey,    // temporary key, never reused
-  content: nip44Encrypt({
-    type: 'qr-acceptance',
-    viewerPubkey: '...',            // viewer's real pubkey
-    viewerRelays: ['wss://...'],
-    timestamp: 1234567890,
-    inviteId: 'uuid-...'
-  }, temporaryChannelKey),
-  tags: [
-    ['p', monitorRealPubkey],
-    ['invite', inviteId],
-    ['v', '2']
-  ],
-  created_at: 1234567890,
-  sig: '...'  // signed with ephemeralViewerPrivkey
-}
-```
-
----
-
 ## Signal Exchange Patterns
 
 Signal kinds 5001–5006 are the universal mechanism for device-to-device communication. They work identically for any `contactId` — PairedContacts use ECDH-derived channel keys; TempContacts use ephemeral keys. The caller never handles keys or relay lists directly; those are internal to `ContactManager`.
@@ -1507,7 +1506,7 @@ interface RemoteCommandPayload {
 
 ```
 Kind: 5001–5006, 5010–5011 (one per signal type)
-Pubkey: contact's inboundChannelPubkey (paired: ECDH-derived; temp: ephemeral)
+Pubkey: sender's outboundChannelPubkey (= contact's inboundChannelPubkey; ECDH-derived for paired, ephemeral for temp)
 Content: NIP-44 encrypted kind-specific payload
 created_at: honest timestamp (not randomized)
 Relay: selected by RelayStateController from contact's outboundRelayList

@@ -115,10 +115,25 @@ Defines event format, signing, relay protocol, and canonical JSON serialization.
 - **Status:** Stable, widely implemented
 - **Used by:** All Senstry events
 
+### NIP-05: DNS-Based Identity Resolution
+Maps a human-readable identifier (`name@domain`) to a Nostr pubkey and optional relay list via a DNS-hosted HTTPS endpoint.
+- **Status:** Stable, widely implemented
+- **Used by:** Device identity resolution — resolving a human-readable identifier to a pubkey before relay discovery. Relay hints from NIP-05 serve as a fallback when NIP-65 is unavailable.
+
+### NIP-65: Relay List Metadata
+Defines kind 10002, a replaceable event where a device publishes its read (inbox) and write (outbox) relay lists. The authoritative Nostr-native source for discovering which relays a pubkey uses.
+- **Status:** Stable, widely implemented
+- **Used by:** Relay discovery — resolving which relays to reach a target device on before initiating a pairing flow.
+
 ### NIP-33: Parameterized Replaceable Events
 Events with kind ≥ 30000 are replaceable. Relay deduplicates by `(pubkey, kind, d-tag)`.
 - **Status:** Stable
-- **Used by:** Not used in Senstry. Footage metadata is exchanged over RTC data channels, not Nostr.
+- **Used by:** Kind 30078 contact book events.
+
+### NIP-78: Arbitrary Custom App Data
+Defines kind 30078 as a parameterized replaceable event for application-specific storage. Content and tags are application-defined; no relay-level schema enforcement.
+- **Status:** Stable
+- **Used by:** Contact book — encrypted contact blob stored and recovered from relay.
 
 ### NIP-44: Encrypted Payloads (ChaCha20-Poly1305)
 Standard encryption for Nostr content.
@@ -243,7 +258,7 @@ Each signal type has its own Nostr kind. Relays cannot filter by encrypted conte
 | 5003 | RTC Hangup | NIP-44 | ECDH channel | ~10s | `false` = hangup initiation, `true` = ack (optional) |
 | 5004 | Status | NIP-44 | ECDH channel | ~3600s | `false` = presence announcement, `true` = reply to announcement |
 | 5005 | Relay Migration | NIP-44 | ECDH channel | ~300s | `false` = relay proposal, `true` = acknowledgement |
-| 5006 | Remote Command | NIP-44 | ECDH channel | ~30s | `false` = TOTP-authorized command, `true` = ack after TOTP validation |
+| 5006 | Remote Command | NIP-44 | ECDH channel | ~30s (signal); `payload.ttl` per command | `false` = TOTP-authorized command, `true` = ack after TOTP validation |
 
 ### Action Signals
 
@@ -266,6 +281,14 @@ These kinds handle device discovery, initial identity exchange, and pre-contact 
 | 5201 | TOTP Mailbox Delivery | NIP-44 to HKDF-derived mailbox pubkey | Pre-contact one-shot delivery; `#p` tag routes to mailboxPubkey (not real pubkey); closed after TempContact is established |
 
 **Note:** Kinds 5100 and 5201 are not signal kinds. They use different encryption models and are fetched via `#p` tag filtering, not `since` filtering. They do not flow through the signal router.
+
+### Contact Book
+
+| Kind | Name | Encrypted | Purpose |
+|------|------|-----------|---------|
+| 30078 | Contact Book | HKDF+ChaCha20-Poly1305 (custom) | Encrypted contact blob; signed with derived contact book key; recoverable from relay by contact book pubkey + d-tag |
+
+The contact book event is not a signal kind and does not flow through the signal router. It is published once per contact list change and fetched only during recovery. See section 8 for key derivation.
 
 ## 7. Subscriptions and Filters
 
@@ -382,7 +405,115 @@ inboundChannelPubkey = secp256k1(inboundChannelPrivkey)
 - Non-persisted: recomputed each session from pairing data
 - Pseudonymous: relay sees channel pubkey, not identity
 
-## 9. Contact Model
+### Contact Book Keys
+
+Two independent keys are derived from the identity privkey and a user-supplied passphrase. Both are required for any contact book operation — the passphrase is not optional.
+
+```
+contactBookSigningPrivkey = HKDF(privkey, passphrase, "senstry-contacts-sign-v1", 32)
+contactBookSigningPubkey  = secp256k1(contactBookSigningPrivkey)
+
+contactBookEncKey = HKDF(privkey, passphrase, "senstry-contacts-enc-v1", 32)
+```
+
+The signing key is used as the `pubkey` field on kind 30078 events — it is not the identity key and never appears in any signal or pairing event. The relay sees only the derived signing pubkey; it cannot link this to the device's real identity without the privkey and passphrase.
+
+The encryption key is the input to ChaCha20-Poly1305 encryption of the contact blob. This derivation is not NIP-44 (which uses ECDH); it is a custom symmetric derivation. A quantum adversary who recovers the identity privkey via Shor's algorithm still cannot derive the encryption key without the passphrase — the passphrase is the PQC-resilient factor protecting contact graph topology against harvest-now-decrypt-later attacks.
+
+**Recovery:** derive both keys from privkey + passphrase, query `{ kinds: [30078], authors: [contactBookSigningPubkey], "#d": ["senstry-contacts"] }` from any relay, decrypt the latest event's content with `contactBookEncKey`.
+
+**Losing the passphrase makes the contact book irrecoverable, even with the privkey.**
+
+## 9. Identity and Relay Discovery
+
+Before initiating a pairing flow, a device needs two things about the target: its **pubkey** and the **relays** to reach it on. These are resolved through two complementary mechanisms — NIP-05 for identity, NIP-65 for relay lists — plus a structured fallback chain.
+
+### NIP-05: Identity Resolution
+
+A device with a NIP-05 identifier (`name@domain`) exposes its real pubkey at a DNS-hosted HTTPS endpoint:
+
+```
+GET https://<domain>/.well-known/nostr.json?name=<name>
+```
+
+Expected response:
+
+```json
+{
+  "names": {
+    "<name>": "<device_pubkey_hex>"
+  },
+  "relays": {
+    "<device_pubkey_hex>": ["wss://relay1.com", "wss://relay2.com"]
+  }
+}
+```
+
+The `names` field resolves the identifier to a pubkey. The `relays` field is optional per the NIP but populated for Senstry devices — it serves as a relay fallback when NIP-65 is unavailable.
+
+NIP-05 is opt-in. It exposes the device's real pubkey via public DNS; devices without an identifier are not discoverable this way.
+
+### NIP-65: Relay List Metadata (Primary)
+
+A device publishes its relay preferences as a kind 10002 replaceable event:
+
+```json
+{
+  "kind": 10002,
+  "pubkey": "<device_real_pubkey>",
+  "tags": [
+    ["r", "wss://relay1.com"],           // read + write
+    ["r", "wss://relay2.com", "write"],  // write only (outbox — device publishes here)
+    ["r", "wss://relay3.com", "read"]    // read only (inbox — device listens here)
+  ]
+}
+```
+
+**Read vs write semantics:**
+
+- **Read relays (inbox)** — where the device listens for incoming events. Use these when *sending to* a device.
+- **Write relays (outbox)** — where the device publishes its own events. Use these when *fetching from* a device.
+
+Senstry always delivers pairing signals *to* a target device, so relay discovery always returns the target's **read relays**.
+
+Querying a device's relay list from any known relay:
+
+```json
+{ "kinds": [10002], "authors": ["<target_pubkey>"], "limit": 1 }
+```
+
+NIP-65 is the authoritative Nostr-native source. It is queried first; NIP-05 relay hints are a fallback.
+
+### Relay Discovery Chain
+
+```typescript
+resolveRelays(pubkey: string, options: {
+  providedRelays?: string[];  // already known — short-circuits all resolution
+  nip05Identifier?: string;   // consulted as fallback if NIP-65 returns nothing
+  seedRelays?: string[];      // relays to query NIP-65 from; defaults to well-known indexers
+}): Promise<string[]>         // always returns read/inbox relays
+```
+
+Resolution order:
+
+1. **`providedRelays`** non-empty → return immediately, no network calls.
+2. **NIP-65** — query `{ kinds: [10002], authors: [pubkey] }` from `seedRelays`. Extract read relays.
+3. **NIP-05** — if `nip05Identifier` provided and step 2 returned nothing, fetch `nostr.json` relay hints.
+4. **`seedRelays` directly** — last resort; no guarantee the target is reachable there.
+
+**Default seed relays:** When `seedRelays` is omitted, the resolver queries well-known Nostr indexer relays (`wss://purplepag.es`, `wss://relay.nostr.band`) that aggregate NIP-65 events across the network. Callers can extend these with their own outbox relays:
+
+```typescript
+seedRelays: [...nostrClient.getOwnRelays(), ...WELL_KNOWN_INDEXERS]
+```
+
+The constant `WELL_KNOWN_INDEXERS` is a module-level export — it is not baked into the function. The caller decides what seeds to provide; the function only decides what to do with them.
+
+### Privacy
+
+Both NIP-05 and NIP-65 expose the device's real pubkey — NIP-05 via DNS, NIP-65 as the event author on relay. Both are opt-in pre-pairing mechanisms. Post-pairing signals continue to use channel pubkeys only; relay discovery does not affect the post-contact privacy model.
+
+## 10. Contact Model
 
 Senstry uses two contact types. Both expose the same signal API — `publishSignal(contactId, kind, payload)` — and are handled identically by the signal router.
 
@@ -396,7 +527,25 @@ Senstry uses two contact types. Both expose the same signal API — `publishSign
 
 Both contact types always have a non-null `outboundChannelPubkey`. The null case does not exist — there is no code path that publishes a signal without a channel key.
 
-## 10. Event Tags and Conventions
+### Contact Book
+
+PairedContacts are backed by IDB and survive restarts. They are also serialized into a recoverable contact book blob stored as a kind 30078 event on relay (see § 8 for key derivation). The decrypted content is:
+
+```typescript
+interface ContactBook {
+  version: 1;
+  entries: Array<{
+    pubkey: string;    // paired device's real pubkey
+    relays: string[];  // their relay list
+    nickname: string;  // local label
+    addedAt: number;   // unix timestamp
+  }>;
+}
+```
+
+Channel keys are not stored in the blob — they are re-derived from each `pubkey` pair on load, consistent with the non-persisted channel key property. The contact book is published once per contact list change. On relay, the `(contactBookSigningPubkey, 30078, "senstry-contacts")` triple always resolves to the latest version.
+
+## 11. Event Tags and Conventions
 
 Tags are optional metadata attached to events. Format is an array of arrays: `["tag-name", "value-1", "value-2"]`.
 
@@ -430,7 +579,7 @@ Tags are optional metadata attached to events. Format is an array of arrays: `["
 }
 ```
 
-## 11. Timestamps and TTL
+## 12. Timestamps and TTL
 
 ### created_at Field
 
@@ -450,7 +599,7 @@ The client discards received events if they are older than a threshold:
 | 5001–5003 (RTC handshake) | ~10s | Stale offers and answers are unusable |
 | 5004 (status) | ~3600s | Presence is meaningful for up to 1 hour |
 | 5005 (relay migration) | ~300s | Stale proposals are ignored |
-| 5006 (remote command) | ~30s | Commands must be acted on promptly; stale commands discarded silently |
+| 5006 (remote command) | ~30s | Live delivery filter: stale live signals discarded silently. `RemoteCommandController` also validates `payload.ttl` (set by the sender per command, e.g. 300s) — this is the authoritative freshness check and covers both live delivery and history-fetched commands |
 | 5010 (trigger) | ~10s | Notifications must be acted on promptly |
 | 5011 (arm state) | ~10s | State changes must be recent |
 
@@ -465,7 +614,7 @@ if (now - event.created_at > TTL_SECONDS) {
 
 **Scope:** TTL applies to live signal router delivery — events arriving on a T+0 subscription that exceed their TTL are discarded as stale. `fetchKindHistory()` bypasses TTL entirely; it is an intentional request for historical data with a caller-controlled time window (default 2 days). Missed action signals (kinds 5010, 5011) are retrieved this way on reconnect.
 
-## 12. Event Immutability and Replaceable Events
+## 13. Event Immutability and Replaceable Events
 
 ### Standard Events (Immutable)
 
@@ -476,11 +625,11 @@ All signal and action signal kinds (5001–5006, 5010, 5011) and pairing kinds (
 
 **No deletion mechanism:** Nostr does not support deleting events. Publishers can recommend deletion (NIP-09), but relays are not obligated to honor it.
 
-### Replaceable Events (NIP-33)
+### Replaceable Events (NIP-78)
 
-Senstry does not use replaceable event kinds (kind ≥ 30000). Footage metadata, segment references, and coverage maps are exchanged over the RTC data channel, not over Nostr.
+Senstry uses kind 30078 (NIP-78, parameterized replaceable per NIP-33) for contact book storage. The relay deduplicates by `(pubkey, kind, d-tag)` — the latest version is always canonical. All signal, pairing, and action signal kinds (5001–5201) remain standard non-replaceable events. Footage metadata, segment references, and coverage maps are exchanged over the RTC data channel, not over Nostr.
 
-## 13. Privacy Model
+## 14. Privacy Model
 
 ### Public Information on Relay
 
@@ -492,13 +641,14 @@ Relays store all events. An observer with access to a relay (relay operator, net
 
 ### What Real Pubkeys Touch
 
-Real device identity pubkeys appear only in kind 5100 events — the pairing acceptance event, which is signed with an ephemeral viewer key (not the device's long-term identity key). In TOTP mailbox delivery (kind 5201), the relay sees only the HKDF-derived `mailboxPubkey` in the `#p` tag — never the device's real identity pubkey. All post-contact signals (kinds 5001–5006, 5010, 5011) use channel pubkeys only; real pubkeys are never present.
+Real device identity pubkeys appear only in kind 5100 events — the pairing acceptance event, which is signed with an ephemeral viewer key (not the device's long-term identity key). In TOTP mailbox delivery (kind 5201), the relay sees only the HKDF-derived `mailboxPubkey` in the `#p` tag — never the device's real identity pubkey. All post-contact signals (kinds 5001–5006, 5010, 5011) use channel pubkeys only; real pubkeys are never present. Kind 30078 contact book events are signed with the derived `contactBookSigningPubkey` — not the identity key — so the real pubkey does not appear there either.
 
 ### Private Information (Encrypted)
 
 - **Event content:** encrypted with NIP-44 in all signal and pairing kinds
 - **Signal identities:** Channel pubkeys are pseudonymous; real pubkey is not visible in any post-contact event
 - **Mailbox routing:** kind 5201 `#p` tag contains only the derived mailboxPubkey, not a real identity
+- **Contact book content:** kind 30078 content encrypted with HKDF-derived key; contact graph is opaque to relay operators and passive observers even after secp256k1 is broken, because the passphrase is required to derive the decryption key
 
 ### Threat Model: Relay Operator
 
@@ -523,7 +673,7 @@ Relays see only:
 
 Media content is unknown to relays.
 
-## 14. Scalability Considerations
+## 15. Scalability Considerations
 
 ### Event Growth
 
@@ -549,11 +699,11 @@ Relays may enforce rate limits to prevent spam:
 - Bandwidth per client
 
 **Senstry adaptation:**
-- Outbox queuer: batches publishes and retries on rate-limit errors
+- Outbox queuer: queues and paces publishes, retries on rate-limit errors
 - Subscription coalescing: multiple related queries are merged into single subscription
 - Single-relay publish: each event goes to one relay (LRU-eligible, selected by RelayStateController); history fan-fetches from all relays to find it regardless of which one was used
 
-## 15. Nostr Ecosystem Context
+## 16. Nostr Ecosystem Context
 
 Nostr powers diverse applications:
 - **Social networks:** Damus, Amethyst (Twitter clone with notes)
@@ -565,7 +715,7 @@ Nostr powers diverse applications:
 
 **Senstry is independent:** Does not interact with social apps, does not use Nostr for media transport, focuses narrowly on signaling and notifications.
 
-## 16. Event Lifecycle Example: Trigger Fired
+## 17. Event Lifecycle Example: Trigger Fired
 
 Walk-through of a complete trigger event from sensor to viewer UI.
 
@@ -600,7 +750,7 @@ Walk-through of a complete trigger event from sensor to viewer UI.
 - **Relay operator cannot infer:** Which devices are communicating (channel pubkeys are unlinkable to real pubkeys without the ECDH secret)
 - **Media:** Never on relay — transferred P2P via WebRTC only
 
-## 17. Architecture Principles
+## 18. Architecture Principles
 
 ### Immutability First
 
@@ -626,7 +776,7 @@ Filtering, dedup, verification, rate limiting all client-side. Relays are dumb. 
 
 Pubkey is derived from privkey via secp256k1. No usernames, no accounts, no servers. Consequence: identity is cryptographic; can be verified anywhere.
 
-## 18. Summary: Why Nostr for Senstry
+## 19. Summary: Why Nostr for Senstry
 
 | Need | Nostr Feature | Benefit |
 |------|---------------|---------|
