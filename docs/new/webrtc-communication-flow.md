@@ -92,17 +92,17 @@ Subscription: T+0 only (since: now) — no history replay in subscribe
 
 ### ECDH-Derived Channel Keys
 
-Both devices independently derive the same directional channel keypairs from their ECDH shared secret. No key exchange required.
+Both devices independently derive the same directional channel keypairs from their ECDH shared secret. No key exchange required. Channel keys derive from **device keys**, not identity keys — each device installation has a unique device keypair ensuring channel isolation.
 
 ```typescript
-// Both sides compute independently:
-const sharedSecret = getConversationKey(privkey, peerRealPubkey);
+// Both sides compute independently using device keys:
+const sharedSecret = getConversationKey(devicePrivkey, peerDevicePubkey);
 
 // Monitor → Viewer (monitor's outbound / viewer's inbound)
-const monitorOutbound = deriveChannelKey(sharedSecret, monitorPubkey, viewerPubkey);
+const monitorOutbound = deriveChannelKey(sharedSecret, monitorDevicePubkey, viewerDevicePubkey);
 
 // Viewer → Monitor (viewer's outbound / monitor's inbound)
-const viewerOutbound = deriveChannelKey(sharedSecret, viewerPubkey, monitorPubkey);
+const viewerOutbound = deriveChannelKey(sharedSecret, viewerDevicePubkey, monitorDevicePubkey);
 
 // Assertion (both sides):
 // monitorOutbound === viewerInbound  ✓
@@ -110,9 +110,10 @@ const viewerOutbound = deriveChannelKey(sharedSecret, viewerPubkey, monitorPubke
 ```
 
 **Key Properties:**
-- Deterministic: same inputs always produce same output
+- Deterministic: same device key inputs always produce the same output
 - Directional: swapping sender/recipient produces a different key
-- Ephemeral: not stored; re-derived on app restart from real pubkeys in `pairedContacts`
+- Device-specific: two devices sharing the same identity key have different device keys and therefore different channels
+- Not persisted: re-derived from the stable device keypair each session
 
 ### Signal TTL
 

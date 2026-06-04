@@ -417,12 +417,13 @@ The QR encodes a **JSON-serializable payload** that is **public and safe to scan
 
 ```typescript
 interface QRPayload {
-  v: 2; // Version (for future upgrades)
-  ik: string; // Invite key: ephemeral pubkey (hex, 64 chars)
-  pk: string; // Monitor's real pubkey (hex, 64 chars)
+  v: 2;           // Version (for future upgrades)
+  ik: string;     // Invite key: ephemeral pubkey (hex, 64 chars)
+  pk: string;     // Monitor's real identity pubkey (hex, 64 chars)
+  dpk: string;    // Monitor's device pubkey (hex, 64 chars) — used for channel key derivation
   relays: string[]; // Monitor's listening relays
-  id: string; // Invite ID (UUID, opaque to scanner)
-  ttl: number; // Unix timestamp when QR expires (e.g., now + 300)
+  id: string;     // Invite ID (UUID, opaque to scanner)
+  ttl: number;    // Unix timestamp when QR expires (e.g., now + 300)
   label?: string; // Optional: monitor's self-label ("Living Room Camera", "Hallway", etc.)
 }
 ```
@@ -432,8 +433,9 @@ interface QRPayload {
 ```typescript
 const payload: QRPayload = {
   v: 2,
-  ik: ephemeralPubkey, // ephemeral invite key's pubkey
-  pk: monitorRealPubkey, // monitor's identity
+  ik: ephemeralPubkey,      // ephemeral invite key's pubkey
+  pk: monitorRealPubkey,    // monitor's identity pubkey
+  dpk: monitorDevicePubkey, // monitor's device pubkey (used for channel key derivation)
   relays: ["wss://relay1.com", "wss://relay2.com"],
   id: crypto.randomUUID(),
   ttl: Math.floor(Date.now() / 1000) + 300, // unix expiry timestamp (now + 5 min)
@@ -445,6 +447,7 @@ const uri = `senstry://pair?${new URLSearchParams({
   v: payload.v.toString(),
   ik: payload.ik,
   pk: payload.pk,
+  dpk: payload.dpk,
   relays: JSON.stringify(payload.relays),
   id: payload.id,
   ttl: payload.ttl.toString(),
@@ -469,7 +472,9 @@ When a viewer scans the QR, they decode the payload locally and **derive a tempo
 ```typescript
 async function acceptInviteFromQR(
   viewerPrivkey: Uint8Array,
+  viewerDevicePrivkey: Uint8Array,
   viewerRealPubkey: string,
+  viewerDevicePubkey: string,
   viewerRelays: string[],
   qrPayload: QRPayload,
 ): Promise<{ success: boolean; pairedMonitorPubkey?: string; error?: string }> {
@@ -507,13 +512,14 @@ async function acceptInviteFromQR(
   }
 
   // ─── Step 3: Create acceptance message ──────────────────────────────────
-  // This message contains the viewer's real identity + relays
-  // The monitor will use this to derive post-pairing channel keys
+  // This message contains the viewer's real identity, device pubkey, and relays.
+  // The monitor will use viewerDevicePubkey to derive post-pairing channel keys.
 
   const acceptancePayload = {
     type: "qr-acceptance",
-    viewerPubkey: viewerRealPubkey, // viewer's identity
-    viewerRelays: viewerRelays, // where to send signals to viewer
+    viewerPubkey: viewerRealPubkey,         // viewer's long-term identity pubkey
+    viewerDevicePubkey: viewerDevicePubkey, // viewer's device pubkey — used for channel key derivation
+    viewerRelays: viewerRelays,             // where to send signals to viewer
     timestamp: Math.floor(Date.now() / 1000),
     inviteId: qrPayload.id, // echo back the invite ID
   };
@@ -579,22 +585,23 @@ async function acceptInviteFromQR(
   }
 
   // ─── Step 7: Store paired device locally ────────────────────────────────
-  // Derive post-pairing channel keys so we can communicate
+  // Derive post-pairing channel keys using DEVICE keys (not identity keys)
 
-  const sharedSecret = getConversationKey(viewerPrivkey, qrPayload.pk);
+  const sharedSecret = getConversationKey(viewerDevicePrivkey, qrPayload.dpk);
   const inboundChannelKey = deriveChannelKey(
     sharedSecret,
-    qrPayload.pk,
-    viewerRealPubkey,
+    qrPayload.dpk,       // monitor's device pubkey
+    viewerDevicePubkey,  // viewer's device pubkey
   );
   const outboundChannelKey = deriveChannelKey(
     sharedSecret,
-    viewerRealPubkey,
-    qrPayload.pk,
+    viewerDevicePubkey,  // viewer's device pubkey
+    qrPayload.dpk,       // monitor's device pubkey
   );
 
   await addPairedContact({
-    pubkey: qrPayload.pk, // monitor's real pubkey
+    identityPubkey: qrPayload.pk,   // monitor's real identity pubkey
+    devicePubkey: qrPayload.dpk,    // monitor's device pubkey
     nickname: qrPayload.label || generateNickname(),
     relays: qrPayload.relays, // monitor's relays
     capabilities: [],
@@ -640,6 +647,7 @@ export async function generateQRAndListenForAcceptance(
     v: 2,
     ik: ephemeralInvitePubkey,
     pk: monitorPubkey,
+    dpk: monitorDevicePubkey,
     relays: monitorRelays,
     id: crypto.randomUUID(),
     ttl: Math.floor(Date.now() / 1000) + 300, // 5 minutes
@@ -671,6 +679,7 @@ export async function generateQRAndListenForAcceptance(
         const acceptance = JSON.parse(decrypted) as {
           type: string;
           viewerPubkey: string;
+          viewerDevicePubkey: string;
           viewerRelays: string[];
           timestamp: number;
           inviteId: string;
@@ -692,34 +701,33 @@ export async function generateQRAndListenForAcceptance(
           return;
         }
 
-        // ─ Validate viewer pubkey format
-        if (acceptance.viewerPubkey.length !== 64) {
+        // ─ Validate viewer pubkey formats
+        if (acceptance.viewerPubkey.length !== 64 || acceptance.viewerDevicePubkey.length !== 64) {
           dbg("warn", "pairing", "Invalid viewer pubkey in QR acceptance");
           return;
         }
 
-        // ─ Store paired device and derive post-pairing channel keys
+        // ─ Store paired device and derive post-pairing channel keys using DEVICE keys
         const sharedSecret = getConversationKey(
-          monitorPrivkey,
-          acceptance.viewerPubkey,
+          monitorDevicePrivkey,
+          acceptance.viewerDevicePubkey, // viewer's device pubkey, not identity pubkey
         );
         const inboundChannelKey = deriveChannelKey(
           sharedSecret,
-          acceptance.viewerPubkey,
-          monitorPubkey,
+          acceptance.viewerDevicePubkey, // viewer's device pubkey
+          monitorDevicePubkey,
         );
         const outboundChannelKey = deriveChannelKey(
           sharedSecret,
-          monitorPubkey,
-          acceptance.viewerPubkey,
+          monitorDevicePubkey,
+          acceptance.viewerDevicePubkey, // viewer's device pubkey
         );
 
         await addPairedContact({
-          pubkey: acceptance.viewerPubkey,
+          identityPubkey: acceptance.viewerPubkey,       // viewer's long-term identity
+          devicePubkey: acceptance.viewerDevicePubkey,   // viewer's device pubkey
           nickname: generateNickname(),
           relays: acceptance.viewerRelays,
-          capabilities: [],
-          lastSeenAt: null,
           channelKeys: {
             inbound: inboundChannelKey,
             outbound: outboundChannelKey,
@@ -755,40 +763,40 @@ Both monitor and viewer independently derive **identical channel keys** from the
 /**
  * Derivation formula (both sides compute independently):
  *
- * 1. Compute shared ECDH secret:
- *    sharedSecret = getConversationKey(own_privkey, peer_pubkey)
+ * 1. Compute shared ECDH secret from DEVICE keys (not identity keys):
+ *    sharedSecret = getConversationKey(own_devicePrivkey, peer_devicePubkey)
  *
  * 2. Derive directional channel keys:
- *    inbound = deriveChannelKey(sharedSecret, peer_pubkey, own_pubkey)
- *    outbound = deriveChannelKey(sharedSecret, own_pubkey, peer_pubkey)
+ *    inbound = deriveChannelKey(sharedSecret, peer_devicePubkey, own_devicePubkey)
+ *    outbound = deriveChannelKey(sharedSecret, own_devicePubkey, peer_devicePubkey)
  *
  * 3. Use derived keys as channel pubkeys in post-pairing signals
  */
 
-// Example: Monitor's perspective
-const monitorSharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
+// Example: Monitor's perspective (using device keys)
+const monitorSharedSecret = getConversationKey(monitorDevicePrivkey, viewerDevicePubkey);
 const monitorInbound = deriveChannelKey(
   monitorSharedSecret,
-  viewerPubkey,
-  monitorPubkey,
+  viewerDevicePubkey,
+  monitorDevicePubkey,
 );
 const monitorOutbound = deriveChannelKey(
   monitorSharedSecret,
-  monitorPubkey,
-  viewerPubkey,
+  monitorDevicePubkey,
+  viewerDevicePubkey,
 );
 
 // Example: Viewer's perspective (identical keys, different perspective)
-const viewerSharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
+const viewerSharedSecret = getConversationKey(viewerDevicePrivkey, monitorDevicePubkey);
 const viewerInbound = deriveChannelKey(
   viewerSharedSecret,
-  monitorPubkey,
-  viewerPubkey,
+  monitorDevicePubkey,
+  viewerDevicePubkey,
 );
 const viewerOutbound = deriveChannelKey(
   viewerSharedSecret,
-  viewerPubkey,
-  monitorPubkey,
+  viewerDevicePubkey,
+  monitorDevicePubkey,
 );
 
 // Assertion (both sides):
@@ -798,11 +806,11 @@ const viewerOutbound = deriveChannelKey(
 
 **Why this is safe:**
 
-- The derivation function is **deterministic** — same inputs always produce same output
+- The derivation function is **deterministic** — same device key inputs always produce the same output
 - The derivation is **directional** — swapping sender/recipient produces a different key
-- No key exchange is needed — both sides compute from existing identities
+- Device keys ensure channel isolation — two devices sharing the same identity key still have distinct channels
 - The temporary channel key for acceptance is **ephemeral** — only used once, then discarded
-- The post-pairing keys are **derived from real identities**, not stored — re-derived on app restart
+- The post-pairing keys are **derived from device keypairs**, not identity keys — re-derived on session start
 
 ### Acceptance Message Format
 
@@ -811,10 +819,11 @@ The acceptance payload (encrypted and published by viewer) contains all informat
 ```typescript
 interface QRAcceptancePayload {
   type: "qr-acceptance";
-  viewerPubkey: string; // viewer's real pubkey (hex, 64 chars)
-  viewerRelays: string[]; // where monitor should send signals to viewer
-  timestamp: number; // unix seconds (creation time)
-  inviteId: string; // echoed from QR payload; secondary correlation check
+  viewerPubkey: string;       // viewer's real identity pubkey (hex, 64 chars)
+  viewerDevicePubkey: string; // viewer's device pubkey (hex, 64 chars) — used for channel key derivation
+  viewerRelays: string[];     // where monitor should send signals to viewer
+  timestamp: number;          // unix seconds (creation time)
+  inviteId: string;           // echoed from QR payload; secondary correlation check
 }
 ```
 
@@ -888,37 +897,37 @@ interface QRAcceptancePayload {
 
 After successful invite acceptance (whether QR or Nostr delivery), both devices have:
 
-- Each other's **real pubkeys** (from QR payload and acceptance message)
+- Each other's **identity pubkeys** and **device pubkeys** (from QR payload and acceptance message)
 - **Relay lists** (from QR and acceptance)
-- **Shared ECDH secret** (computed from their privkeys)
+- **Shared ECDH secret** (computed from their device privkeys)
 
-Now they can **independently derive post-pairing channel keys**:
+Now they can **independently derive post-pairing channel keys** using their device keys:
 
 ```typescript
-// Monitor's computation:
-const monitorSharedSecret = getConversationKey(monitorPrivkey, viewerPubkey);
+// Monitor's computation (using device keys):
+const monitorSharedSecret = getConversationKey(monitorDevicePrivkey, viewerDevicePubkey);
 const monitorInbound = deriveChannelKey(
   monitorSharedSecret,
-  viewerPubkey,
-  monitorPubkey,
+  viewerDevicePubkey,
+  monitorDevicePubkey,
 );
 const monitorOutbound = deriveChannelKey(
   monitorSharedSecret,
-  monitorPubkey,
-  viewerPubkey,
+  monitorDevicePubkey,
+  viewerDevicePubkey,
 );
 
-// Viewer's computation:
-const viewerSharedSecret = getConversationKey(viewerPrivkey, monitorPubkey);
+// Viewer's computation (using device keys):
+const viewerSharedSecret = getConversationKey(viewerDevicePrivkey, monitorDevicePubkey);
 const viewerInbound = deriveChannelKey(
   viewerSharedSecret,
-  monitorPubkey,
-  viewerPubkey,
+  monitorDevicePubkey,
+  viewerDevicePubkey,
 );
 const viewerOutbound = deriveChannelKey(
   viewerSharedSecret,
-  viewerPubkey,
-  monitorPubkey,
+  viewerDevicePubkey,
+  monitorDevicePubkey,
 );
 
 // Both derive identical keys:
@@ -926,7 +935,7 @@ const viewerOutbound = deriveChannelKey(
 // monitorInbound === viewerOutbound  ✓
 ```
 
-All subsequent signals (status, RTC handshake, relay updates, etc.) are published with these **channel key pubkeys** and **single-layer NIP-44 encryption**. Real pubkeys never appear on Nostr again.
+All subsequent signals (status, RTC handshake, relay updates, etc.) are published with these **channel key pubkeys** and **single-layer NIP-44 encryption**. Neither real identity pubkeys nor device pubkeys ever appear on Nostr again.
 
 ### Security Considerations
 
@@ -985,7 +994,8 @@ export const KIND_QR_ACCEPTANCE = 5100;
   pubkey: ephemeralViewerPubkey,    // temporary key, never reused
   content: nip44Encrypt({
     type: 'qr-acceptance',
-    viewerPubkey: '...',            // viewer's real pubkey
+    viewerPubkey: '...',            // viewer's real identity pubkey
+    viewerDevicePubkey: '...',      // viewer's device pubkey (for channel key derivation)
     viewerRelays: ['wss://...'],
     timestamp: 1234567890,
     inviteId: 'uuid-...'
@@ -1469,6 +1479,9 @@ interface RtcHangupPayload {
 // Kind 5004 — Status
 // isResponse=false: device announces presence (online/offline)
 // isResponse=true: peer replies to a received announcement
+// #s tag (plaintext on event): carries the sender's current sessionUUID.
+// Peers read the #s tag to update their known session UUID without decrypting the payload.
+// Session-directed signals (5001-5003, 5005, 5006) use the peer's last-seen #s value.
 interface StatusPayload {
   state: "online" | "offline";
   isResponse: boolean;

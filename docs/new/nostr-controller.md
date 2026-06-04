@@ -181,15 +181,17 @@ Internal registry for all contacts — both permanent paired contacts and tempor
 ```typescript
 // Shared interface — NostrClient sees no difference between paired and temp contacts
 interface ContactEntry {
-  contactId: string; // UUID — generated at creation, stable for lifetime of contact
+  contactId: string;          // UUID — device-pair scoped; stable for lifetime of contact
 
-  pubkey?: string; // may be absent for TempContacts where only the ephemeral key is known
+  identityPubkey?: string;    // peer's long-term identity pubkey; may be absent for TempContacts
+  devicePubkey?: string;      // peer's device pubkey; used for channel key derivation; absent for TempContacts
+  peerSessionUUID?: string;   // most recently seen session UUID from peer's kind 5004 announcement
 
-  inboundChannelPubkey: string; // paired: ECDH-derived; temp: freshly generated ephemeral
+  inboundChannelPubkey: string;   // paired: ECDH-derived from device keys; temp: freshly generated ephemeral
   inboundChannelPrivkey: Uint8Array; // held in memory; used to decrypt incoming events
-  outboundChannelPubkey: string; // paired: ECDH-derived; temp: sender's ephemeralPubkey from mailbox payload
+  outboundChannelPubkey: string;  // paired: ECDH-derived from device keys; temp: sender's ephemeralPubkey
 
-  inboundRelayList: string[]; // relays WE listen on for this contact
+  inboundRelayList: string[];  // relays WE listen on for this contact
   outboundRelayList: string[]; // relays WE send to in order to reach this contact
 
   addedAt: number;
@@ -201,6 +203,8 @@ class ContactManager {
   registerPaired(contact: PairedContact): string; // returns new UUID contactId
   unregisterPaired(contactId: string): void;
   updatePairedRelays(contactId: string, newInboundRelays: string[]): void; // relay migration commit
+  updatePeerDevicePubkey(contactId: string, newDevicePubkey: string): void; // re-key after peer recovery
+  updatePeerSession(contactId: string, sessionUUID: string): void; // called on each kind 5004 received
 
   // Temp contact management (memory-only, TTL)
   registerTemp(entry: Omit<ContactEntry, "contactId">): string; // returns new UUID contactId
@@ -209,7 +213,8 @@ class ContactManager {
 
   // Lookup
   get(contactId: string): ContactEntry;
-  findByPubkey(pubkey: string): ContactEntry[]; // find all contacts (paired or temp) for a real identity
+  findByIdentityPubkey(pubkey: string): ContactEntry[];   // find all contacts for a real identity
+  findByDevicePubkey(pubkey: string): ContactEntry | null; // find contact by device pubkey
   findByInboundKey(inboundChannelPubkey: string): ContactEntry | null; // for signal routing
   allMyInboundRelays(): string[]; // union of inboundRelayList across all contacts
 }
@@ -217,10 +222,12 @@ class ContactManager {
 
 **Paired entries:**
 
-- Registered from `PairedContact` records on startup; each gets a UUID `contactId`
-- ECDH-derived channel keys, cached on register
+- Each `contactId` is a device-pair relationship: one local device ↔ one peer device. The same peer identity with a different device generates a distinct contactId with distinct channel keys.
+- Channel keys derived from device keypairs (ECDH), cached on register
+- `peerSessionUUID` updated on every received kind 5004 from that contact; used to address session-directed signals
 - No `expiresAt` — permanent until unpaired
 - Relay migration → `updatePairedRelays(contactId, ...)` → next operation picks up new list automatically
+- Peer recovery → `updatePeerDevicePubkey(contactId, newDevicePubkey)` → channel keys re-derived
 
 **Temp entries (TOTP-mailbox-derived):**
 
@@ -228,10 +235,10 @@ class ContactManager {
 - Uses freshly generated ephemeral channel keypair (`inboundChannelPubkey/Privkey` generated at creation)
 - `outboundChannelPubkey` = sender's `ephemeralPubkey` from the mailbox payload
 - Memory-only, not persisted to IDB; discarded when `expiresAt` passes
-- Multiple temp entries may share the same `pubkey` — each has its own UUID
+- `identityPubkey` and `devicePubkey` absent — temp contacts use ephemeral keys only
 
 **Pairing handshake — duplicate detection:**
-When pairing completes, `ContactManager.findByPubkey(pubkey)` checks whether a temp contact already exists for that real identity (e.g. a TOTP session was in progress before pairing finished). The controller decides whether to expire the temp entry, carry over its relay/key state, or let both coexist until the temp expires naturally.
+When pairing completes, `ContactManager.findByDevicePubkey(pubkey)` checks whether a temp or paired contact already exists for that device. The controller decides whether to expire the temp entry, carry over its relay/key state, or let both coexist until the temp expires naturally.
 
 **Signal routing:**
 Incoming events carry an `authors` pubkey that matches an `inboundChannelPubkey`. `findByInboundKey()` maps that back to a `contactId`, which is what the signal router delivers to `onSignal`.
@@ -239,8 +246,82 @@ Incoming events carry an `authors` pubkey that matches an `inboundChannelPubkey`
 **Signal router coverage:**
 
 - `allMyInboundRelays()` includes relay lists from all contacts (paired and temp)
-- Signal router subscribes across all of them, filtering by all active `inboundChannelPubkey` values
-- Re-subscribes automatically when any contact is registered, updated, or expired
+- Signal router maintains two concurrent subscriptions per contact: broadcast (kinds 5004, 5010, 5011, no `#s` filter) and session-directed (kinds 5001–5003, 5005, 5006, `#s: mySessionUUID`)
+- Re-subscribes automatically when any contact is registered, updated, or expired; session-directed subscription also refreshes on session restart
+
+---
+
+### ContactBookController
+
+Handles encrypted contact book persistence to and recovery from Nostr relays (kind 30078). Operates independently of the signal path — no relay rate-limit budget is consumed and no subscriptions are opened. All operations are explicit; nothing publishes automatically without a caller trigger.
+
+The passphrase is never stored. It is passed at call time, used to derive keys, and discarded. `ContactManager` remains the runtime source of truth; `ContactBookController` is the persistence and recovery layer on top of it.
+
+```typescript
+class ContactBookController {
+  fetchContactBook(options: {
+    privkey: Uint8Array;
+    passphrase: string;
+    seedRelays?: string[];        // defaults to WELL_KNOWN_INDEXERS
+  }): Promise<ContactBookSnapshot>;
+
+  publishContactBook(options: {
+    privkey: Uint8Array;
+    passphrase: string;
+    contacts: PairedContact[];   // current state from ContactManager
+    ownRelays: string[];
+  }): Promise<void>;
+}
+
+interface ContactBookSnapshot {
+  entries: ContactBookEntry[];
+  ownRelays: string[];
+  sourceCount: number;     // number of relay versions found and merged
+  mergedCount: number;     // entries that came from non-primary versions
+}
+```
+
+#### Fetch and Merge
+
+`fetchContactBook` queries all `seedRelays` in parallel for `{ kinds: [30078], authors: [contactBookSigningPubkey], "#d": ["senstry-contacts"] }`. Each relay returns its latest version of the replaceable event. Multiple versions can exist across relays when two devices have edited the contact book independently while offline.
+
+The merge strategy is union-by-identityPubkey, not latest-wins:
+
+1. Collect all unique events across relays (deduplicate by `event.id`)
+2. Decrypt each event's content with `contactBookEncKey`
+3. Union all `entries` arrays — deduplicate by `identityPubkey`; for the same identity in multiple versions, keep the entry with the latest `addedAt`; preserve the `devicePubkey` from that winning entry
+4. Union all `ownRelays` arrays across versions
+5. Return `ContactBookSnapshot`
+
+Naive latest-wins would silently drop entries added on a device that fell behind. Union merge preserves the full contact set regardless of which version is newest.
+
+After merging, the caller is responsible for:
+1. Restoring contacts to `ContactManager` via `registerPaired()`
+2. Calling `publishContactBook()` to write the canonical merged state back to relay — without this, diverged versions persist and future recoveries repeat the merge
+
+#### Publish
+
+`publishContactBook` serializes the current `PairedContact` list and `ownRelays` into a `ContactBook` blob, encrypts it with `contactBookEncKey`, signs a kind 30078 event with `contactBookSigningPrivkey`, and publishes to all relays in `ownRelays`. Because kind 30078 is replaceable, each relay automatically discards its previous version.
+
+**Publish triggers** (caller responsibility — not automatic):
+- After a pairing completes and a new `PairedContact` is registered
+- After a contact is unpaired and removed from `ContactManager`
+- After a relay migration commits and a contact's relay list changes
+- After a merge recovery, to canonicalize the merged state on relay
+
+#### Key Derivation (per operation)
+
+```typescript
+const contactBookSigningPrivkey = HKDF(privkey, passphrase, "senstry-contacts-sign-v1", 32);
+const contactBookSigningPubkey  = secp256k1(contactBookSigningPrivkey);
+const contactBookEncKey         = HKDF(privkey, passphrase, "senstry-contacts-enc-v1", 32);
+```
+
+Derived at call time, not cached. The passphrase is the PQC-resilient factor — a quantum adversary recovering `privkey` via Shor's algorithm cannot derive either key without it.
+
+#### Merge Conflict: ownRelays
+
+When merging multiple versions, `ownRelays` arrays are unioned. The caller receives the full union and is responsible for presenting it to the user or pruning it before the next publish. Relays are never silently dropped during merge — losing a relay silently could break future contact book recovery.
 
 ---
 
@@ -772,20 +853,27 @@ onDestroy(() => nostrClient.stopSignalRouter());
 
 **What the router does internally:**
 
-- Subscribes T+0 on all relays in `ContactManager.allMyInboundRelays()` — covers both paired and temp contacts
-- Filters for all registered peers' inbound channel keys
-- Subscription kind filter: `[5001, 5002, 5003, 5004, 5005, 5006, 5010, 5011]`
-- Kind 5006 (Remote Command) events are delivered via `onSignal` to `RemoteCommandController` (see sentry-controller.md)
-- Kind 5201 (TOTP Mailbox) events are NOT routed through the signal router — handled by the separate `subscribeToTOTPMailbox` subscription
-- Deduplicates by event ID
-- Decrypts and delivers to `onSignal` callback
-- When a peer is registered or updated (`updatePairedRelays`), the router re-subscribes using the transition lifecycle: a new REQ is opened and relay-verified before the old one closes, ensuring no coverage gap
-- The router's internal `requestSubscription` call does not use `onReady` — it is a long-lived subscription with no history alignment needed
+The router maintains two concurrent subscription sets per contact, reflecting the two addressing modes:
+
+- **Broadcast subscription** — kinds `[5004, 5010, 5011]`, no `#s` filter. Receives presence announcements and action signals regardless of session. On receiving kind 5004, updates `ContactManager.updatePeerSession(contactId, sessionUUID)` from the `#s` tag.
+- **Session-directed subscription** — kinds `[5001, 5002, 5003, 5005, 5006]`, `#s: mySessionUUID`. Receives signals addressed to this specific session. Replaced on session restart with the new UUID.
+
+Both subscriptions:
+- T+0 only — `since: now`; no history replay
+- Span all relays in `ContactManager.allMyInboundRelays()`
+- Filter by all registered peers' inbound channel pubkeys
+- Deduplicate by event ID
+- Decrypt and deliver to `onSignal` callback
+
+Kind 5006 (Remote Command) events are delivered via `onSignal` to `RemoteCommandController` (see sentry-controller.md). Kind 5201 (TOTP Mailbox) events are NOT routed through the signal router — handled by the separate `subscribeToTOTPMailbox` subscription.
+
+When a peer is registered or updated (`updatePairedRelays`), the router re-subscribes using the transition lifecycle: a new REQ is opened and relay-verified before the old one closes, ensuring no coverage gap.
 
 **Rules:**
 
 - Modules never manage subscriptions, relay lists, or channel keys
 - History catch-up happens via `fetchKindHistory()` — the router handles only T+0
+- History fetch bypasses the `#s` session gate — all past events are replayed regardless of session
 
 ---
 
@@ -993,7 +1081,11 @@ describe("NostrClient (integration)", () => {
 ## Key Invariants
 
 - **Modules interact with contact identity only** — no relay lists, channel keys, or raw Nostr events outside `NostrClient`. `ContactManager` holds all relay and key state internally.
-- **`ContactManager` is the single source of truth** — covers paired contacts (permanent, ECDH keys, IDB) and temp contacts (ephemeral keys, memory-only, TOTP-mailbox-derived). Relay migration flows through `updatePairedRelays()`; temp contact expiry is automatic. All operations resolve through it.
+- **ContactBookController is explicit-only** — nothing publishes the contact book automatically. Callers trigger publish after pairing, unpairing, relay migration commit, and post-merge canonicalization. The passphrase is never stored; it is passed at call time and discarded after key derivation.
+- **Merge is union-by-identityPubkey, not latest-wins** — when multiple relay versions diverge, all entries are unioned by identity pubkey. Latest-wins would silently drop contacts added on a lagging device. After any merge, the caller must re-publish the canonical result to prevent repeated merge on future recoveries.
+- **`contactId` is a device-pair relationship** — the same peer identity paired from two different devices yields two distinct contactIds with distinct channel keys. IDB resolves the correct contactId per device without cross-device coordination.
+- **`ContactManager` is the single source of truth** — covers paired contacts (permanent, device-key-derived channel keys, IDB) and temp contacts (ephemeral keys, memory-only, TOTP-mailbox-derived). Relay migration flows through `updatePairedRelays()`; peer re-key flows through `updatePeerDevicePubkey()`; temp contact expiry is automatic. All operations resolve through it.
+- **Session UUID is per-startup** — generated fresh on every startup, never persisted. `peerSessionUUID` in ContactEntry is updated on each received kind 5004. Session-directed signals include the peer's current `peerSessionUUID` as `#s` tag; signals without a matching `#s` are ignored by the target session.
 - **All contacts (TempContact and PairedContact) have non-null `outboundChannelPubkey`** — there is no null-channel case. The null-channel case was removed along with the pre-TOTP-mailbox initial contact pattern. Use `publishSignal(contactId, kind, payload)` for all post-contact communication.
 - **Never publish when `nostrOnline = false`** — gate checked before any outbound operation
 - **`publishSignal` is the default** — `publishSignalDirect` only for time-sensitive signals (status, RTC handshake)

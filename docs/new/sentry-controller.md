@@ -11,6 +11,8 @@ SentrySection.svelte  (thin UI layer)
   ├── DetectorController         manages detector instances + sensorStates
   ├── ActionController           manages actionStates, evaluates links
   ├── RecordingController        manages MediaRecorder sessions
+  ├── PinSegmentsController      manages footage window pinning for PinSegmentsActions
+  ├── CapturePhotosController    manages photo burst sessions for CapturePhotosActions
   ├── TriggerPublisher           sends action signals (kind 5010/5011) to targeted paired contacts via channel keys
   └── RemoteCommandController    receives kind 5006 from signal router, validates TOTP, dispatches to handlers
 ```
@@ -283,8 +285,10 @@ interface RemoteCommandHandler {
 remoteCommandController.registerHandler("relay-migrate-command", {
   handle: async (contactId, payload) => {
     const { newRelays } = payload;
-    await nostrClient.requestRelayMigrationListening(contactId, newRelays, () => { /* dual-listen confirmed active */ });
-    // kind 5005 dual-channel migration proceeds from here; unchanged
+    nostrClient.requestRelayMigrationListening(contactId, newRelays, async () => {
+      // onReady: dual-listen confirmed active — kind 5005 migration proceeds from here
+      await proposeInboundMigration(contactId, newRelays);
+    });
   },
 });
 ```

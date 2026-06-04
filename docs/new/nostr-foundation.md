@@ -243,7 +243,7 @@ outboundChannelPubkey = deriveChannelPubkey(outboundChannelPrivkey)
 
 #### Non-Persisted
 
-Channel keys are derived on-the-fly from the shared secret at pairing time. They are not persisted in IDB; recalculated each session.
+Channel keys are derived on-the-fly from the device shared secret at session start. They are not persisted in IDB; re-derived from the stable device keypair each session.
 
 ## 6. Event Kinds Used by Senstry
 
@@ -281,6 +281,27 @@ These kinds handle device discovery, initial identity exchange, and pre-contact 
 | 5201 | TOTP Mailbox Delivery | NIP-44 to HKDF-derived mailbox pubkey | Pre-contact one-shot delivery; `#p` tag routes to mailboxPubkey (not real pubkey); closed after TempContact is established |
 
 **Note:** Kinds 5100 and 5201 are not signal kinds. They use different encryption models and are fetched via `#p` tag filtering, not `since` filtering. They do not flow through the signal router.
+
+### Signal Addressing Modes
+
+Post-contact signals support two delivery modes distinguished by the presence of the `#s` tag.
+
+**Broadcast (no `#s` tag):** Any active session on the channel receives and processes the event. Used when the target session is unknown, the peer may be offline, or the signal is relevant to all sessions regardless of which is active.
+
+**Session-directed (`#s: targetSessionUUID`):** Only the session whose UUID matches the tag acts on the event. All other sessions on the same channel ignore it. Used for stateful interactions that require a specific live session as counterpart.
+
+The session UUID is generated fresh on every startup. Peers learn the current session UUID from the most recent kind 5004 announcement, which carries `#s` as a plaintext tag. Session-directed signals sent to a stale UUID go unanswered — the sending peer waits for a new kind 5004 before retrying.
+
+| Signal | Mode | Reason |
+|---|---|---|
+| 5004 Status | Broadcast | Session discovery — announces presence and current session UUID to all |
+| 5010 Trigger | Broadcast | Notification reaches any active session |
+| 5011 Arm State | Broadcast | State change reaches any active session |
+| 5001 RTC Session | Session-directed | Handshake requires a specific live session counterpart |
+| 5002 RTC Answer | Session-directed | Completes handshake with the initiating session |
+| 5003 RTC Hangup | Session-directed | Closes a specific session's RTC connection |
+| 5005 Relay Migration | Session-directed | Session-stateful relay negotiation |
+| 5006 Remote Command | Session-directed | Command targets a specific session |
 
 ### Contact Book
 
@@ -331,15 +352,30 @@ A **subscription** is a long-lived query that returns both historical events and
 
 ### Common Senstry Subscriptions
 
-**Signal subscription (all signal kinds, T+0 only):**
+Each contact requires two concurrent T+0 subscriptions reflecting the two addressing modes.
+
+**Broadcast subscription (session-agnostic):**
 ```json
 {
-  "kinds": [5001, 5002, 5003, 5004, 5005, 5006, 5010, 5011],
+  "kinds": [5004, 5010, 5011],
   "authors": ["inboundChannelPubkey"],
   "since": now
 }
 ```
-Subscribe to future signals and action signals from a specific contact (by channel pubkey). `since: now` is always used — no history replay. History for action signals (5010, 5011) is fetched via `fetchKindHistory(contactId, kind, { windowStart: lastOnline })` on reconnect.
+Receives presence announcements and action signals regardless of session. No `#s` filter — these signals have no session target.
+
+**Session-directed subscription:**
+```json
+{
+  "kinds": [5001, 5002, 5003, 5005, 5006],
+  "authors": ["inboundChannelPubkey"],
+  "#s": ["mySessionUUID"],
+  "since": now
+}
+```
+Receives signals directed at this specific session only. Opened with the current session UUID on startup. When a new session starts, a new subscription replaces the old one.
+
+History for action signals (5010, 5011) is fetched via `fetchKindHistory(contactId, kind, { windowStart: lastOnline })` on reconnect — no `#s` filter on history fetch, all past events are replayed regardless of session.
 
 **TOTP mailbox subscription (one-shot, pre-contact):**
 ```json
@@ -360,18 +396,29 @@ Every device has one **identity keypair:**
 - **Privkey:** 32-byte random value (Uint8Array), stored in IndexedDB (browser sandbox provides encryption at rest)
 - **Pubkey:** 64-character hex string, derived via secp256k1 from privkey
 
-This keypair is used only for pairing events (kind 5100) and as input to ECDH shared secret derivation. It never appears as the `pubkey` field on any post-contact Nostr event.
+The identity keypair is used for pairing authentication (kind 5100), contact book signing, and re-keying announcements. It never appears as the `pubkey` field on any post-contact Nostr event.
+
+### Device Keypair
+
+Every device also generates a **device keypair** on first launch, independently of the identity keypair:
+
+- **Privkey:** 32-byte random value (Uint8Array), stored in IDB. Never leaves the device. Not included in the contact book backup.
+- **Pubkey:** 64-character hex string, derived via secp256k1 from the device privkey. Exchanged during pairing alongside the identity pubkey.
+
+The device keypair is the input to ECDH channel key derivation. It is distinct from the identity keypair — recovering an identity onto a new device generates a fresh device keypair, which means fresh channel keys. Two devices sharing the same identity key have different device keypairs and therefore different, isolated relay channels. Within a single IDB the device keypair is stable across restarts.
+
+**Re-keying on recovery:** When a new device keypair is generated (new install), the device notifies each contact of its new device pubkey via a re-key announcement authenticated by the identity privkey. Contacts re-derive channel keys using the new device pubkey.
 
 ### ECDH Shared Secret
 
-When pairing two devices, a **shared secret** is computed:
+When pairing two devices, a **shared secret** is computed from their device keys:
 
 ```
-sharedSecret = ECDH(myPrivkey, pairedContactPubkey)
+sharedSecret = ECDH(myDevicePrivkey, pairedDevicePubkey)
 ```
 
-- Computed once per pair, not persisted
-- Only the paired devices can compute it (requires one privkey + other pubkey)
+- Computed once per device-pair, not persisted
+- Only the two specific device instances can compute it
 - Used as input to channel key derivation
 
 ### Mailbox Keypair
@@ -387,23 +434,24 @@ The mailboxPubkey is used as the `#p` routing target and NIP-44 recipient key in
 
 ### Channel Keys
 
-Derived from the shared secret:
+Derived from the device-level shared secret:
 
 ```
 // Monitor → Viewer
-outboundChannelPrivkey = deriveChannelKey(sharedSecret, monitorPubkey, viewerPubkey)
+outboundChannelPrivkey = deriveChannelKey(sharedSecret, monitorDevicePubkey, viewerDevicePubkey)
 outboundChannelPubkey = secp256k1(outboundChannelPrivkey)
 
 // Viewer → Monitor
-inboundChannelPrivkey = deriveChannelKey(sharedSecret, viewerPubkey, monitorPubkey)
+inboundChannelPrivkey = deriveChannelKey(sharedSecret, viewerDevicePubkey, monitorDevicePubkey)
 inboundChannelPubkey = secp256k1(inboundChannelPrivkey)
 ```
 
 **Properties:**
-- Deterministic: same inputs always produce same output
+- Deterministic: same device key inputs always produce the same output
 - Directional: `deriveChannelKey(s, A, B) ≠ deriveChannelKey(s, B, A)`
-- Non-persisted: recomputed each session from pairing data
-- Pseudonymous: relay sees channel pubkey, not identity
+- Device-specific: two devices sharing the same identity have different device keys and therefore different channels — events are never delivered to the wrong device
+- Non-persisted: re-derived from the stable device keypair each session
+- Pseudonymous: relay sees only the channel pubkey, not the device or identity key
 
 ### Contact Book Keys
 
@@ -520,10 +568,12 @@ Senstry uses two contact types. Both expose the same signal API — `publishSign
 | Property | TempContact | PairedContact |
 |----------|-------------|---------------|
 | Origin | Created from a TOTP mailbox delivery (kind 5201) | Created from a QR/URI/Nostr pairing invite |
-| Channel keys | Fresh ephemeral keypair (sender's `replyKey`) | ECDH-derived from shared invite secret |
+| Channel keys | Fresh ephemeral keypair (sender's `replyKey`) | ECDH-derived from device key pair |
 | Persistence | Memory-only; TTL-bound | IDB-backed; persistent across sessions |
 | Identified by | `contactId` | `contactId` |
 | Signal kinds | 5001–5006, 5010, 5011 | 5001–5006, 5010, 5011 |
+
+A `contactId` represents a **device-pair relationship**, not an identity-pair relationship. If ContactA has two devices (DeviceA, DeviceB) and ContactB has one device (DeviceA), there are two separate contactIds: one for `ContactA-DeviceA ↔ ContactB-DeviceA` and one for `ContactA-DeviceB ↔ ContactB-DeviceA`. Each device's IDB holds only the contactIds relevant to that device — no cross-device resolution is required.
 
 Both contact types always have a non-null `outboundChannelPubkey`. The null case does not exist — there is no code path that publishes a signal without a channel key.
 
@@ -534,16 +584,18 @@ PairedContacts are backed by IDB and survive restarts. They are also serialized 
 ```typescript
 interface ContactBook {
   version: 1;
+  ownRelays: string[];  // this device's own relay list
   entries: Array<{
-    pubkey: string;    // paired device's real pubkey
-    relays: string[];  // their relay list
-    nickname: string;  // local label
-    addedAt: number;   // unix timestamp
+    identityPubkey: string;  // peer's long-term identity pubkey (stable across devices)
+    devicePubkey: string;    // peer's device pubkey at time of pairing (used for channel key derivation)
+    relays: string[];        // peer's relay list
+    nickname: string;        // local label
+    addedAt: number;         // unix timestamp
   }>;
 }
 ```
 
-Channel keys are not stored in the blob — they are re-derived from each `pubkey` pair on load, consistent with the non-persisted channel key property. The contact book is published once per contact list change. On relay, the `(contactBookSigningPubkey, 30078, "senstry-contacts")` triple always resolves to the latest version.
+Channel keys are not stored in the blob — they are re-derived from `devicePubkey` on load. If the peer re-keys (new device), they announce their new `devicePubkey` via a re-key signal authenticated by their `identityPubkey`. The `identityPubkey` is the stable reference that survives device replacement. The contact book is published once per contact list change. On relay, the `(contactBookSigningPubkey, 30078, "senstry-contacts")` triple always resolves to the latest version.
 
 ## 11. Event Tags and Conventions
 
@@ -555,6 +607,7 @@ Tags are optional metadata attached to events. Format is an array of arrays: `["
 |-----|--------|---------|
 | `p` | `["p", "pubkey"]` | NIP-44 recipient; also marks a pubkey mention |
 | `p` | `["p", mailboxPubkey]` | TOTP mailbox routing — present only in kind 5201 pre-contact events; the value is the HKDF-derived mailboxPubkey, not a real identity pubkey; absent from all post-contact signals |
+| `s` | `["s", "sessionUUID"]` | Session addressing — present on session-directed signals (5001–5003, 5005, 5006) and on kind 5004 announcements. On 5004: advertises the sender's current session UUID. On directed signals: targets a specific session; non-matching sessions ignore the event. Absent from broadcast signals (5010, 5011) |
 | `e` | `["e", "event-id"]` | Reference to another event |
 | `relay` | `["relay", "url"]` | Relay hint (where to fetch related events) |
 | `t` | `["t", "tag"]` | Hashtag (e.g., `["t", "motion-detection"]`) |
@@ -738,7 +791,7 @@ Walk-through of a complete trigger event from sensor to viewer UI.
    - Signed with outbound channel privkey — real identity never exposed
 5. **RelayStateController:** Selects next available relay from contact's outbound relay list (LRU)
 6. **Relay:** Receives event, validates signature, stores, notifies subscribers
-7. **Viewer:** T+0 subscription matches `{ kinds: [5001,5002,5003,5004,5005,5006,5010,5011], authors: [monitor-outbound-channel-pubkey] }` — event delivered
+7. **Viewer:** T+0 broadcast subscription matches `{ kinds: [5004,5010,5011], authors: [monitor-outbound-channel-pubkey] }` — kind 5010 event delivered (broadcast kinds require no `#s` filter)
 8. **NostrClient (viewer):** Decrypts with inbound channel privkey, delivers `onSignal(monitorContactId, 5010, payload)`
 9. **Viewer UI:** Receives `(monitorContactId, 5010, { sensorType, level, detectedAt })` — adds alert marker to timeline
 10. **Viewer:** Requests pre/post-roll footage from monitor over the existing RTC data channel

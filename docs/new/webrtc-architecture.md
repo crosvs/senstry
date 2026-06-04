@@ -316,8 +316,8 @@ All messages are JSON strings. Sent/received by `handleDataMessage()` on monitor
 | `{ type: 'source-list-request' }` | `{ type: 'source-list', sourceIds: [...] }` | List of open source IDs from monitor |
 | `{ type: 'channel-list-request' }` | `{ type: 'channel-list', channels: [ChannelConfig, ...] }` | Live ChannelConfigs from monitor |
 | `{ type: 'segment-channels-request' }` | `{ type: 'segment-channels', channels: [...] }` | Distinct channel IDs in stored segments |
-| `{ type: 'coverage-request', mimePrefix?, channelId? }` | `{ type: 'coverage-map', segments: [[start, end], ...], mimePrefix }` | Coverage intervals |
-| `{ type: 'coverage-channels-request', mimePrefix? }` | `{ type: 'coverage-channels', channels: { [channelId]: [[start, end], ...], ... } }` | Per-channel coverage |
+| `{ type: 'coverage-request', mimePrefix?, channelId? }` | `{ type: 'coverage-map', coverage: [[start, end], ...], mimePrefix }` | Coverage intervals |
+| `{ type: 'coverage-channels-request', mimePrefix? }` | `{ type: 'coverage-channels', coverage: { [channelId]: [[start, end], ...] } }` | Per-channel coverage |
 | `{ type: 'segment-request', time, mimePrefix?, channelId? }` | `segment-meta` + `segment-chunk`×N or `segment-error` | Fetch segment at timestamp |
 | `{ type: 'segment-request-by-id', segmentId }` | `segment-meta-by-id` + `segment-chunk-by-id`×N or `segment-error-by-id` | Fetch by ID |
 | `{ type: 'segments-after-request', after, count }` | `{ type: 'segments-after', segments: [SegmentMeta, ...] }` | Metadata for up to 20 after timestamp |
@@ -487,15 +487,17 @@ export function deriveChannelKey(sharedSecret: Uint8Array, fromPubkey: string, t
 The router derives inbound channel pubkeys from all paired devices (one per direction, via `deriveChannelKey`), subscribes T+0 to all signal kinds across all inbound relays, and delivers decrypted payloads to the `onSignal` callback. Callers never manage subscriptions or channel keys directly.
 
 ```typescript
-// Conceptual subscription the router maintains per paired device:
-// { kinds: [5001, 5002, 5003, 5004, 5005, 5006, 5010, 5011], authors: [inboundChannelPubkey], since: now }
+// Two concurrent subscriptions the router maintains per paired device:
+// Broadcast (no #s filter): { kinds: [5004, 5010, 5011], authors: [inboundChannelPubkey], since: now }
+// Session-directed:         { kinds: [5001, 5002, 5003, 5005, 5006], authors: [inboundChannelPubkey], "#s": [mySessionUUID], since: now }
 ```
 
 **Transmission:** `sendSignal()`
 
 ```typescript
-const sharedSecret = getConversationKey(privkey, toPubkey);
-const outboundChannelPrivkey = deriveChannelKey(sharedSecret, fromPubkey, toPubkey);
+// Channel keys use DEVICE keys, not identity keys
+const sharedSecret = getConversationKey(devicePrivkey, peerDevicePubkey);
+const outboundChannelPrivkey = deriveChannelKey(sharedSecret, ownDevicePubkey, peerDevicePubkey);
 const outboundChannelPubkey = getPublicKey(outboundChannelPrivkey);
 
 const plaintext = JSON.stringify(msg);
@@ -518,9 +520,9 @@ const event = finalizeEvent({
 
 ### Implementation Detail
 
-Each direction has its own channel key:
-- **Monitor → Viewer:** Signed with `deriveChannelKey(sharedSecret, monitorPubkey, viewerPubkey)`
-- **Viewer → Monitor:** Signed with `deriveChannelKey(sharedSecret, viewerPubkey, monitorPubkey)`
+Each direction has its own channel key, derived from device keys (not identity keys):
+- **Monitor → Viewer:** Signed with `deriveChannelKey(sharedSecret, monitorDevicePubkey, viewerDevicePubkey)`
+- **Viewer → Monitor:** Signed with `deriveChannelKey(sharedSecret, viewerDevicePubkey, monitorDevicePubkey)`
 
 Receiver derives the sender's outbound key and verifies it matches the event's pubkey before decrypting.
 
