@@ -64,14 +64,23 @@ Nothing is auto-discovered or implicitly connected. Every pipeline component is 
 
 ---
 
+## Source Material
+
+`docs/new/previous/` contains the original documentation these files were derived from. Those docs were built incrementally through task sessions — never fully reviewed end-to-end — and were summarized and adjusted post-creation. They contain known coherence issues and should be treated as reference-only. The canonical documentation is exclusively in `docs/new/`.
+
+---
+
 ## Document Index
 
-| File                                     | What it covers                                                                                     |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `docs/new/nostr-foundation.md`           | Core Nostr protocol concepts, event model, NIPs used, ECDH channel key design, contact model       |
-| `docs/new/nostr-controller.md`           | NostrClient architecture: RelayPool, PublishQueue, SubscriptionManager, RelayStateController       |
-| `docs/new/nostr-communication-flow.md`   | Device pairing, signal exchange, relay migration, TOTP, Nostr actions                              |
-| `docs/new/sentry-pipeline-foundation.md` | Sentry pipeline: sources, sensors, channels, links, actions, segments                              |
-| `docs/new/sentry-controller.md`          | Controller extraction: DetectorController, ActionController, RecordingController, TriggerPublisher |
-| `docs/new/webrtc-architecture.md`        | WebRTC session lifecycle, signal types, data channel protocol, encryption                          |
-| `docs/new/webrtc-communication-flow.md`  | WebRTC connection flows, request API, segment transfer, signal router                              |
+| File                                  | What it covers                                                                                              |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `docs/new/nostr-protocol.md`          | Core Nostr protocol concepts, event model, NIPs used, ECDH channel key design, relay model                  |
+| `docs/new/contact-model.md`           | TempContact and PairedContact types, ContactManager, channel key derivation, contact lifecycle               |
+| `docs/new/pairing.md`                 | Device pairing flows: QR-based, TOTP mailbox, and programmatic; invite delivery and PairedContact creation  |
+| `docs/new/signal-exchange.md`         | Signal kinds 5001–5006: definitions, addressing, routing, TTL, publishing, and isResponse semantics          |
+| `docs/new/nostr-client.md`            | NostrClient architecture: RelayPool, PublishQueue, SubscriptionManager, RelayStateController, NostrGate      |
+| `docs/new/webrtc-peer.md`             | RTCPeerConnection factory, ICE/STUN/TURN config, signal wire format, ECDH encryption, TTL, deduplication    |
+| `docs/new/webrtc-session.md`          | WebRTC session lifecycle: viewer and monitor connection flows, signal router, session teardown               |
+| `docs/new/webrtc-data-channel.md`     | Data channel protocol: control and data channels, request/response pattern, segment transfer                 |
+| `docs/new/sentry-pipeline.md`         | Sentry pipeline: sources, sensors, channels, capture methods, links, actions, segments                       |
+| `docs/new/sentry-controllers.md`      | Controller layer: DetectorController, ActionController, RecordingController, TriggerPublisher, and peers     |
