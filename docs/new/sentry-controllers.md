@@ -9,6 +9,7 @@ SentrySection.svelte  (thin UI layer)
   │  reads controller state for rendering
   │  forwards arm/disarm gestures to controllers
   │
+  ├── SessionController          owns session connection lifecycle, kind 5004 state machine
   ├── DetectorController         manages detector instances and sensorStates
   ├── ActionController           evaluates links, manages actionStates
   ├── RecordingController        manages MediaRecorder sessions, per-track arbitration
@@ -202,6 +203,74 @@ Calls `capturePhoto(stream, options)` per burst interval and `saveSegment(blob, 
 
 ---
 
+## SessionController
+
+`SessionController` owns the session connection lifecycle for all contacts. It is the exclusive owner of session state — other controllers consult it for active session UUIDs and receive callbacks when sessions open or close. It drives `NostrClient`'s session subscriptions via `openSessionSubscription`/`closeSessionSubscription` and owns the kind 5004 state machine. It has no Svelte dependency.
+
+```typescript
+class SessionController {
+  constructor(
+    mySessionUUID: string,
+    nostrClient: NostrClient,
+    onSessionOpened: (contactId: string, peerSessionUUID: string) => void,
+    onSessionClosed: (contactId: string, peerSessionUUID: string) => void,
+    opts?: {
+      startupGraceMs?: number; // default: 20_000
+    }
+  ) {}
+
+  // Called by the top-level signal router fan-out for every kind 5004 event
+  handlePresenceSignal(
+    contactId: string,
+    payload: StatusPayload,
+    senderSessionUUID: string,
+  ): void;
+
+  // Returns the active peer session UUIDs for a contact.
+  // Other controllers call this before publishSignal to obtain a valid sessionId.
+  getActiveSessions(contactId: string): string[];
+
+  // Explicitly closes a session (e.g. after RTC hangup, after peer offline).
+  closeSession(contactId: string, peerSessionUUID: string): void;
+
+  start(): void;  // begins accepting 5004 signals; starts startup grace timer
+  stop(): void;   // closes all session subscriptions; does not publish offline
+}
+```
+
+**Constructor arguments:**
+
+| Argument | Role |
+|---|---|
+| `mySessionUUID` | This app instance's session UUID, generated once at startup and passed identically to `NostrClient`. |
+| `nostrClient` | Used to call `publishSignalDirect` (for `isResponse=true` 5004 session connect) and `openSessionSubscription`/`closeSessionSubscription`. |
+| `onSessionOpened(contactId, peerSessionUUID)` | Fired when a session is fully established (after both sides complete the 5004 exchange). Signals RTC and other controllers that this peer session is ready to receive directed signals. |
+| `onSessionClosed(contactId, peerSessionUUID)` | Fired when a session ends — peer announced offline with a matching session UUID, or `closeSession` was called explicitly. |
+| `opts.startupGraceMs` | During this window after `start()`, `SessionController` does not send an unsolicited `isResponse=true` in response to a peer's `isResponse=false` announcement. If a peer sends `isResponse=true` directed at this session (because it received this device's own startup broadcast first), the session is accepted regardless of the grace window. This prevents a reply flood when many contacts come online simultaneously. |
+
+**`handlePresenceSignal` behavior:**
+
+1. `payload.state === 'offline'`: close any active session for `(contactId, senderSessionUUID)` — call `nostrClient.closeSessionSubscription(contactId, senderSessionUUID)`, remove from the session map, fire `onSessionClosed`.
+
+2. `payload.state === 'online'`, `isResponse=false` (announcement):
+   - Session already active for `senderSessionUUID`: no-op.
+   - Startup grace has not expired: record the announcement as pending; do not reply yet. When grace expires, all pending announcements are processed: for each, open `nostrClient.openSessionSubscription(contactId, senderSessionUUID)`, then `publishSignalDirect(contactId, 5004, { state: 'online', isResponse: true }, senderSessionUUID)`, and fire `onSessionOpened`. If a peer sends `isResponse=true` directed at this session UUID before grace expires, that handshake is accepted immediately (step 3 below) — the pending entry is removed and no deferred reply is sent.
+   - Startup grace expired: open `nostrClient.openSessionSubscription(contactId, senderSessionUUID)`, then `publishSignalDirect(contactId, 5004, { state: 'online', isResponse: true }, senderSessionUUID)`. Fire `onSessionOpened`. The session subscription is opened before the reply is sent so the session is ready to receive directed traffic by the time the peer processes the ack.
+
+3. `payload.state === 'online'`, `isResponse=true` (session connect directed at this session):
+   - Open `nostrClient.openSessionSubscription(contactId, senderSessionUUID)` if not already open.
+   - Fire `onSessionOpened(contactId, senderSessionUUID)`.
+
+**`getActiveSessions(contactId)`** returns the UUIDs of all currently active peer sessions for the contact. Returns `[]` if none. Callers use this to obtain a `sessionId` before calling `publishSignal`.
+
+**What `SessionController` does NOT do:**
+- Does not call `ContactManager.updatePeerSession()` directly — the app layer may wire that via the `onSessionOpened` callback if the convenience field is desired.
+- Does not handle any signal kind other than 5004 via `handlePresenceSignal`.
+- Does not own RTC state, relay migration state, or remote command state.
+- Does not validate session UUIDs passed by callers — it is the source of truth for valid UUIDs.
+
+---
+
 ## RemoteCommandController
 
 Kind 5006 (Remote Command) is defined in [signal-exchange.md](signal-exchange.md) § Remote Command.
@@ -232,7 +301,7 @@ interface RemoteCommandHandler {
 |---|---|
 | `nostrClient` | Publishes ack signals via `publishSignal` |
 | `totpStore` | Credential lookup and rate limiting per contact |
-| `onSignal` | `(contactId: string, kind: number, payload: object) => void` delivering kind 5006 events from the signal router — see [signal-exchange.md](signal-exchange.md) § Signal Router for the `SignalRouterCallback` type alias |
+| `onSignal` | `(contactId: string, kind: number, payload: object, senderSessionUUID?: string) => void` delivering kind 5006 events from the signal router — `senderSessionUUID` is the `#fs` tag value and is passed to the ack publish as `sessionId`. See [signal-exchange.md](signal-exchange.md) § Signal Router for the `SignalRouterCallback` type alias. |
 
 `TOTPCredentialStore` is the subset of `ContactManager` used by `RemoteCommandController`:
 
@@ -258,7 +327,7 @@ The application's top-level `onSignal` handler fans out by kind: kind 5006 event
 3. Validate via `verifyRawSeed` or `verifyTOTPCode` depending on `payload.credential_type`
 4. Record the attempt via `totpStore.recordAttempt(contactId, success)` regardless of outcome
 5. If invalid: discard silently, no ack, rate limiting applied
-6. If valid: publish ack (`kind 5006, { isResponse: true, commandId, accepted: true }`), then call the registered handler
+6. If valid: publish ack via `publishSignal(contactId, 5006, { isResponse: true, commandId, accepted: true }, senderSessionUUID)`, then call the registered handler
 
 The ack confirms credential validity only. Handler execution result is not part of the ack. Dispatch is by `payload.payload.type` — one registered handler per type.
 
@@ -324,6 +393,7 @@ Payload shapes (`TriggerPayload`, `ArmStatePayload`) are defined in [signal-exch
 
 ```svelte
 <script lang="ts">
+  let sessionCtrl: SessionController | null = null;
   let detectorCtrl: DetectorController | null = null;
   let actionCtrl: ActionController | null = null;
   let recordingCtrl: RecordingController | null = null;

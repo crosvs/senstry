@@ -2,7 +2,7 @@
 
 ## Overview
 
-**NostrClient** is the single entry point for all Nostr interactions. Modules communicate through contactIds — they never handle relay lists, channel keys, raw events, or rate-limit state directly. All of that resolution is internal.
+**NostrClient** is the single entry point for all Nostr interactions. Modules communicate through contactIds — they never handle relay lists, channel keys, raw events, or rate-limit state directly. All of that resolution is internal. `NostrClient` requires a `mySessionUUID` at construction — a per-app-instance UUID generated once at startup and shared with `SessionController`. It is used to populate the `#fs` sender tag on all outbound session-directed events.
 
 ```
 Module
@@ -30,6 +30,7 @@ class NostrClient {
   constructor(
     privkey: Uint8Array,
     pubkey: string,
+    mySessionUUID: string,
     onOnlineStateChange: (isOnline: boolean) => void,
   ) {}
 
@@ -50,8 +51,9 @@ class NostrClient {
   allContactIds(): string[];
 
   // Publishing — relay selection, key lookup, and encryption are internal
-  publishSignal(contactId: string, kind: number, payload: object): void;
-  publishSignalDirect(contactId: string, kind: number, payload: object): Promise<void>;
+  // sessionId: target peer session UUID; when provided, adds ["s", sessionId] and ["fs", mySessionUUID] tags
+  publishSignal(contactId: string, kind: number, payload: object, sessionId?: string): void;
+  publishSignalDirect(contactId: string, kind: number, payload: object, sessionId?: string): Promise<void>;
 
   // TOTP mailbox — pre-contact delivery, separate from the signal router
   subscribeToTOTPMailbox(
@@ -61,11 +63,16 @@ class NostrClient {
     onMessage: (decryptedPayload: object, senderEphemeralPubkey: string) => void,
   ): () => void;
 
-  // Signal router — T+0 across all contacts; decrypts before delivery
+  // Signal router — T+0 broadcast subscriptions per contact; decrypts before delivery
+  // senderSessionUUID: from #s tag (5004) or #fs tag (session-directed kinds); absent for broadcast 5010/5011
   startSignalRouter(
-    onSignal: (contactId: string, kind: number, payload: object) => void,
+    onSignal: (contactId: string, kind: number, payload: object, senderSessionUUID?: string) => void,
   ): void;
   stopSignalRouter(): void;
+
+  // Session subscriptions — opened/closed by SessionController; events delivered via the same onSignal callback
+  openSessionSubscription(contactId: string, peerSessionUUID: string): void;
+  closeSessionSubscription(contactId: string, peerSessionUUID: string): void;
 
   // One-off subscription — for pre-pairing flows with no contactId
   requestSubscription(
@@ -108,7 +115,7 @@ class NostrClient {
 - `publishSignalDirect` — immediate, bypasses queue. Use only for time-sensitive signals (status announcements, RTC handshake).
 
 **Signal routing:**
-- `startSignalRouter(onSignal)` — maintains T+0 subscriptions across all contacts. `onSignal` receives `(contactId, kind, payload)` already decrypted.
+- `startSignalRouter(onSignal)` — maintains T+0 broadcast subscriptions (kinds 5004, 5010, 5011) per contact. `onSignal` receives `(contactId, kind, payload, senderSessionUUID?)` already decrypted. Session subscriptions (kinds 5001–5006) are managed separately via `openSessionSubscription`/`closeSessionSubscription` and also deliver through `onSignal`.
 - Router re-subscribes automatically when contacts are added, updated, or expired.
 
 ---
@@ -471,14 +478,14 @@ for (const event of missedActions.reverse()) {
 ### Pattern 5: Signal Router (Long-Lived Subscription)
 
 ```typescript
-nostrClient.startSignalRouter((contactId, kind, payload) => {
-  routeSignal(contactId, kind, payload);
+nostrClient.startSignalRouter((contactId, kind, payload, senderSessionUUID) => {
+  routeSignal(contactId, kind, payload, senderSessionUUID);
 });
 
 onDestroy(() => nostrClient.stopSignalRouter());
 ```
 
-The router maintains broadcast and session-directed subscriptions per contact. For subscription structure, kind assignments, and session UUID update behavior, see [signal-exchange.md](signal-exchange.md).
+`startSignalRouter` establishes broadcast subscriptions (kinds 5004, 5010, 5011) per contact. Session subscriptions (kinds 5001–5006) are opened and closed by `SessionController` via `openSessionSubscription`/`closeSessionSubscription` — events from both subscription types are delivered through the same `onSignal` callback. For subscription structure, kind assignments, and tag semantics, see [signal-exchange.md](signal-exchange.md).
 
 Kind 5201 (TOTP Mailbox) is not routed here — it uses the separate `subscribeToTOTPMailbox` subscription.
 
@@ -519,6 +526,8 @@ The generator stops automatically when `windowStart` is reached or all relays re
 - **Default history window is 2 days** — `fetchKindHistory` never looks beyond `now - 2 days` unless `windowStart` is set explicitly.
 - **Never publish when `nostrOnline = false`** — gate checked before every outbound operation; the only exception is the offline status announcement itself.
 - **Signal routing is by kind number** — callbacks dispatched by kind, never by decrypted payload content. `SubscriptionManager` may group multiple kinds into one relay REQ for efficiency; this is invisible to callers.
+- **Session subscriptions are caller-managed** — `NostrClient` never opens a session subscription autonomously. `openSessionSubscription`/`closeSessionSubscription` are called exclusively by `SessionController`. `NostrClient` does not validate session UUIDs; it uses them mechanically for tags and relay filters.
+- **Each active peer session is one relay REQ** — session subscriptions for different peer sessions on the same contact have distinct `#fs` tag anchors and do not merge in `SubscriptionManager`.
 
 ---
 
@@ -591,10 +600,10 @@ describe("SubscriptionManager", () => {
 ```typescript
 describe("NostrClient (integration)", () => {
   it("publishes and subscriber receives", async () => {
-    const client = new NostrClient(privkey, pubkey, vi.fn());
+    const client = new NostrClient(privkey, pubkey, mySessionUUID, vi.fn());
     const received: string[] = [];
 
-    client.startSignalRouter((contactId, kind, payload) => {
+    client.startSignalRouter((contactId, kind, payload, senderSessionUUID) => {
       received.push(JSON.stringify(payload));
     });
 

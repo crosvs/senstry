@@ -102,15 +102,18 @@ interface ArmStatePayload {
 
 Post-contact signals support two addressing modes distinguished by the presence of the `#s` tag on the Nostr event.
 
-**Broadcast (not filtered by `#s`):** Any active session on the channel receives and processes the event. Used when the target session is unknown or the signal is relevant regardless of which session is active. Kind 5004 events carry `#s` as a metadata tag for the sender's session UUID, but broadcast subscriptions do not filter by it.
+**Broadcast (no session tags):** Any active session on the channel receives and processes the event. Broadcast kinds (5004, 5010, 5011) carry no `#s` or `#fs` tags, with one exception: kind 5004 `isResponse=false` carries `["s", senderSessionUUID]` as an informational tag announcing the sender's identity. This is not a relay routing filter — broadcast subscriptions for 5004 do not filter by `#s`.
 
-**Session-directed (`#s: targetSessionUUID`):** Only the session whose UUID matches the tag acts on the event. All other sessions on the same channel ignore it. Used for stateful interactions requiring a specific live counterpart.
+**Session-directed (`#s` + `#fs` tags):** Only the matching session receives and processes the event. Two plaintext tags are required:
+- `["s", recipientSessionUUID]` — anchors delivery to the recipient's session at the relay level
+- `["fs", senderSessionUUID]` — identifies the sender's session, enabling the recipient to filter out traffic from peer sessions it has not chosen to connect to
 
-The session UUID is generated fresh on every startup. Peers learn the current session UUID from the most recent kind 5004 announcement, which carries `#s` as a plaintext tag on the event (not in the encrypted content). Session-directed signals sent to a stale UUID go unanswered; the sending peer waits for a new kind 5004 before retrying.
+Session connections are established via the 5004 handshake — see [Status (Kind 5004)](#status-kind-5004). Session UUIDs are generated fresh on every app startup. Session-directed signals sent to a stale UUID go unanswered; the sending peer waits for a new kind 5004 before retrying.
 
 | Kind | Mode | Reason |
 |------|------|--------|
-| 5004 Status | Broadcast | Announces presence and current session UUID to all sessions |
+| 5004 Status (`isResponse=false`) | Broadcast | Announces presence and session UUID; `#s` tag is informational only |
+| 5004 Status (`isResponse=true`) | Session-directed | Session connect — establishes a session with the announcer |
 | 5010 Trigger | Broadcast | Notification reaches any active session |
 | 5011 Arm State | Broadcast | State change reaches any active session |
 | 5001 RTC Session | Session-directed | Handshake requires a specific live session counterpart |
@@ -123,14 +126,17 @@ The session UUID is generated fresh on every startup. Peers learn the current se
 
 ## Signal Transmission
 
-Every signal is published via `nostrClient.publishSignal(contactId, kind, payload)` or `nostrClient.publishSignalDirect(contactId, kind, payload)`. Relay selection, channel key lookup, and encryption are all internal.
+Every signal is published via `nostrClient.publishSignal(contactId, kind, payload, sessionId?)` or `nostrClient.publishSignalDirect(contactId, kind, payload, sessionId?)`. Relay selection, channel key lookup, and encryption are all internal. The optional `sessionId` is the target peer session UUID — when provided, NostrClient adds `["s", sessionId]` and `["fs", mySessionUUID]` to the event. When absent, no session tags are added.
 
 ```
 Event structure on relay:
   pubkey:     sender's outboundChannelPubkey (ECDH-derived for paired; ephemeral for temp)
   kind:       5001–5006 or 5010–5011
   created_at: honest unix timestamp
-  tags:       [["s", targetSessionUUID]]  — session-directed only; absent for broadcast
+  tags (broadcast 5010, 5011):              []
+  tags (5004 isResponse=false):             [["s", senderSessionUUID]]            — informational only, not a routing filter
+  tags (5004 isResponse=true):              [["s", recipientSessionUUID], ["fs", senderSessionUUID]]
+  tags (session-directed 5001–5003, 5005–5006): [["s", recipientSessionUUID], ["fs", senderSessionUUID]]
   content:    NIP-44 ciphertext (ChaCha20-Poly1305 over ECDH channel key)
 ```
 
@@ -150,18 +156,18 @@ Both accept `(contactId, kind, payload)`. Relay and key selection are identical.
 The signal router is a long-lived subscription set managed inside `NostrClient`. Modules start it once and receive decoded, decrypted signals via a callback — no relay or channel key management required.
 
 ```typescript
-nostrClient.startSignalRouter((contactId, kind, payload) => {
-  routeSignal(contactId, kind, payload);
+nostrClient.startSignalRouter((contactId, kind, payload, senderSessionUUID) => {
+  routeSignal(contactId, kind, payload, senderSessionUUID);
 });
 ```
 
 ```typescript
-type SignalRouterCallback = (contactId: string, kind: number, payload: object) => void
+type SignalRouterCallback = (contactId: string, kind: number, payload: object, senderSessionUUID?: string) => void
 ```
 
-The router maintains **two concurrent subscriptions per contact**, reflecting the two addressing modes. The subscription JSON blocks below are per-contact — the router opens one broadcast and one session-directed subscription for each registered contact, with the `"authors"` field set to that contact's `inboundChannelPubkey`.
+`startSignalRouter` establishes **one broadcast subscription per contact**. Session subscriptions are opened and closed separately by `SessionController` (see [sentry-controllers.md](sentry-controllers.md) § SessionController) via `nostrClient.openSessionSubscription()` / `nostrClient.closeSessionSubscription()`. Events from both subscription types are delivered through the same `onSignal` callback.
 
-**Broadcast subscription:**
+**Broadcast subscription (one per contact, established by `startSignalRouter`):**
 ```json
 {
   "kinds": [5004, 5010, 5011],
@@ -170,19 +176,18 @@ The router maintains **two concurrent subscriptions per contact**, reflecting th
 }
 ```
 
-**Session-directed subscription:**
+**Session subscription (one per active peer session, managed by `SessionController`):**
 ```json
 {
   "kinds": [5001, 5002, 5003, 5005, 5006],
   "authors": ["inboundChannelPubkey"],
   "#s": ["mySessionUUID"],
+  "#fs": ["peerSessionUUID"],
   "since": now
 }
 ```
 
-Both subscriptions are T+0 (`since: now`). Both span all relays in `ContactManager.allMyInboundRelays()`. Incoming events are decrypted before delivery to `onSignal`.
-
-On receiving kind 5004, the router calls `ContactManager.updatePeerSession(contactId, sessionUUID)` using the plaintext `#s` tag — no decryption needed to extract the session UUID.
+All subscriptions are T+0 (`since: now`), spanning all relays in `ContactManager.allMyInboundRelays()`. Incoming events are decrypted before delivery to `onSignal`. For kind 5004 `isResponse=false`, `senderSessionUUID` is extracted from the plaintext `#s` tag without decryption (no `#s` filter is applied on the broadcast subscription, so the tag is read purely as metadata). For kinds 5010 and 5011, no session tags are present and `senderSessionUUID` is absent in the callback. For session-directed kinds (5001–5003, 5004 `isResponse=true`, 5005–5006), `senderSessionUUID` is extracted from the `#fs` tag.
 
 ### Dispatch Table
 
@@ -194,15 +199,15 @@ The router delivers each decoded signal to the appropriate handler based on kind
 | 5001 | `true` | Viewer handler — `handleOffer()` |
 | 5002 | `false` | Monitor handler — `handleAnswer()` |
 | 5003 | `false` or `true` | Both viewer and monitor handlers — each checks its own session map and closes the matching session |
-| 5004 | `false` | Router calls `notifyPresenceChange(contactId, 'online' \| 'offline')`, then replies with `isResponse=true` if conditions allow |
-| 5004 | `true` | Router calls `notifyPresenceChange(contactId, 'online' \| 'offline')` — no reply sent |
+| 5004 | `false` | Delivered to callback — `senderSessionUUID` extracted from plaintext `#s` tag (no decryption needed) and passed as fourth argument |
+| 5004 | `true` | Delivered to callback — `senderSessionUUID` extracted from `#fs` tag |
 | 5005 | `false` | Relay migration handler — `handleRelayMigrationProposal()` |
 | 5005 | `true` | Relay migration handler — `handleRelayMigrationAck()` |
 | 5006 | `false` | `RemoteCommandController` — validates TOTP and dispatches command |
 | 5010 | — | Viewer handler — `handleTriggerSignal()` |
 | 5011 | — | Viewer handler — `handleArmStateSignal()` |
 
-`notifyPresenceChange` is a callback passed to the signal router at startup — it is not a `ContactManager` method. `ContactManager` does not store presence state; presence is consumer-managed state delivered via this callback. `ContactManager.updatePeerSession(contactId, sessionUUID)` is called separately on kind 5004 to record the peer's current session UUID from the plaintext `#s` tag (no decryption required).
+Presence state and session management are consumer-managed. The `senderSessionUUID` fourth argument gives every handler the sender's session UUID without any additional lookup. `SessionController` (see [sentry-controllers.md](sentry-controllers.md)) handles kind 5004 to manage session connections; other handlers receive the session UUID so they can reply to the correct session via `publishSignal`.
 
 When a contact is registered, updated (`updatePairedRelays`), or expired, the router re-subscribes using the transition lifecycle: a new relay REQ is opened and verified before the old one closes, ensuring no coverage gap.
 
@@ -300,11 +305,13 @@ for (const contactId of nostrClient.allContactIds()) {
 }
 ```
 
-The signal router handles the reply side: on receiving kind 5004 with `isResponse=false`, the peer replies with its own `isResponse=true` announcement. This is the mechanism by which both devices confirm mutual presence.
+Kind 5004 has two sub-types serving distinct roles:
 
-**Startup grace period:** For 20 seconds after the router starts, auto-replies to kind 5004 announcements are suppressed. This prevents a flood of mutual-presence replies when multiple contacts come online simultaneously at startup. The router still calls `notifyPresenceChange` during the grace period — only the outbound reply is held.
+**Announcement (`isResponse=false`):** Broadcast — carries `["s", senderSessionUUID]` as an informational tag (not a routing filter). Any session on the channel receives it. `SessionController` receives the announcement via the signal router callback and decides whether to establish a session connection with the announcing session.
 
-**Manual solicitation:** Either device sends kind 5004 `isResponse=false` to request a reply from the other side. The receiving peer treats any `isResponse=false` as both an announcement and a reply solicitation.
+**Session connect (`isResponse=true`):** Session-directed — carries `["s", announcerSessionUUID]` (the session UUID from the received announcement, used as the relay routing target) and `["fs", mySessionUUID]` (this device's session UUID, identifying the sender). Published by `SessionController` to establish a session with the peer. On receiving an `isResponse=true` targeted at its own session UUID, `SessionController` opens a session subscription for the sender. The handshake is complete when both sides have opened session subscriptions for each other.
+
+The timing of `SessionController`'s response to an announcement — including any startup anti-flood behavior — is determined by `SessionController`'s own state machine.
 
 ### RTC Signaling (Kinds 5001–5003)
 
@@ -334,9 +341,10 @@ Action signals are the Nostr output of the Senstry pipeline. When a sensor fires
 Action signals arrive through the signal router alongside all other kinds:
 
 ```typescript
-nostrClient.startSignalRouter((contactId, kind, payload) => {
+nostrClient.startSignalRouter((contactId, kind, payload, senderSessionUUID) => {
   if (kind === 5010) handleTriggerSignal(contactId, payload as TriggerPayload);
   if (kind === 5011) handleArmStateSignal(contactId, payload as ArmStatePayload);
+  // senderSessionUUID is absent for broadcast kinds 5010/5011
 });
 ```
 

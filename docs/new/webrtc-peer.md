@@ -153,7 +153,7 @@ All WebRTC signals travel as Nostr events. Each signal type has its own kind num
 | `pubkey` | ECDH-derived channel key (never the real identity key) |
 | `content` | NIP-44 ChaCha20-Poly1305 ciphertext over the JSON payload |
 | `created_at` | Honest wall-clock timestamp (not randomized) |
-| `tags` | Empty for most kinds; session-directed kinds include `#s` tag with session UUID |
+| `tags` | Broadcast kinds (5010, 5011): empty. 5004 `isResponse=false`: `["s", senderSessionUUID]` (informational). Session-directed kinds (5001–5003, 5004 `isResponse=true`, 5005–5006): `["s", recipientSessionUUID]` and `["fs", senderSessionUUID]` |
 
 Gift wrap (NIP-59) is not used. All signals use single-layer NIP-44 encryption over ECDH-derived channel keys. Signal kind semantics (5001–5006, 5010, 5011) are defined in [signal-exchange.md](signal-exchange.md).
 
@@ -202,7 +202,7 @@ const content = encryptSignalContent(JSON.stringify(payload), outboundChannelPri
 const event = finalizeEvent({
   kind,
   created_at: Math.floor(Date.now() / 1000),
-  tags: sessionId ? [['s', sessionId]] : [], // session-directed kinds include ["s", sessionId]; broadcast kinds pass []
+  tags: sessionId ? [['s', sessionId], ['fs', mySessionUUID]] : [], // session-directed: recipient UUID + sender UUID (from NostrClient constructor); broadcast: []
   content
 }, outboundChannelPrivkey);
 ```
@@ -240,4 +240,4 @@ Two mechanisms combine to eliminate duplicate processing:
 
 Per-relay deduplication ensures that a signal delivered through multiple relay connections is processed exactly once.
 
-Signal routing — kind dispatch, subscription management, and the startup grace period — is defined in [signal-exchange.md](signal-exchange.md).
+Signal routing — kind dispatch and subscription management — is defined in [signal-exchange.md](signal-exchange.md).

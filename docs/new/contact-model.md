@@ -42,7 +42,7 @@ interface ContactEntry {
 
   identityPubkey?: string;      // peer's long-term identity pubkey; absent for TempContacts
   devicePubkey?: string;        // peer's device pubkey; used for ECDH; absent for TempContacts
-  peerSessionUUID?: string;     // most recently seen session UUID from peer's kind 5004
+  peerSessionUUID?: string;     // most recently confirmed peer session UUID; display only — not the authoritative session source
 
   inboundChannelPubkey: string;    // paired: ECDH-derived; temp: freshly generated ephemeral
   inboundChannelPrivkey: Uint8Array; // held in memory; used to decrypt incoming events
@@ -72,7 +72,7 @@ interface PairedContactEntry extends ContactEntry {
 
 `outboundChannelPubkey` is always non-null. There is no code path that publishes a signal without a resolved channel key.
 
-`peerSessionUUID` is updated on every received kind 5004 from that contact. Session-directed signals (kinds 5001–5003, 5005, 5006) include this value as the `#s` tag target.
+`peerSessionUUID` holds the most recently confirmed peer session UUID, updated by the app layer via `SessionController.onSessionOpened` callback after a 5004 handshake completes. It is a convenience field for display purposes (e.g. UI presence). `SessionController` maintains the authoritative active session list separately — callers that need a valid session UUID for `publishSignal` call `sessionController.getActiveSessions(contactId)`, not this field.
 
 ---
 
@@ -196,6 +196,8 @@ To recover contacts from relay:
 3. Decrypt the latest event's content with `contactBookEncKey`.
 4. Re-derive channel keys from each entry's `devicePubkey`.
 
+A recovered contact with a `devicePubkey` that no longer matches the peer's current device is indistinguishable from a contact that is simply offline — the Nostr protocol has no deletion or re-key notification primitive. The re-pairing flow handles this naturally: if a peer has re-keyed, they initiate a new pairing offer authenticated by their known `identityPubkey`, at which point the stored `devicePubkey` is replaced and channel keys are re-derived. What to do with contacts that remain absent after recovery is a user or application concern, not a protocol one.
+
 ---
 
 ## ContactManager
@@ -226,7 +228,7 @@ class ContactManager {
 }
 ```
 
-**Paired entries** cache channel keys on registration (derived from the stored device keypair). `peerSessionUUID` is updated on every received kind 5004. Relay migration commits via `updatePairedRelays()`; peer re-key via `updatePeerDevicePubkey()` re-derives channel keys.
+**Paired entries** cache channel keys on registration (derived from the stored device keypair). `peerSessionUUID` is updated by `SessionController` after a session is confirmed (not automatically by the signal router). Relay migration commits via `updatePairedRelays()`; peer re-key via `updatePeerDevicePubkey()` re-derives channel keys.
 
 **Temp entries:** `ContactManager` generates the inbound keypair and sets outbound channel values from the provided `senderEphemeralPubkey`. No `identityPubkey` or `devicePubkey` is set.
 
